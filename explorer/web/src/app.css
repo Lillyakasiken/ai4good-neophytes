@@ -426,6 +426,23 @@ label.field span { display: flex; gap: 4px; }
   user-select: none;
 }
 
+.world .tile-grid {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.world .tile-grid path {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.92);
+  stroke-width: 1;
+  filter: drop-shadow(0 0 0.6px rgba(18, 32, 36, 0.85));
+}
+
 .world .cell img {
   inset: 0;
   width: 100%;
@@ -558,22 +575,35 @@ label.field span { display: flex; gap: 4px; }
 
 .grid-wrap { min-height: 0; position: relative; }
 
-.scroller {
+.tiles-pane {
   height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.scroller {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 8px;
   background: linear-gradient(180deg, color-mix(in srgb, var(--haze) 55%, #9aada8), var(--haze) 140px);
 }
 
-.spacer { position: relative; }
+.mosaic {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.mosaic.loading { opacity: 0.55; }
 
 .cell {
-  position: absolute;
-  top: 0;
-  left: 0;
   display: flex;
   flex-direction: column;
   gap: 3px;
+  width: 100%;
   padding: 0;
   border: 0;
   background: transparent;
@@ -582,8 +612,7 @@ label.field span { display: flex; gap: 4px; }
 
 .frame {
   position: relative;
-  flex: 1;
-  min-height: 0;
+  aspect-ratio: 1;
   overflow: hidden;
   background: #8ea09a;
   box-shadow: inset 0 0 0 1px rgba(18, 32, 36, 0.35);
@@ -605,6 +634,7 @@ label.field span { display: flex; gap: 4px; }
   position: absolute;
   inset: 0;
   object-fit: cover;
+  opacity: 0.85;
 }
 
 .frame img.missing { display: none; }
@@ -621,10 +651,74 @@ label.field span { display: flex; gap: 4px; }
 .dots { display: inline-flex; gap: 3px; align-items: center; }
 
 .skel {
-  position: absolute;
-  top: 0;
-  left: 0;
+  aspect-ratio: 1;
   background: color-mix(in srgb, var(--quiet) 35%, var(--haze));
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--sheet);
+  border-top: 1px solid var(--line);
+}
+
+.pager button {
+  min-width: 32px;
+  border: 1px solid var(--line);
+  background: transparent;
+  border-radius: 2px;
+  padding: 4px 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pager button[aria-current="page"] {
+  background: var(--canopy);
+  color: var(--sheet);
+  border-color: var(--canopy);
+}
+
+.pager button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.pages {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pager .gap {
+  color: var(--mist);
+  padding: 0 2px;
+}
+
+.pager .jump label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--mist);
+  font-size: 12px;
+}
+
+.pager input {
+  width: 4.6em;
+  border: 1px solid var(--line);
+  background: transparent;
+  border-radius: 2px;
+  padding: 3px 6px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.pager .count {
+  margin: 0 0 0 auto;
+  color: var(--mist);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .empty, .error {
@@ -651,6 +745,44 @@ label.field span { display: flex; gap: 4px; }
   box-shadow: var(--shadow);
   overflow: auto;
   padding: 16px 18px 32px;
+}
+
+.drawer.vision {
+  width: min(960px, 100vw);
+}
+
+.drawer-tabs {
+  display: flex;
+  width: fit-content;
+  margin: 0 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.drawer-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: 0;
+  padding: 5px 12px;
+  color: var(--mist);
+}
+
+.drawer-tabs svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.drawer-tabs button.on {
+  background: var(--canopy);
+  color: var(--sheet);
 }
 
 .drawer header {

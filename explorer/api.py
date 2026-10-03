@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
+from pydantic import BaseModel, Field
 
 from common import (
     CACHE,
@@ -29,8 +30,10 @@ from common import (
     TILES_PARQUET,
     THUMBS_DIR,
     load_names,
+    resolve_data_path,
     species_columns,
 )
+from vision import catalog, load_source, render
 
 CLASSES, DISPLAY_ORDER, CV_FOLDS = load_names()
 SPECIES = species_columns(CLASSES, DISPLAY_ORDER)
@@ -330,6 +333,46 @@ def tile_detail(tile_id: str):
         "thumb": f"/thumbs/{row['tile_id']}.webp",
         "mask": f"/masks/{row['tile_id']}.webp",
     }
+
+
+class PreviewIn(BaseModel):
+    max_edge: int = 512
+    ops: list[dict] = Field(default_factory=list)
+
+
+def _tile_image_path(tile_id):
+    if len(tile_id) != 16 or any(c not in "0123456789abcdef" for c in tile_id):
+        raise HTTPException(status_code=400, detail="tile_id must be 16 hex characters")
+    _require_catalog()
+    rows = _fetch(
+        "SELECT img_path FROM read_parquet(?) WHERE tile_id = ?",
+        [str(TILES_PARQUET), tile_id],
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="tile not found")
+    path = resolve_data_path(rows[0]["img_path"])
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="tile image is not on disk")
+    return path
+
+
+@app.get("/api/vision/ops")
+def vision_ops():
+    """Whitelist of preview filters and their slider ranges."""
+    return catalog()
+
+
+@app.post("/api/tiles/{tile_id}/preview")
+def tile_preview(tile_id: str, body: PreviewIn):
+    """Filtered preview and histogram. The JPEG is not written to disk."""
+    path = _tile_image_path(tile_id)
+    try:
+        rgb, alpha, elev = load_source(tile_id, path, body.max_edge)
+        return render(rgb, alpha, body.ops, elev=elev)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/stats")

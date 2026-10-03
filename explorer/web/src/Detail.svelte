@@ -1,9 +1,12 @@
 <script>
+  import Process from './Process.svelte';
+
   let { tileId, fold, onclose } = $props();
 
   let tile = $state(null);
   let error = $state('');
   let opacity = $state(0.8);
+  let tab = $state('tile');
   let legendOpen = $state(false);
   let maskLegend = $state(null);
 
@@ -20,7 +23,7 @@
     error = '';
     if (!id) return;
     let dead = false;
-    fetch('/api/tiles/' + id)
+    fetch('/api/tiles/' + id, { priority: 'high' })
       .then(async (res) => {
         if (!res.ok) throw new Error(await res.text());
         return res.json();
@@ -126,7 +129,7 @@
 </script>
 
 <button type="button" class="drawer-back" aria-label="Close details" onclick={onclose}></button>
-<aside class="drawer">
+<aside class="drawer" class:vision={tab === 'vision'}>
   {#if error}
     <p class="error">{error}</p>
   {:else if !tile}
@@ -140,14 +143,37 @@
       <button type="button" class="close" onclick={onclose}>Close</button>
     </header>
 
-    <div class="stage">
-      <img src={tile.thumb} alt="Orthophoto thumbnail" />
-      <img class="mask" src={tile.mask} alt="" style:opacity={opacity} />
+    <div class="drawer-tabs" role="tablist" aria-label="Tile detail">
+      <button type="button" role="tab" aria-selected={tab === 'tile'} class:on={tab === 'tile'} onclick={() => (tab = 'tile')}>
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="1.6" y="2.2" width="12.8" height="11.6" />
+          <path d="M1.6 10.4 5.2 7.4l2.6 2.2 2.4-2 4.2 3.2" />
+          <circle cx="5.2" cy="5.6" r="1" />
+        </svg>
+        Tile
+      </button>
+      <button type="button" role="tab" aria-selected={tab === 'vision'} class:on={tab === 'vision'} onclick={() => (tab = 'vision')}>
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="7.2" cy="7.2" r="4.4" />
+          <path d="M10.4 10.4 14 14" />
+          <path d="M7.2 4.6v1.3M7.2 8.5v1.3M4.6 7.2h1.3M8.5 7.2h1.3" />
+        </svg>
+        Vision
+      </button>
     </div>
-    <label class="slider">
-      Labels
-      <input type="range" min="0" max="1" step="0.05" bind:value={opacity} />
-    </label>
+
+    {#if tab === 'vision'}
+      <Process tileId={tile.tile_id} mask={tile.mask} />
+    {:else}
+      <div class="stage">
+        <img src={tile.thumb} alt="Orthophoto thumbnail" fetchpriority="high" />
+        <img class="mask" src={tile.mask} alt="" style:opacity={opacity} fetchpriority="high" />
+      </div>
+      <label class="slider">
+        Labels
+        <input type="range" min="0" max="1" step="0.05" bind:value={opacity} />
+      </label>
+    {/if}
     <div class="legend">
       {#each legend as item}
         <span>

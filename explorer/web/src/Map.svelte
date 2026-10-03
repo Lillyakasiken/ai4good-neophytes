@@ -4,6 +4,9 @@
   let { facets, filters, showLabels = $bindable(), onopen } = $props();
 
   const OVERVIEW_MAX = 72;
+  // Sheet builds are slow and share the browser's connection pool with the
+  // tile preview. Keep only a few in flight so a click is not queued behind them.
+  const SHEET_SLOTS = 3;
 
   let site = $state('');
   let flight = $state('');
@@ -23,6 +26,7 @@
   let drag = $state(null);
   let hover = $state(null);
   let imageOpacity = $state(1);
+  let showGrid = $state(false);
 
   const IGNORE = [
     { name: 'unlabelled', color: '#737373', binomial: false },
@@ -52,6 +56,16 @@
     ...IGNORE.map((item) => ({ ...item, rgb: rgbOf(item.color) })),
   ]);
   let overview = $derived(cell < OVERVIEW_MAX);
+  let gridPath = $derived.by(() => {
+    if (!showGrid || !mosaic) return '';
+    let path = '';
+    for (const tile of mosaic.tiles) {
+      const x = tile.col * cell;
+      const y = tile.row * cell;
+      path += `M${x} ${y}h${cell}v${cell}h${-cell}z`;
+    }
+    return path;
+  });
   let chunks = $derived.by(() => {
     if (!mosaic || overview || !viewportW) return [];
     const sheet = mosaic.sheet || 8;
@@ -90,6 +104,16 @@
     return out;
   });
   let visibleKeys = $derived(new Set(chunks.map((chunk) => chunk.key)));
+  let sheetSlots = $derived.by(() => {
+    const allow = new Set();
+    if (overview) return allow;
+    for (const chunk of chunks) {
+      if (readySheets[chunk.key]) continue;
+      allow.add(chunk.key);
+      if (allow.size >= SHEET_SLOTS) break;
+    }
+    return allow;
+  });
   let detailPending = $derived(
     !overview && chunks.length > 0 && chunks.every((chunk) => !readySheets[chunk.key]),
   );
@@ -212,6 +236,14 @@
       if (add.length) retained = [...retained, ...add];
     });
   });
+
+  function showSheet(key) {
+    return !!readySheets[key] || sheetSlots.has(key);
+  }
+
+  function sheetUrl(cc, cr) {
+    return `/api/mosaic/${encodeURIComponent(mosaic.site)}/${encodeURIComponent(mosaic.flight)}/sheet/${cc}/${cr}/image.webp`;
+  }
 
   function onImageStart() {
     imagesStarted = true;
@@ -416,6 +448,10 @@
         <input type="checkbox" bind:checked={showLabels} />
         Show labels
       </label>
+      <label class="map-check">
+        <input type="checkbox" bind:checked={showGrid} />
+        Show grid
+      </label>
       <label class="map-slider">
         Image
         <input type="range" min="0" max="1" step="0.05" bind:value={imageOpacity} />
@@ -479,27 +515,36 @@
             style:width="{chunk.cols * cell}px"
             style:height="{chunk.rows * cell}px"
           >
-            <img
-              class="photo"
-              src="/api/mosaic/{encodeURIComponent(mosaic.site)}/{encodeURIComponent(mosaic.flight)}/sheet/{chunk.cc}/{chunk.cr}/image.webp"
-              alt=""
-              draggable="false"
-              style:opacity={imageOpacity}
-              style:height="{chunk.heightPct}%"
-              use:watchTile={chunk.key}
-            />
-            {#if showLabels}
+            {#if showSheet(chunk.key)}
               <img
-                class="mask"
-                src="/api/mosaic/{encodeURIComponent(mosaic.site)}/{encodeURIComponent(mosaic.flight)}/sheet/{chunk.cc}/{chunk.cr}/image.webp"
+                class="photo"
+                src={sheetUrl(chunk.cc, chunk.cr)}
                 alt=""
                 draggable="false"
+                fetchpriority="low"
+                style:opacity={imageOpacity}
                 style:height="{chunk.heightPct}%"
-                style:top="{chunk.maskTopPct}%"
+                use:watchTile={chunk.key}
               />
+              {#if showLabels && readySheets[chunk.key]}
+                <img
+                  class="mask"
+                  src={sheetUrl(chunk.cc, chunk.cr)}
+                  alt=""
+                  draggable="false"
+                  fetchpriority="low"
+                  style:height="{chunk.heightPct}%"
+                  style:top="{chunk.maskTopPct}%"
+                />
+              {/if}
             {/if}
           </div>
         {/each}
+        {#if showGrid}
+          <svg class="tile-grid" aria-hidden="true">
+            <path d={gridPath} />
+          </svg>
+        {/if}
       </div>
     {/if}
     {#if (!imagesStarted || detailPending) && !error}

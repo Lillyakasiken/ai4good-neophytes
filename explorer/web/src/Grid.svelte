@@ -3,153 +3,176 @@
 
   let { query, showLabels, colors, onopen } = $props();
 
-  const PAGE = 60;
-  const GAP = 10;
-  const MIN = 168;
+  const PAGE = 48;
 
   let scroller = $state(null);
-  let width = $state(0);
-  let viewportH = $state(0);
-  let scrollTop = $state(0);
+  let page = $state(0);
+  let jump = $state('1');
   let total = $state(0);
+  let tiles = $state([]);
   let ready = $state(false);
+  let loading = $state(false);
   let failed = $state('');
-  let pages = $state({});
-  let inflight = new Set();
   let generation = 0;
+  let alive = true;
 
-  // clientWidth includes the scroller's horizontal padding (18px each side).
-  let inner = $derived(Math.max(0, width - 36));
-  let cols = $derived(Math.max(1, Math.floor((Math.max(inner, MIN) + GAP) / (MIN + GAP))));
-  let cellW = $derived(inner > 0 ? Math.max(1, (inner - GAP * (cols - 1)) / cols) : MIN);
-  let cellH = $derived(cellW + 28);
-  let stride = $derived(cellH + GAP);
-  let rowCount = $derived(total > 0 ? Math.ceil(total / cols) : 0);
-  let firstRow = $derived(stride > 0 ? Math.max(0, Math.floor(scrollTop / stride) - 1) : 0);
-  let visRows = $derived(Math.max(1, Math.ceil(((viewportH || 640) / stride) + 3)));
-  let lastRow = $derived(Math.min(rowCount, firstRow + visRows));
-  let totalH = $derived(rowCount * stride);
-
-  let cells = $derived.by(() => {
+  let pageCount = $derived(total > 0 ? Math.ceil(total / PAGE) : 0);
+  let rangeStart = $derived(total === 0 ? 0 : page * PAGE + 1);
+  let rangeEnd = $derived(Math.min(total, (page + 1) * PAGE));
+  let links = $derived.by(() => {
+    if (pageCount < 1) return [];
+    const current = page + 1;
+    const wanted = [1, pageCount, current - 2, current - 1, current, current + 1, current + 2];
+    const nums = [...new Set(wanted.filter((n) => n >= 1 && n <= pageCount))].sort((a, b) => a - b);
     const out = [];
-    for (let row = firstRow; row < lastRow; row++) {
-      for (let col = 0; col < cols; col++) {
-        const index = row * cols + col;
-        if (index >= total) break;
-        const page = Math.floor(index / PAGE) * PAGE;
-        out.push({
-          index,
-          tile: pages[page]?.[index - page] ?? null,
-          x: col * (cellW + GAP),
-          y: row * stride,
-        });
-      }
+    for (let i = 0; i < nums.length; i++) {
+      if (i > 0 && nums[i] - nums[i - 1] > 1) out.push({ kind: 'gap', id: `gap-${nums[i]}` });
+      out.push({ kind: 'page', n: nums[i], id: `page-${nums[i]}` });
     }
     return out;
   });
 
-  async function load(key, offset, gen) {
-    const token = `${gen}:${offset}`;
-    if (inflight.has(token)) return;
-    inflight.add(token);
+  async function load(key, pageIndex, gen, clear) {
+    loading = true;
+    if (clear) {
+      tiles = [];
+      total = 0;
+      ready = false;
+    }
     try {
-      const p = new URLSearchParams(key);
-      p.set('limit', String(PAGE));
-      p.set('offset', String(offset));
-      const res = await fetch('/api/tiles?' + p);
+      const params = new URLSearchParams(key);
+      params.set('limit', String(PAGE));
+      params.set('offset', String(pageIndex * PAGE));
+      const res = await fetch('/api/tiles?' + params);
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
-      if (gen !== generation) return;
+      if (!alive || gen !== generation) return;
+      const pages = data.total > 0 ? Math.ceil(data.total / PAGE) : 1;
+      if (data.total > 0 && pageIndex > pages - 1) {
+        page = pages - 1;
+        jump = String(page + 1);
+        await load(key, page, gen, clear);
+        return;
+      }
       total = data.total;
+      tiles = data.tiles;
       ready = true;
-      pages = { ...pages, [offset]: data.tiles };
+      loading = false;
+      if (scroller) scroller.scrollTop = 0;
     } catch (err) {
-      if (gen === generation) failed = String(err.message || err);
+      if (!alive || gen !== generation) return;
+      failed = String(err.message || err);
+      loading = false;
+      ready = true;
     }
   }
 
-  // Reset only when the filter query changes. Writes stay untracked so the
-  // arriving page does not clear itself and refetch forever.
+  function show(next) {
+    const pages = Math.max(1, pageCount || 1);
+    const clamped = Math.min(Math.max(0, next), pages - 1);
+    jump = String(clamped + 1);
+    if (clamped === page && ready) return;
+    page = clamped;
+    generation += 1;
+    load(query, clamped, generation, false);
+  }
+
+  function commitJump() {
+    const n = Number.parseInt(String(jump).trim(), 10);
+    if (!Number.isFinite(n)) {
+      jump = String(page + 1);
+      return;
+    }
+    show(n - 1);
+  }
+
   $effect(() => {
     const key = query;
     generation += 1;
     const gen = generation;
+    alive = true;
     untrack(() => {
-      inflight = new Set();
-      pages = {};
-      total = 0;
-      ready = false;
+      page = 0;
+      jump = '1';
       failed = '';
-      scrollTop = 0;
-      if (scroller) scroller.scrollTop = 0;
-      load(key, 0, gen);
+      load(key, 0, gen, true);
     });
-  });
-
-  $effect(() => {
-    const key = query;
-    const gen = generation;
-    const offsets = new Set();
-    for (const cell of cells) offsets.add(Math.floor(cell.index / PAGE) * PAGE);
-    untrack(() => {
-      for (const offset of offsets) {
-        if (!pages[offset]) load(key, offset, gen);
-      }
-    });
+    return () => {
+      alive = false;
+    };
   });
 </script>
 
-<div
-  class="scroller"
-  bind:this={scroller}
-  bind:clientWidth={width}
-  bind:clientHeight={viewportH}
-  onscroll={() => (scrollTop = scroller.scrollTop)}
->
-  {#if failed}
-    <p class="error">{failed}</p>
-  {:else if ready && total === 0}
-    <p class="empty">No tiles match these filters.</p>
-  {:else}
-    <div class="spacer" style:height="{totalH}px">
-      {#each cells as cell (cell.index)}
-        {#if cell.tile}
-          <button
-            type="button"
-            class="cell"
-            style:width="{cellW}px"
-            style:height="{cellH}px"
-            style:transform="translate({cell.x}px, {cell.y}px)"
-            onclick={() => onopen(cell.tile.tile_id)}
-          >
-            <span class="frame" style:height="{cellW}px">
+<div class="tiles-pane">
+  <div class="scroller" bind:this={scroller}>
+    {#if failed}
+      <p class="error">{failed}</p>
+    {:else if ready && total === 0}
+      <p class="empty">No tiles match these filters.</p>
+    {:else if !ready}
+      <div class="mosaic" aria-hidden="true">
+        {#each { length: PAGE } as _, i (i)}
+          <div class="skel"></div>
+        {/each}
+      </div>
+    {:else}
+      <div class="mosaic" class:loading aria-busy={loading}>
+        {#each tiles as tile (tile.tile_id)}
+          <button type="button" class="cell" onclick={() => onopen(tile.tile_id)}>
+            <span class="frame">
               <img
-                src={cell.tile.thumb}
+                src={tile.thumb}
                 alt=""
                 onerror={(e) => e.currentTarget.classList.add('missing')}
               />
               {#if showLabels}
-                <img class="mask" src={cell.tile.mask} alt="" style:opacity="0.85" />
+                <img class="mask" src={tile.mask} alt="" />
               {/if}
             </span>
             <span class="caption">
-              <strong>{cell.tile.site_name}_{cell.tile.flight}</strong>
+              <strong>{tile.site_name}_{tile.flight}</strong>
               <span class="dots">
-                {#each cell.tile.species as name}
+                {#each tile.species as name}
                   <i class="swatch" style:--swatch={colors[name] || '#999'}></i>
                 {/each}
               </span>
             </span>
           </button>
-        {:else}
-          <div
-            class="skel"
-            style:width="{cellW}px"
-            style:height="{cellH}px"
-            style:transform="translate({cell.x}px, {cell.y}px)"
-          ></div>
-        {/if}
-      {/each}
-    </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+
+  {#if total > 0}
+    <nav class="pager" aria-label="Tile pages">
+      <button type="button" disabled={page === 0} onclick={() => show(page - 1)}>Previous</button>
+      <div class="pages">
+        {#each links as item (item.id)}
+          {#if item.kind === 'gap'}
+            <span class="gap" aria-hidden="true">…</span>
+          {:else}
+            <button
+              type="button"
+              aria-current={item.n === page + 1 ? 'page' : undefined}
+              onclick={() => show(item.n - 1)}
+            >{item.n}</button>
+          {/if}
+        {/each}
+      </div>
+      <button type="button" disabled={page >= pageCount - 1} onclick={() => show(page + 1)}>Next</button>
+      <form
+        class="jump"
+        onsubmit={(event) => {
+          event.preventDefault();
+          commitJump();
+        }}
+      >
+        <label>
+          Page
+          <input inputmode="numeric" bind:value={jump} aria-label="Page number" />
+        </label>
+      </form>
+      <p class="count">{rangeStart.toLocaleString()}–{rangeEnd.toLocaleString()} of {total.toLocaleString()}</p>
+    </nav>
   {/if}
 </div>
