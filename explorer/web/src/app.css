@@ -747,7 +747,8 @@ label.field span { display: flex; gap: 4px; }
   padding: 16px 18px 32px;
 }
 
-.drawer.vision {
+.drawer.vision,
+.drawer.segment {
   width: min(960px, 100vw);
 }
 

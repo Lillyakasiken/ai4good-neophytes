@@ -590,7 +590,7 @@
               {#each menuGroups as group (group.id)}
                 <p class="picker-group">{group.label}</p>
                 {#each group.ops as op (op.name)}
-                  <button type="button" role="option" class="picker-option" onclick={() => addFilter(op.name)}>
+                  <button type="button" role="option" aria-selected={false} class="picker-option" onclick={() => addFilter(op.name)}>
                     {op.label}
                   </button>
                 {/each}

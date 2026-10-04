@@ -33,6 +33,12 @@ from common import (
     resolve_data_path,
     species_columns,
 )
+from segment import (
+    SegmentFailed,
+    SegmentUnavailable,
+    catalog as segment_catalog,
+    run as segment_run,
+)
 from vision import catalog, load_source, render
 
 CLASSES, DISPLAY_ORDER, CV_FOLDS = load_names()
@@ -371,6 +377,47 @@ def tile_preview(tile_id: str, body: PreviewIn):
         return render(rgb, alpha, body.ops, elev=elev)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class SegmentIn(BaseModel):
+    model: str = "yoloe-26s"
+    max_edge: int = 512
+    conf: float = 0.25
+    texts: list[str] = Field(default_factory=list)
+    points: list[dict] = Field(default_factory=list)
+    boxes: list[dict] = Field(default_factory=list)
+
+
+@app.get("/api/segment/models")
+def segment_models():
+    """Whitelist of zero-shot segmentation models and species phrases."""
+    return segment_catalog()
+
+
+@app.post("/api/tiles/{tile_id}/segment")
+def tile_segment(tile_id: str, body: SegmentIn):
+    """Instance overlay for one tile. The PNG is not written to disk."""
+    path = _tile_image_path(tile_id)
+    try:
+        rgb, alpha, _elev = load_source(tile_id, path, body.max_edge)
+        return segment_run(
+            rgb,
+            alpha,
+            model=body.model,
+            max_edge=body.max_edge,
+            conf=body.conf,
+            texts=body.texts,
+            points=body.points,
+            boxes=body.boxes,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SegmentUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except SegmentFailed as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -1,5 +1,6 @@
 <script>
   import Process from './Process.svelte';
+  import Segment from './Segment.svelte';
 
   let { tileId, fold, onclose } = $props();
 
@@ -129,7 +130,7 @@
 </script>
 
 <button type="button" class="drawer-back" aria-label="Close details" onclick={onclose}></button>
-<aside class="drawer" class:vision={tab === 'vision'}>
+<aside class="drawer" class:vision={tab === 'vision'} class:segment={tab === 'segment'}>
   {#if error}
     <p class="error">{error}</p>
   {:else if !tile}
@@ -160,10 +161,18 @@
         </svg>
         Vision
       </button>
+      <button type="button" role="tab" aria-selected={tab === 'segment'} class:on={tab === 'segment'} onclick={() => (tab = 'segment')}>
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M3.1 5.6 6.2 2.7l4.1 1.1L13.2 6.4l-1.1 4.1-3.6 2.2-4.3-1.3L2.6 8.1Z" />
+        </svg>
+        Segment
+      </button>
     </div>
 
     {#if tab === 'vision'}
       <Process tileId={tile.tile_id} mask={tile.mask} />
+    {:else if tab === 'segment'}
+      <Segment tileId={tile.tile_id} mask={tile.mask} />
     {:else}
       <div class="stage">
         <img src={tile.thumb} alt="Orthophoto thumbnail" fetchpriority="high" />

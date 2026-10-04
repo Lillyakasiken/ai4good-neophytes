@@ -34,6 +34,8 @@ The page opens on cv3 train, sorted by labelled area, with the class mask drawn 
 
 Open a tile and choose Vision to preview OpenCV filters and a gray-value histogram on that tile. The preview is computed in memory and is not written to disk. It does not change the thumbnails, the catalog, or the training data.
 
+Choose Segment to run a zero-shot mask on that same preview. The tab offers YOLOE-26s, which takes a text phrase, and SAM 2.1 tiny, which takes include and exclude points and boxes. Neither model is trained on the six neophytes, so the overlay is only a visual test. The first text prompt downloads `yoloe-26s-seg.pt` and a MobileCLIP encoder into `cache/weights` (about 254 MB for the encoder) and needs network access. That first call also installs the Ultralytics CLIP fork if it is missing (`pip install git+https://github.com/ultralytics/CLIP.git`). The mask is returned in the response and is not saved.
+
 ## The prepare scripts
 
 You can run them by hand from `explorer/` with `.venv/bin/python`. `run.sh` calls the same commands.
