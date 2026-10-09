@@ -31,6 +31,11 @@
     sort: 'label_m2',
   });
 
+  function setNumber(params, key, value) {
+    if (value == null || value === '' || Number.isNaN(Number(value))) return;
+    params.set(key, String(value));
+  }
+
   let query = $derived.by(() => {
     const p = new URLSearchParams();
     p.set('fold', filters.fold);
@@ -43,12 +48,10 @@
     for (const name of filters.species) p.append('species', name);
     if (filters.labelled) p.set('labelled', 'true');
     if (filters.backgroundOnly) p.set('background_only', 'true');
-    if (filters.nodataMin !== '') p.set('nodata_min', filters.nodataMin);
-    if (filters.nodataMax !== '') p.set('nodata_max', filters.nodataMax);
-    if (filters.minM2 !== '') {
-      p.set('min_m2', filters.minM2);
-      p.set('min_m2_species', filters.minM2Species);
-    }
+    setNumber(p, 'nodata_min', filters.nodataMin);
+    setNumber(p, 'nodata_max', filters.nodataMax);
+    setNumber(p, 'min_m2', filters.minM2);
+    if (p.has('min_m2')) p.set('min_m2_species', filters.minM2Species);
     p.set('sort', filters.sort);
     return p.toString();
   });
@@ -82,7 +85,10 @@
         return res.json();
       })
       .then((data) => {
-        if (!dead) stats = data;
+        if (!dead) {
+          stats = data;
+          error = '';
+        }
       })
       .catch((err) => {
         if (!dead) error = String(err.message || err);
