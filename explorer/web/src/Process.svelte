@@ -1,5 +1,6 @@
 <script>
   import { tick } from 'svelte';
+  import Zoom from './Zoom.svelte';
 
   let { tileId, mask } = $props();
 
@@ -24,6 +25,8 @@
   let catalogError = $state('');
   let canvas = $state(null);
   let segmentCanvas = $state(null);
+  let zoomCanvas = $state(null);
+  let zoomOpen = $state(false);
   let range = $state(null);
   let sliderDraft = $state(null);
   let dragAnchor = 0;
@@ -438,16 +441,20 @@
   });
 
   $effect(() => {
+    tileId;
+    zoomOpen = false;
+  });
+
+  $effect(() => {
     const src = view?.gray;
     const selected = range;
-    const node = segmentCanvas;
-    if (!node) return;
+    const nodes = [segmentCanvas, zoomCanvas].filter(Boolean);
+    if (!nodes.length) return;
     let dead = false;
-    const ctx = node.getContext('2d');
 
     async function run() {
       if (!src || !selected) {
-        ctx.clearRect(0, 0, node.width, node.height);
+        for (const node of nodes) node.getContext('2d').clearRect(0, 0, node.width, node.height);
         return;
       }
       let data = grayPixels.src === src ? grayPixels.data : null;
@@ -457,7 +464,7 @@
         grayPixels = { src, data };
       }
       if (dead) return;
-      paintSegment(node, data, selected.lo, selected.hi);
+      for (const node of nodes) paintSegment(node, data, selected.lo, selected.hi);
     }
 
     run();
@@ -467,7 +474,13 @@
   });
 </script>
 
-<svelte:window onclick={closeMenu} onkeydown={(event) => menuOpen && event.key === 'Escape' && (menuOpen = false)} />
+<svelte:window
+  onclick={closeMenu}
+  onkeydown={(event) => {
+    if (event.defaultPrevented) return;
+    if (menuOpen && event.key === 'Escape') menuOpen = false;
+  }}
+/>
 
 <div class="lab">
   <div class="preview">
@@ -479,9 +492,16 @@
         {/each}
       </select>
     </label>
-    <div class="stage" aria-busy={busy}>
+    <button
+      type="button"
+      class="stage"
+      aria-busy={busy}
+      aria-label="Enlarge preview"
+      disabled={!view?.image}
+      onclick={() => (zoomOpen = true)}
+    >
       {#if view?.image}
-        <img class="base" src={urlOf(view)} alt="Filtered preview" draggable="false" />
+        <img class="base" src={urlOf(view)} alt="" draggable="false" />
       {:else if !problem}
         <p class="wait">Rendering preview…</p>
       {/if}
@@ -503,7 +523,30 @@
         aria-hidden="true"
         style:clip-path={canWipe ? `inset(0 ${100 - wipe}% 0 0)` : undefined}
       ></canvas>
-    </div>
+    </button>
+    {#if view?.image}
+      <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Filtered preview">
+        <img class="base" src={urlOf(view)} alt="Filtered preview" draggable="false" />
+        {#if canWipe}
+          <img
+            class="wipe"
+            src={urlOf(original)}
+            alt=""
+            draggable="false"
+            style:clip-path={`inset(0 0 0 ${wipe}%)`}
+          />
+        {/if}
+        {#if mask}
+          <img class="mask" src={mask} alt="" draggable="false" style:opacity={opacity} />
+        {/if}
+        <canvas
+          class="segment"
+          bind:this={zoomCanvas}
+          aria-hidden="true"
+          style:clip-path={canWipe ? `inset(0 ${100 - wipe}% 0 0)` : undefined}
+        ></canvas>
+      </Zoom>
+    {/if}
     <label class="slider">
       Original
       <input type="range" min="0" max="100" step="1" bind:value={wipe} disabled={!canWipe} aria-label="Compare original and filtered preview" />
@@ -675,6 +718,8 @@
   .field { margin-bottom: 8px; }
 
   .stage { display: flex; align-items: center; justify-content: center; }
+
+  button.stage:disabled { opacity: 1; }
 
   .base, .wipe {
     position: absolute;

@@ -1,6 +1,7 @@
 <script>
   import Process from './Process.svelte';
   import Segment from './Segment.svelte';
+  import Zoom from './Zoom.svelte';
 
   let { tileId, fold, onclose } = $props();
 
@@ -10,6 +11,10 @@
   let tab = $state('tile');
   let legendOpen = $state(false);
   let maskLegend = $state(null);
+  let zoomOpen = $state(false);
+  let sharp = $state('');
+  let sharpFor = $state('');
+  let sharpBusy = $state(false);
 
   const IGNORE = [
     { kind: 'ignore', color: '#737373', label: 'unlabelled' },
@@ -22,6 +27,10 @@
     const id = tileId;
     tile = null;
     error = '';
+    zoomOpen = false;
+    sharp = '';
+    sharpFor = '';
+    sharpBusy = false;
     if (!id) return;
     let dead = false;
     fetch('/api/tiles/' + id, { priority: 'high' })
@@ -38,7 +47,8 @@
     legendOpen = false;
     maskLegend = null;
     function onKey(event) {
-      if (event.key === 'Escape') onclose();
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      onclose();
     }
     window.addEventListener('keydown', onKey);
     return () => {
@@ -127,6 +137,39 @@
     if (value == null || value === 0) return value === 0 ? '0' : '—';
     return Number(value).toLocaleString();
   }
+
+  $effect(() => {
+    if (!zoomOpen || !tile?.tile_id || sharpFor === tile.tile_id) return;
+    const id = tile.tile_id;
+    const ctrl = new AbortController();
+    let dead = false;
+    sharpBusy = true;
+    fetch(`/api/tiles/${id}/preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_edge: 1024, ops: [] }),
+      signal: ctrl.signal,
+    })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await res.text());
+        return res.json();
+      })
+      .then((data) => {
+        if (dead) return;
+        sharpFor = id;
+        sharp = data?.image ? `data:image/jpeg;base64,${data.image}` : '';
+        sharpBusy = false;
+      })
+      .catch((err) => {
+        if (dead || err.name === 'AbortError') return;
+        sharp = '';
+        sharpBusy = false;
+      });
+    return () => {
+      dead = true;
+      ctrl.abort();
+    };
+  });
 </script>
 
 <button type="button" class="drawer-back" aria-label="Close details" onclick={onclose}></button>
@@ -174,10 +217,14 @@
     {:else if tab === 'segment'}
       <Segment tileId={tile.tile_id} mask={tile.mask} />
     {:else}
-      <div class="stage">
-        <img src={tile.thumb} alt="Orthophoto thumbnail" fetchpriority="high" />
-        <img class="mask" src={tile.mask} alt="" style:opacity={opacity} fetchpriority="high" />
-      </div>
+      <button type="button" class="stage" aria-label="Enlarge orthophoto" onclick={() => (zoomOpen = true)}>
+        <img src={tile.thumb} alt="" fetchpriority="high" draggable="false" />
+        <img class="mask" src={tile.mask} alt="" style:opacity={opacity} fetchpriority="high" draggable="false" />
+      </button>
+      <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Orthophoto" note={sharpBusy ? 'Loading a sharper view…' : ''}>
+        <img src={sharp || tile.thumb} alt="Orthophoto" draggable="false" />
+        <img class="mask" src={tile.mask} alt="" style:opacity={opacity} draggable="false" />
+      </Zoom>
       <label class="slider">
         Labels
         <input type="range" min="0" max="1" step="0.05" bind:value={opacity} />
