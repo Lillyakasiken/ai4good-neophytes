@@ -22,6 +22,7 @@ import segmentation_models_pytorch as smp
 
 from torchmetrics.classification import (
     MulticlassAccuracy, MulticlassAUROC, MulticlassF1Score, MulticlassJaccardIndex,
+    MulticlassStatScores,
 )
 
 from utils.scheduler_utils import get_scheduler
@@ -153,6 +154,8 @@ class SegmentationModel(pl.LightningModule):
             setattr(self, f"{split}_f1", MulticlassF1Score(num_classes=num_classes, average='macro', ignore_index=ignore_index))
             setattr(self, f"{split}_auc", MulticlassAUROC(num_classes=num_classes, average='macro', ignore_index=ignore_index, thresholds=5))
             setattr(self, f"{split}_f1_per_class", MulticlassF1Score(num_classes=num_classes, average=None, ignore_index=ignore_index))
+            # # per-class tp/fp/fn for the species F1 (see species_f1)
+            setattr(self, f"{split}_stats", MulticlassStatScores(num_classes=num_classes, average=None, ignore_index=ignore_index))
 
     # -------------------------------------------------------------------------
     # setup
@@ -244,13 +247,29 @@ class SegmentationModel(pl.LightningModule):
         getattr(self, f"{stage}_f1").update(preds.detach(), masks.detach())
         getattr(self, f"{stage}_auc").update(logits.detach(), masks.detach().long())
         getattr(self, f"{stage}_f1_per_class").update(preds.detach(), masks.detach())
+        getattr(self, f"{stage}_stats").update(preds.detach(), masks.detach())
         return loss
+
+    @staticmethod
+    def species_f1(stats):
+        """Mean F1 over the species, background (class 0) excluded.
+
+        Same definition as ``F1-avg-wo0`` in test.py: a class that neither occurs nor
+        is predicted has no F1 (nan) and is left out of the mean. ``val_f1`` instead
+        averages over all classes including background, whose F1 sits at ~0.999 and
+        hides how well the species themselves are segmented.
+        """
+        tp, fp, fn = stats[:, 0].float(), stats[:, 1].float(), stats[:, 3].float()
+        denom = 2 * tp + fp + fn
+        f1 = torch.where(denom > 0, 2 * tp / denom.clamp(min=1), torch.full_like(tp, float('nan')))
+        return torch.nanmean(f1[1:])
 
     def _epoch_end(self, stage, prog_bar=True):
         self.log_dict({
             f"{stage}_acc": getattr(self, f"{stage}_acc").compute(),
             f"{stage}_iou": getattr(self, f"{stage}_iou").compute(),
             f"{stage}_f1": getattr(self, f"{stage}_f1").compute(),
+            f"{stage}_f1_species": self.species_f1(getattr(self, f"{stage}_stats").compute()),
             f"{stage}_auc": getattr(self, f"{stage}_auc").compute(),
         }, prog_bar=prog_bar)
 
@@ -261,7 +280,7 @@ class SegmentationModel(pl.LightningModule):
             for k, v in self.elevation_fusion.get_fusion_scales().items():
                 self.log(k, v, prog_bar=False)
 
-        for metric in ("acc", "iou", "f1", "auc", "f1_per_class"):
+        for metric in ("acc", "iou", "f1", "auc", "f1_per_class", "stats"):
             getattr(self, f"{stage}_{metric}").reset()
 
     def training_step(self, batch, batch_idx):

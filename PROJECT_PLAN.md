@@ -1,6 +1,6 @@
 # Neophytes Group F: Project Plan
 
-*Last updated: Oct 2, 2026*
+*Last updated: Oct 12, 2026 (see [Changelog](#changelog))*
 
 We aim to raise cross-site species F1 over the U-Net + MiT-b2 baseline and to show when the model can be trusted at a new site. Species F1 is the mean F1 of the six target species under 5-fold leave-sites-out cross-validation. We run experiments daily, about one week ahead of each talk: the target freeze is **Nov 18, 2026**, the hard freeze **Nov 27, 2026**, the final presentation **Dec 11, 2026**, and the paper and code are due **Dec 18, 2026**.
 
@@ -21,6 +21,7 @@ We aim to raise cross-site species F1 over the U-Net + MiT-b2 baseline and to sh
 - [Paper and presentations](#paper-and-presentations)
 - [Risks and fallbacks](#risks-and-fallbacks)
 - [Open questions](#open-questions)
+- [Changelog](#changelog)
 - [Sources](#sources)
 
 ## Research questions
@@ -111,13 +112,13 @@ By Tuesday Oct 6, every group member can run the pipeline, and we know what one 
 
 - [ ] Set up the fork, run the smoke test (`data=neophytes_split_debug_1024 model=model_debug`), and obtain W&B access (everyone).
 - [ ] Set up the shared GPU queue with automatic evaluation (see [Daily rhythm](#daily-rhythm)).
-- [ ] Time one full baseline run on cv3 (wall-clock hours and GPU memory); this number sets the compute budget.
-- [ ] Add validation species F1 (background excluded) and use it as the `ModelCheckpoint` monitor.
-- [ ] Fix resuming: pass `ckpt_path` to `trainer.fit` so that the optimizer state, epoch and LR schedule are restored.
-- [ ] Fix `inference.py` so that it feeds nDSM to elevation models (stem mode currently drops it silently; concat mode crashes).
-- [ ] Change `evaluate_cv.py` to use `ddof=1` and to save per-fold, per-seed values for paired tests.
+- [x] Time one full baseline run on cv3 (wall-clock hours and GPU memory); this number sets the compute budget. *Oct 12: 57.8 h and ~40 of 44.4 GiB, far above the 6.5 h budget (see [Compute budget](#compute-budget)).*
+- [x] Add validation species F1 (background excluded) and use it as the `ModelCheckpoint` monitor. *Oct 12: `val_f1_species`.*
+- [x] Fix resuming: pass `ckpt_path` to `trainer.fit` so that the optimizer state, epoch and LR schedule are restored. *Oct 12.*
+- [x] Fix `inference.py` so that it feeds nDSM to elevation models (stem mode currently drops it silently; concat mode crashes). *Oct 12; the orthophoto DSM/DTM paths still have to be set in `configs/inference.yaml`.*
+- [x] Change `evaluate_cv.py` to use `ddof=1` and to save per-fold, per-seed values for paired tests. *Oct 12: `cv_runs.csv`.*
 - [ ] Find out whether mask values 254 and 255 mean "uncertain" or "unlabeled"; RQ4 depends on the answer.
-- [ ] Train the baseline (MiT-b2, defaults) on both development folds × 2 seeds to obtain a first estimate of seed noise.
+- [ ] Train the baseline (MiT-b2, defaults) on both development folds × 2 seeds to obtain a first estimate of seed noise. *Oct 12: cv3 s42 at 1024 crops is done (W&B `baseline_run1`); the remaining runs move to the 512-crop development setting.*
 - [ ] Agree on directions with Group E to avoid duplicated work.
 
 ## Phase 1 — Error analysis and low-cost improvements (Oct 5–14)
@@ -233,6 +234,8 @@ The GPU offers about 880 GPU-hours until the target freeze: about 44 days from O
 
 **If a baseline run takes more than 6.5 hours,** we develop with 512 crops and fewer epochs, run ablations with one seed, and keep three seeds only for the baseline and the final model. The queue (see [Daily rhythm](#daily-rhythm)) keeps the GPU busy at night and on weekends.
 
+**Status, Oct 12:** this fallback applies. The measured run takes 57.8 h, about 9× the assumed budget: 50 epochs × (48 min training + 19 min validation), plus 72 min of testing. The group still has to fix the 512-crop development setting once the first 512 run has finished.
+
 ## Roles
 
 Four workstreams divide the work, each with one owner. A group of fewer than four merges W3 into W1; a larger group pairs people on W2 and on the stretch goals. Every member writes the paper section for their own workstream and presents in rotation.
@@ -291,6 +294,23 @@ We designed the plan so that each phase still yields a paper section if the next
 - [ ] Does the PlantCLEF species list include all six targets and Centaurea stoebe?
 - [ ] Which direction is Group E taking?
 - [ ] Will the supervisors accept a clearly labeled transductive variant?
+
+## Changelog
+
+Each entry lists the date, what changed and where. The details of each entry are in the linked note.
+
+### Oct 12, 2026 — baseline status and Phase 0 code fixes
+
+Details: [docs/changes_2026-10-12.md](docs/changes_2026-10-12.md)
+
+- **Baseline result.** Run `baseline_run1` (cv3, s42, 1024 crops) is finished. Its best checkpoint (epoch 38) reaches a species F1 of 0.859 on validation and **0.594 on test**. R. typhina (0.467) and S. inaequidens (0.121) lose the most at the held-out sites. The checkpoints are in `/zfs/ai4good/groups/neophytes/zhixuan_li/checkpoints/`.
+- **Timing.** One run takes 57.8 h and about 40 GiB of GPU memory, so the compute-budget fallback applies (see [Compute budget](#compute-budget)).
+- **Model selection** (`models/semseg_plm.py`, `configs/model/model.yaml`). The new metric `val_f1_species` is the species F1 without background, defined like `F1-avg-wo0`. It is now the checkpoint and early-stopping monitor; `val_f1` is still logged.
+- **Resuming** (`train.py`). `last.ckpt` now goes to `trainer.fit(ckpt_path=...)`, so the optimizer, epoch and LR schedule are restored instead of only the weights.
+- **CV aggregation** (`evaluate_cv.py`). Runs are keyed by (fold, seed), and seeds are averaged within a fold. Fold std now uses `ddof=1`, and the new output `cv_runs.csv` holds one row per run for paired tests.
+- **Inference with nDSM** (`inference.py`, `configs/inference.yaml`). The new `ElevationReader` feeds the georeferenced nDSM to `concat` and `stem` models, and a missing DSM/DTM path now raises an error.
+- **Queue** (`scripts/queue_2026-10-12_cv3.sh`). The overnight jobs are a smoke test of the changes, `test.py` on both baseline checkpoints, and a first 512-crop cv3 run. The smoke test passed: the resumed run continued at epoch 1, and `val_f1_species` is logged.
+- **`test.py` without AUROC** (`scripts/queue_2026-10-12_cv3_part2.sh`). With its four 200-threshold AUROC metrics, `test.py` needed about 6 h per checkpoint. The test jobs now run with `compute_auc=False`, which brings this down to about 65 min. The AUROC belongs to RQ4 and can be computed later on an idle GPU.
 
 ## Sources
 

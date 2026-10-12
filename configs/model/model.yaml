@@ -44,13 +44,16 @@ lr_scheduler:
     T_max: ${model.max_epochs}  # epochs for one full cosine cycle
     eta_min: 1e-6               # minimum learning rate
 
+# # Model selection monitors val_f1_species: the mean F1 of the six species without
+# # background, i.e. the validation counterpart of the reported test metric (F1-avg-wo0).
+# # val_f1 (all seven classes) is still logged, but background F1 sits at ~0.999 there.
 callbacks:
   - type: LearningRateMonitor
     params:
       log_momentum: False
   - type: EarlyStopping
     params:
-      monitor: val_f1
+      monitor: val_f1_species
       min_delta: 0.001
       # patience >= max_epochs disables early stopping: on the plateau val_f1 is a
       # poor predictor of test performance, so stopping early mostly adds noise
@@ -60,7 +63,7 @@ callbacks:
       verbose: True
   - type: ModelCheckpoint
     params:
-      monitor: val_f1
+      monitor: val_f1_species
       mode: max
       save_last: True
       save_top_k: 1

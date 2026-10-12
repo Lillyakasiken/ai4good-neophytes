@@ -28,6 +28,15 @@ data:
         mean: [0.485, 0.456, 0.406]
         std: [0.229, 0.224, 0.225]
 
+  # # Elevation, only for models trained with the nDSM (ndsm in model.in_channels):
+  # # one DSM and one DTM GeoTiff per entry of image_dir, same order, same CRS as the
+  # # orthophoto. Left at null for such a model, inference.py stops with an error.
+  dsm_path: null
+  dtm_path: null
+  ndsm_norm:  # must match the Normalize of ndsm_transforms in the training data config
+    mean: 1.43
+    std: 3.10
+
 blending: hard_crop  # 'hard_crop' (fast, default) or 'gaussian' (smooth seams, several GB RAM)
 
 # # Additionally write <stem>_uncertainty.tif with one float32 band holding the
