@@ -312,6 +312,15 @@ Details: [docs/changes_2026-10-12.md](docs/changes_2026-10-12.md)
 - **Queue** (`scripts/queue_2026-10-12_cv3.sh`). The overnight jobs are a smoke test of the changes, `test.py` on both baseline checkpoints, and a first 512-crop cv3 run. The smoke test passed: the resumed run continued at epoch 1, and `val_f1_species` is logged.
 - **`test.py` without AUROC** (`scripts/queue_2026-10-12_cv3_part2.sh`). With its four 200-threshold AUROC metrics, `test.py` needed about 6 h per checkpoint. The test jobs now run with `compute_auc=False`, which brings this down to about 65 min. The AUROC belongs to RQ4 and can be computed later on an idle GPU.
 
+### Oct 13, 2026 — baseline failure analysis and the 512 queue
+
+Details: [docs/changes_2026-10-12.md, sections 5–6](docs/changes_2026-10-12.md#5-failure-analysis-of-the-baseline-added-oct-13)
+
+- **Best vs last.** On test, `last` (epoch 49) reaches a species F1 of 0.589, against 0.594 for `best_epoch=38`.
+- **Failure analysis.** R. typhina has a recall of 0.93 but a precision of 0.31, because 61% of its predicted pixels are A. altissima at flights without R. typhina. S. inaequidens (93%) and B. orientalis (57%) are mostly missed as background. Basel_2_4, the only August flight, fails on all classes (species F1 0.157), so the low August score in `f1_per_month.png` is this single flight.
+- **512 speed.** 8.3 it/s (1024: 1.1 it/s), about 7.5 h per run including the test pass. Validation now takes about half of a run's time.
+- **Queue** (`scripts/queue_2026-10-13_512.sh`). Once the current run has finished, this queue runs `test.py` on 512 cv3 s42, then trains 512 cv3 s43, cv1 s42 and cv1 s43, each followed by `test.py`. Together these give the 2 folds × 2 seeds of Phase 0.
+
 ## Sources
 
 - [Overview of PlantCLEF 2025 (released DINOv2 plant models, 1.4M images, 7,806 species)](https://arxiv.org/abs/2509.17602)
