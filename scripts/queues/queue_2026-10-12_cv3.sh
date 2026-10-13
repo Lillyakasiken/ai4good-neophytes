@@ -3,7 +3,7 @@
 # after the other; start it once in tmux from the repo root:
 #
 #     tmux new -s queue
-#     bash scripts/queue_2026-10-12_cv3.sh
+#     bash scripts/queues/queue_2026-10-12_cv3.sh
 #
 # 1. smoke test of today's code changes on the debug split (~10 min, CSV logger):
 #    one epoch, then a resume to two epochs. If it fails, the queue stops here,
@@ -25,7 +25,7 @@ QUEUE_DIR=lightning_logs/queue_2026-10-12
 
 source /zfs/ai4good/groups/neophytes/miniforge3/etc/profile.d/conda.sh
 conda activate "$CONDA_ENV"
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 mkdir -p "$QUEUE_DIR"
 
 wait_for_gpu() {

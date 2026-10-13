@@ -13,11 +13,11 @@
 # every run also gets a test.py pass (best checkpoint, compute_auc=False as in the
 # Oct 12 part 2 queue). test.py picks the test split of the fold from the run name.
 #
-# The queue first waits until scripts/queue_2026-10-12_cv3_part2.sh has exited (its
+# The queue first waits until scripts/queues/queue_2026-10-12_cv3_part2.sh has exited (its
 # last job is train_512_cv3_s42), so it can be started now in a second tmux window:
 #
 #     tmux new -s queue2
-#     bash scripts/queue_2026-10-13_512.sh
+#     bash scripts/queues/queue_2026-10-13_512.sh
 #
 # Every job then waits until the GPU has MIN_FREE_GIB free. The 512 run holds about
 # 34 GiB, so the default is 36 instead of the 40 of the 1024 queues. Logs and exit
@@ -32,7 +32,7 @@ QUEUE_DIR=lightning_logs/queue_2026-10-13
 
 source /zfs/ai4good/groups/neophytes/miniforge3/etc/profile.d/conda.sh
 conda activate "$CONDA_ENV"
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 mkdir -p "$QUEUE_DIR"
 
 wait_for_prev_queue() {

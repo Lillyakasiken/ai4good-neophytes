@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Continuation of scripts/queue_2026-10-12_cv3.sh after its smoke test had passed.
+# Continuation of scripts/queues/queue_2026-10-12_cv3.sh after its smoke test had passed.
 # Jobs 2 and 3 of that queue, with one change: test.py runs with compute_auc=False.
 #
 # Why: with AUROC on, test.py needed 4.6 s per batch (~6 h per checkpoint), because
@@ -7,7 +7,7 @@
 # binary) on 2 x 2048^2 px. The failure analysis needs the confusion matrices and the
 # per-class / per-site / per-month F1, not the AUROC (RQ4); run that later on an idle GPU.
 #
-#     tmux send-keys -t queue "bash scripts/queue_2026-10-12_cv3_part2.sh" Enter
+#     tmux send-keys -t queue "bash scripts/queues/queue_2026-10-12_cv3_part2.sh" Enter
 
 set -u
 
@@ -19,7 +19,7 @@ QUEUE_DIR=lightning_logs/queue_2026-10-12
 
 source /zfs/ai4good/groups/neophytes/miniforge3/etc/profile.d/conda.sh
 conda activate "$CONDA_ENV"
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 mkdir -p "$QUEUE_DIR"
 
 wait_for_gpu() {
