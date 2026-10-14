@@ -15,3 +15,6 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+
+# personal notes (not shared)
+notes/
