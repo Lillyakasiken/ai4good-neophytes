@@ -23,7 +23,9 @@ EDGES = (256, 512, 1024)
 MAX_OPS = 12
 _CACHE_MAX = 8
 _DSM_NODATA = -32767.0
-_TILE_SUFFIX = re.compile(r"(_\d{2}_\d{2}\.tiff?)$", re.IGNORECASE)
+# Row/column index at the end of a tile name. Dornach uses three digits
+# (_058_085); the other sites use two (_02_65).
+_TILE_SUFFIX = re.compile(r"(_\d{2,3}_\d{2,3}\.tiff?)$", re.IGNORECASE)
 
 _cache_lock = threading.Lock()
 _cache = OrderedDict()
@@ -733,7 +735,7 @@ def _match_tile_file(folder, suffix):
 
 
 def _elev_paths(img_path):
-    """Sibling DSM/DTM files that share the tile's ``_RR_CC`` suffix."""
+    """Sibling DSM/DTM files that share the tile's row/column suffix."""
     path = Path(img_path)
     match = _TILE_SUFFIX.search(path.name)
     if match is None:
