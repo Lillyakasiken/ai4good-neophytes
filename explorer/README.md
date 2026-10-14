@@ -4,6 +4,21 @@ Local viewer for the drone tiles the baseline trains on (U-Net + MiT-b2, fold cv
 
 The catalog is one Parquet row per tile, queried with DuckDB. Thumbnails are 256px WebP files, so the grid never opens a full GeoTIFF.
 
+## In the browser
+
+The page opens on the tile grid for cv3 train. Switch to Map to see one flight. Open a tile to look at the photo and its labels, try image filters, or ask for a mask.
+
+```mermaid
+flowchart TD
+  page["Open the explorer"] --> tiles["Tiles"]
+  page --> map["Map"]
+  tiles -->|"filter and sort"| tile["Open a tile"]
+  map -->|"pick a flight"| tile
+  tile --> photo["Photo and class mask"]
+  tile --> vision["Vision"]
+  tile --> segment["Segment"]
+```
+
 ## Setup
 
 ```bash
