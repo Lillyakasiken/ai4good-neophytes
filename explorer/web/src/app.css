@@ -37,7 +37,7 @@ button { cursor: pointer; }
 .app {
   height: 100dvh;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   background: var(--haze);
 }
 
@@ -205,6 +205,21 @@ label.field span { display: flex; gap: 4px; }
   font-size: 13px;
 }
 
+.filters .reset {
+  align-self: end;
+  height: 32px;
+  border: 1px solid var(--line);
+  background: transparent;
+  border-radius: 2px;
+  padding: 0 12px;
+  white-space: nowrap;
+}
+
+.filters .reset:disabled {
+  color: var(--quiet);
+  cursor: default;
+}
+
 .species {
   display: flex;
   flex-wrap: wrap;
@@ -251,7 +266,7 @@ label.field span { display: flex; gap: 4px; }
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   background: #e8e8e8;
 }
 
@@ -273,6 +288,92 @@ label.field span { display: flex; gap: 4px; }
   color: var(--ink);
   height: 32px;
 }
+
+.map-time {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 22px;
+  padding: 8px 18px 10px;
+  background: var(--sheet);
+  border-bottom: 1px solid var(--line);
+}
+
+.map-year {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.map-year-label {
+  font-size: 12px;
+  color: var(--mist);
+  font-variant-numeric: tabular-nums;
+}
+
+.map-year.quiet .map-year-label {
+  color: var(--quiet);
+}
+
+.map-months {
+  display: flex;
+  gap: 4px;
+}
+
+.map-month {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  width: 52px;
+  height: 46px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--ink);
+  line-height: 1.05;
+}
+
+button.map-month { cursor: pointer; }
+
+.map-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--canopy);
+}
+
+.map-month-name { font-size: 12px; }
+
+.map-month-day {
+  min-height: 11px;
+  font-size: 11px;
+  color: var(--mist);
+  font-variant-numeric: tabular-nums;
+}
+
+.map-month.on {
+  background: var(--canopy);
+  border-color: var(--canopy);
+  color: var(--sheet);
+}
+
+.map-month.on .map-dot { background: var(--sheet); }
+
+.map-month.on .map-month-day {
+  color: color-mix(in srgb, var(--sheet) 82%, transparent);
+}
+
+.map-month.off {
+  color: var(--quiet);
+  background: color-mix(in srgb, var(--haze) 55%, var(--sheet));
+  border-color: transparent;
+}
+
+.map-month.off .map-dot { visibility: hidden; }
 
 .map-actions {
   display: flex;
@@ -436,11 +537,39 @@ label.field span { display: flex; gap: 4px; }
   overflow: visible;
 }
 
-.world .tile-grid path {
+.world .tile-grid path.edge {
   fill: none;
   stroke: rgba(255, 255, 255, 0.92);
   stroke-width: 1;
   filter: drop-shadow(0 0 0.6px rgba(18, 32, 36, 0.85));
+}
+
+.world .tile-grid path.mark {
+  fill-opacity: 0.46;
+  stroke-opacity: 0.95;
+  stroke-width: 1.25;
+}
+
+.map-legend {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.map-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.map-legend i {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
 }
 
 .world .cell img {
@@ -796,6 +925,87 @@ label.field span { display: flex; gap: 4px; }
   background: transparent;
 }
 
+.seasons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px 14px;
+  margin: 0 0 14px;
+}
+
+.season-year {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.season-year-label {
+  font-size: 11px;
+  color: var(--mist);
+  font-variant-numeric: tabular-nums;
+}
+
+.season-months {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.season {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  width: 46px;
+  height: 38px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--ink);
+  line-height: 1.05;
+}
+
+button.season:disabled { cursor: default; }
+
+.season-name { font-size: 12px; }
+
+.season-day {
+  min-height: 11px;
+  font-size: 11px;
+  color: var(--mist);
+  font-variant-numeric: tabular-nums;
+}
+
+.season.on {
+  background: var(--canopy);
+  border-color: var(--canopy);
+  color: var(--sheet);
+}
+
+.season.on .season-day {
+  color: color-mix(in srgb, var(--sheet) 82%, transparent);
+}
+
+.season.off {
+  color: var(--quiet);
+  background: color-mix(in srgb, var(--haze) 55%, var(--sheet));
+  border-color: transparent;
+}
+
+.season.pending {
+  outline: 2px solid var(--canopy);
+  outline-offset: 1px;
+}
+
+.season-error {
+  margin: 0 0 10px;
+  color: var(--ink);
+  font-size: 13px;
+}
+
 .drawer h2 {
   margin: 0;
   font-family: "Bricolage Grotesque", "Public Sans", sans-serif;
@@ -809,6 +1019,10 @@ label.field span { display: flex; gap: 4px; }
   background: transparent;
   border-radius: 2px;
   padding: 4px 8px;
+}
+
+.shot {
+  position: relative;
 }
 
 .stage {
@@ -834,6 +1048,8 @@ button.stage {
 button.stage:disabled {
   cursor: default;
 }
+
+.stage.busy { opacity: 0.72; }
 
 .stage img { width: 100%; height: 100%; object-fit: contain; display: block; }
 

@@ -1,7 +1,7 @@
 <script>
-  import { untrack } from 'svelte';
+  import { tick, untrack } from 'svelte';
 
-  let { facets, filters, showLabels = $bindable(), onopen } = $props();
+  let { facets, filters = $bindable(), showLabels = $bindable(), onopen } = $props();
 
   const OVERVIEW_MAX = 72;
   // Sheet builds are slow and share the browser's connection pool with the
@@ -27,7 +27,22 @@
   let hover = $state(null);
   let imageOpacity = $state(1);
   let showGrid = $state(false);
+  let showRoleColors = $state(true);
 
+  const MONTHS = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const ROLES = [
+    ['all', 'All roles'],
+    ['train', 'Train'],
+    ['val', 'Validation'],
+    ['test', 'Test'],
+    ['unused', 'Unused'],
+  ];
+  const ROLE_COLOR = {
+    train: '#1f8a4c',
+    val: '#2b6cb0',
+    test: '#d97706',
+    unused: '#64748b',
+  };
   const IGNORE = [
     { name: 'unlabelled', color: '#737373', binomial: false },
     { name: 'uncertain', color: '#facc15', binomial: false },
@@ -41,7 +56,32 @@
 
   let sites = $derived([...new Set((facets?.flights ?? []).map((row) => row.site_name))]);
   let flightsForSite = $derived(
-    (facets?.flights ?? []).filter((row) => row.site_name === site),
+    (facets?.flights ?? [])
+      .filter((row) => row.site_name === site)
+      .slice()
+      .sort((a, b) => String(a.acq_date ?? '').localeCompare(String(b.acq_date ?? ''))
+        || String(a.flight).localeCompare(String(b.flight))),
+  );
+  let years = $derived(facets?.years ?? []);
+  let months = $derived(facets?.months ?? []);
+  let flightAt = $derived.by(() => {
+    const at = new Map();
+    for (const row of flightsForSite) {
+      if (row.year == null || row.month == null) continue;
+      const key = `${row.year}-${row.month}`;
+      if (!at.has(key)) at.set(key, row);
+    }
+    return at;
+  });
+  let timeline = $derived(
+    years.map((year) => ({
+      year,
+      quiet: !months.some((month) => flightAt.has(`${year}-${month}`)),
+      months: months.map((month) => ({
+        month,
+        row: flightAt.get(`${year}-${month}`) ?? null,
+      })),
+    })),
   );
   let byCell = $derived(
     new Map((mosaic?.tiles ?? []).map((tile) => [`${tile.col},${tile.row}`, tile])),
@@ -65,6 +105,25 @@
       path += `M${x} ${y}h${cell}v${cell}h${-cell}z`;
     }
     return path;
+  });
+  let roleMarks = $derived.by(() => {
+    if (!showGrid || !mosaic) return [];
+    const wanted = filters.role && filters.role !== 'all' ? filters.role : null;
+    const paths = { train: '', val: '', test: '', unused: '' };
+    const counts = { train: 0, val: 0, test: 0, unused: 0 };
+    for (const tile of mosaic.tiles) {
+      const role = tile.cv_role;
+      if (!(role in paths)) continue;
+      if (wanted && role !== wanted) continue;
+      counts[role] += 1;
+      if (!showRoleColors) continue;
+      const x = tile.col * cell;
+      const y = tile.row * cell;
+      paths[role] += `M${x} ${y}h${cell}v${cell}h${-cell}z`;
+    }
+    return ['train', 'val', 'test', 'unused']
+      .filter((role) => counts[role])
+      .map((role) => ({ role, path: paths[role], color: ROLE_COLOR[role], count: counts[role] }));
   });
   let chunks = $derived.by(() => {
     if (!mosaic || overview || !viewportW) return [];
@@ -279,12 +338,39 @@
     };
   }
 
+  function dayOf(acq) {
+    if (!acq || String(acq).length < 10) return '';
+    const day = Number(String(acq).slice(8, 10));
+    return Number.isFinite(day) ? String(day) : '';
+  }
+
+  function flightDateLabel(row, year, month) {
+    const day = dayOf(row.acq_date);
+    const when = day ? `${day} ${MONTHS[month]} ${year}` : `${MONTHS[month] ?? month} ${year}`;
+    return `${site}, ${when}`;
+  }
+
   function chooseSite(value) {
     site = value;
-    const rows = (facets?.flights ?? []).filter((row) => row.site_name === value);
-    if (!rows.some((row) => String(row.flight) === flight)) {
-      flight = rows[0] ? String(rows[0].flight) : '';
-    }
+    const rows = (facets?.flights ?? [])
+      .filter((row) => row.site_name === value)
+      .slice()
+      .sort((a, b) => String(a.acq_date ?? '').localeCompare(String(b.acq_date ?? ''))
+        || String(a.flight).localeCompare(String(b.flight)));
+    flight = rows[0] ? String(rows[0].flight) : '';
+  }
+
+  async function onTimelineKey(event) {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    const group = event.currentTarget.closest('.map-time');
+    const rows = flightsForSite.filter((row) => row.year != null && row.month != null);
+    const index = rows.findIndex((row) => String(row.flight) === String(flight));
+    const next = rows[index + (event.key === 'ArrowRight' ? 1 : -1)];
+    if (!next) return;
+    event.preventDefault();
+    flight = String(next.flight);
+    await tick();
+    group?.querySelector('.map-month.on')?.focus();
   }
 
   function fit() {
@@ -424,15 +510,23 @@
       </select>
     </label>
     <label class="field">
-      Flight
-      <select value={flight} onchange={(event) => (flight = event.currentTarget.value)}>
-        {#each flightsForSite as row (`${row.site_name}-${row.flight}`)}
-          <option value={row.flight}>{row.flight}</option>
+      Fold
+      <select bind:value={filters.fold}>
+        {#each ['cv1', 'cv2', 'cv3', 'cv4', 'cv5'] as fold}
+          <option value={fold}>{fold}</option>
+        {/each}
+      </select>
+    </label>
+    <label class="field">
+      CV role
+      <select bind:value={filters.role}>
+        {#each ROLES as [value, label]}
+          <option {value}>{label}</option>
         {/each}
       </select>
     </label>
     <div class="map-actions">
-      <button type="button" class="fit" onclick={fit}>Fit</button>
+      <button type="button" class="fit" onclick={fit}>Fit map to screen</button>
       {#if error}
         <p class="map-meta">{error}</p>
       {:else if mosaic}
@@ -452,12 +546,59 @@
         <input type="checkbox" bind:checked={showGrid} />
         Show grid
       </label>
+      <label class="map-check">
+        <input type="checkbox" bind:checked={showRoleColors} />
+        Color roles
+      </label>
+      {#if showGrid && showRoleColors && roleMarks.length}
+        <p class="map-legend">
+          {#each roleMarks as mark (mark.role)}
+            <span>
+              <i style:background={mark.color}></i>
+              {mark.role} {mark.count.toLocaleString()}
+            </span>
+          {/each}
+        </p>
+      {/if}
       <label class="map-slider">
         Image
         <input type="range" min="0" max="1" step="0.05" bind:value={imageOpacity} />
       </label>
-      <p class="map-hint">Whole flight, every folder. Drag to move, scroll to zoom, click a tile.</p>
+      <p class="map-hint">Whole flight. The grid marks tiles in this fold and role. Drag to move, scroll to zoom, click a tile.</p>
     </div>
+  </div>
+
+  <div class="map-time" role="group" aria-label="Flights of {site} by date">
+    {#each timeline as group (group.year)}
+      <div class="map-year" class:quiet={group.quiet}>
+        <span class="map-year-label">{group.year}</span>
+        <div class="map-months">
+          {#each group.months as cell (`${group.year}-${cell.month}`)}
+            {#if cell.row}
+              <button
+                type="button"
+                class="map-month"
+                class:on={String(cell.row.flight) === String(flight)}
+                aria-pressed={String(cell.row.flight) === String(flight)}
+                aria-label={flightDateLabel(cell.row, group.year, cell.month)}
+                onclick={() => (flight = String(cell.row.flight))}
+                onkeydown={onTimelineKey}
+              >
+                <span class="map-dot" aria-hidden="true"></span>
+                <span class="map-month-name">{MONTHS[cell.month]}</span>
+                <span class="map-month-day">{dayOf(cell.row.acq_date)}</span>
+              </button>
+            {:else}
+              <span class="map-month off">
+                <span class="map-dot" aria-hidden="true"></span>
+                <span class="map-month-name">{MONTHS[cell.month]}</span>
+                <span class="map-month-day"></span>
+              </span>
+            {/if}
+          {/each}
+        </div>
+      </div>
+    {/each}
   </div>
 
   <div
@@ -542,7 +683,12 @@
         {/each}
         {#if showGrid}
           <svg class="tile-grid" aria-hidden="true">
-            <path d={gridPath} />
+            {#if showRoleColors}
+              {#each roleMarks as mark (mark.role)}
+                <path class="mark" d={mark.path} style:fill={mark.color} style:stroke={mark.color} />
+              {/each}
+            {/if}
+            <path class="edge" d={gridPath} />
           </svg>
         {/if}
       </div>

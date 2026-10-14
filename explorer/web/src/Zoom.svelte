@@ -1,5 +1,7 @@
 <script>
-  let { open = false, onclose, label = 'Image', note = '', children } = $props();
+  import CopyButton from './CopyButton.svelte';
+
+  let { open = false, onclose, label = 'Image', note = '', opacity = $bindable(undefined), children } = $props();
 
   const MIN_SCALE = 1;
   const MAX_SCALE = 8;
@@ -143,8 +145,17 @@
       <button type="button" onclick={() => zoomBy(1.25)} aria-label="Zoom in">+</button>
       <button type="button" onclick={center}>Reset</button>
       <span class="hint">Scroll to zoom, drag to move</span>
-      {#if note}<span class="note">{note}</span>{/if}
-      <button type="button" class="done" onclick={onclose}>Close</button>
+      {#if note}<span class="status">{note}</span>{/if}
+      <span class="trail">
+        {#if opacity !== undefined}
+          <label class="slider">
+            Labels
+            <input type="range" min="0" max="1" step="0.05" bind:value={opacity} aria-label="Label opacity" />
+          </label>
+        {/if}
+        <CopyButton root={frameEl} />
+        <button type="button" class="done" onclick={onclose}>Close</button>
+      </span>
     </div>
     <div
       class="viewport"
@@ -208,12 +219,45 @@
   }
 
   .hint,
-  .note {
+  .status {
+    margin: 0;
+    line-height: 1;
+    align-self: center;
+  }
+
+  .hint {
     color: rgba(244, 248, 249, 0.72);
     font-size: 12px;
   }
 
-  .done { margin-left: auto; }
+  .status {
+    color: var(--sheet);
+    font-size: 12px;
+  }
+
+  .trail {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .slider {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    color: rgba(244, 248, 249, 0.85);
+    font-size: 12px;
+    line-height: 1;
+  }
+
+  .slider input {
+    flex: none;
+    width: 9rem;
+    margin: 0;
+    accent-color: var(--haze);
+  }
 
   .viewport {
     position: relative;

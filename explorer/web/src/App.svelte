@@ -13,23 +13,44 @@
   let openId = $state(null);
   let infoOpen = $state(false);
   let view = $state('tiles');
-  let filters = $state({
-    fold: 'cv3',
-    role: 'train',
-    split: '',
-    site: '',
-    flight: '',
-    year: '',
-    month: '',
-    species: [],
-    labelled: false,
-    backgroundOnly: false,
-    nodataMin: '',
-    nodataMax: '',
-    minM2: '',
-    minM2Species: 'A_altissima',
-    sort: 'label_m2',
+
+  function defaultFilters() {
+    return {
+      fold: 'cv3',
+      role: 'train',
+      split: '',
+      site: '',
+      flight: '',
+      year: '',
+      month: '',
+      species: [],
+      labelled: false,
+      backgroundOnly: false,
+      nodataMin: '',
+      nodataMax: '',
+      minM2: '',
+      maxM2: '',
+      m2Species: 'label_m2',
+      sort: 'label_m2',
+    };
+  }
+
+  let filters = $state(defaultFilters());
+  let filtersChanged = $derived.by(() => {
+    const base = defaultFilters();
+    for (const key of Object.keys(base)) {
+      if (key === 'species') {
+        if (filters.species.length > 0) return true;
+        continue;
+      }
+      if (filters[key] !== base[key]) return true;
+    }
+    return false;
   });
+
+  function resetFilters() {
+    filters = defaultFilters();
+  }
 
   function setNumber(params, key, value) {
     if (value == null || value === '' || Number.isNaN(Number(value))) return;
@@ -51,7 +72,8 @@
     setNumber(p, 'nodata_min', filters.nodataMin);
     setNumber(p, 'nodata_max', filters.nodataMax);
     setNumber(p, 'min_m2', filters.minM2);
-    if (p.has('min_m2')) p.set('min_m2_species', filters.minM2Species);
+    setNumber(p, 'max_m2', filters.maxM2);
+    if (p.has('min_m2') || p.has('max_m2')) p.set('m2_species', filters.m2Species);
     p.set('sort', filters.sort);
     return p.toString();
   });
@@ -165,12 +187,12 @@
   </header>
 
   {#if view !== 'map'}
-    <Filters {facets} bind:filters bind:showLabels />
+    <Filters {facets} bind:filters bind:showLabels changed={filtersChanged} onreset={resetFilters} />
   {/if}
 
   <div class="workspace" class:map-mode={view === 'map'}>
     {#if view === 'map'}
-      <Map {facets} {filters} bind:showLabels onopen={(id) => (openId = id)} />
+      <Map {facets} bind:filters bind:showLabels onopen={(id) => (openId = id)} />
     {:else}
       {#if error}
         <p class="error">{error}</p>

@@ -6,10 +6,14 @@ Run from this directory, with its virtualenv:
 """
 
 import math
+import os
+import re
 import threading
 from datetime import date, datetime
 
 import duckdb
+import numpy as np
+import rasterio
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -61,6 +65,15 @@ SORTS = {
     "acq_date": "acq_date NULLS LAST, tile_id",
     "site_name": "site_name, flight, acq_date, tile_id",
 }
+
+# Empty margin is empty pixels divided by every pixel in the tile.
+NODATA_MIN = 0.0
+NODATA_MAX = 1.0
+# A 2048 px tile at the coarsest ground sampling distance here (~3 mm)
+# covers about 38.6 m². 40 leaves a little room past that and rejects
+# areas no tile can have.
+M2_MIN = 0.0
+M2_MAX = 40.0
 for _name in SPECIES_NAMES:
     SORTS[f"{_name}_m2"] = f"{_name}_m2 DESC, tile_id"
 
@@ -74,6 +87,21 @@ app.mount("/masks", StaticFiles(directory=MASKS_DIR), name="masks")
 def _require_catalog():
     if not TILES_PARQUET.is_file():
         raise HTTPException(status_code=503, detail="Catalog missing. Run explorer/build_catalog.py.")
+
+
+def _label_ids(mask_path):
+    """Class ids present in the label tile.
+
+    The mask thumbnail is a lossy WebP, so its colors are not the class ids.
+    Band 1 of the GeoTIFF is: 0 background, 1–6 species, 254 unlabelled, 255 uncertain.
+    """
+    path = resolve_data_path(mask_path)
+    try:
+        with rasterio.open(path) as src:
+            values = np.unique(src.read(1))
+    except (OSError, rasterio.errors.RasterioIOError):
+        return None
+    return [int(v) for v in values.tolist()]
 
 
 def _fold(fold):
@@ -116,11 +144,23 @@ def _source():
     )
 
 
+def _m2_column(name):
+    if not name or name == "label_m2":
+        return "label_m2"
+    if name not in SPECIES_BY_NAME:
+        raise HTTPException(status_code=400, detail="m2_species must be label_m2 or a species stats name")
+    return f"{name}_m2"
+
+
 def _where(
     fold, role, split, site, flight, year, month, species, labelled,
-    nodata_min, nodata_max, min_m2, min_m2_species, include_role=True,
-    background_only=False,
+    nodata_min, nodata_max, min_m2, m2_species, include_role=True,
+    background_only=False, max_m2=None,
 ):
+    if nodata_min is not None and nodata_max is not None and nodata_min > nodata_max:
+        raise HTTPException(status_code=400, detail="empty margin min cannot be greater than max")
+    if min_m2 is not None and max_m2 is not None and min_m2 > max_m2:
+        raise HTTPException(status_code=400, detail="min m² cannot be greater than max m²")
     clauses = []
     params = []
     if include_role and role and role != "all":
@@ -162,17 +202,74 @@ def _where(
     if nodata_max is not None:
         clauses.append("nodata_frac <= ?")
         params.append(nodata_max)
-    if min_m2 is not None:
-        if min_m2_species not in SPECIES_BY_NAME:
-            raise HTTPException(status_code=400, detail="min_m2_species must be a species stats name")
-        clauses.append(f"{min_m2_species}_m2 >= ?")
-        params.append(min_m2)
+    if min_m2 is not None or max_m2 is not None:
+        column = _m2_column(m2_species)
+        if min_m2 is not None:
+            clauses.append(f"{column} >= ?")
+            params.append(min_m2)
+        if max_m2 is not None:
+            clauses.append(f"{column} <= ?")
+            params.append(max_m2)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     return where, params
 
 
 def _present(row):
     return [name for name in SPECIES_NAMES if (row.get(f"{name}_px") or 0) > 0]
+
+
+_CELL = re.compile(r"(\d+_\d+)\.[A-Za-z0-9]+$")
+
+
+def _grid_cell(path):
+    """Row and column suffix of a tile filename, such as ``01_67``.
+
+    Flights of one site are cut on the same grid, so the suffix is the same
+    spot in every season.
+    """
+    match = _CELL.search(os.path.basename(str(path)))
+    return match.group(1) if match else None
+
+
+def _seasons(site_name, img_path):
+    """Every flight of this site, and the tile at this spot when it was cut."""
+    cell = _grid_cell(img_path)
+    if not site_name or not cell:
+        return []
+    rows = _fetch(
+        """
+        WITH flights AS (
+            SELECT flight,
+                   MIN(acq_date) AS acq_date,
+                   MIN("year") AS year,
+                   MIN(month) AS month
+            FROM read_parquet(?)
+            WHERE site_name = ?
+            GROUP BY flight
+        ),
+        here AS (
+            SELECT tile_id, flight
+            FROM read_parquet(?)
+            WHERE site_name = ?
+              AND regexp_extract(img_path, '(\\d+_\\d+)\\.[A-Za-z0-9]+$', 1) = ?
+        )
+        SELECT f.flight, f.year, f.month, f.acq_date, h.tile_id
+        FROM flights f
+        LEFT JOIN here h USING (flight)
+        ORDER BY f.acq_date, f.flight
+        """,
+        [str(TILES_PARQUET), site_name, str(TILES_PARQUET), site_name, cell],
+    )
+    return [
+        {
+            "tile_id": row["tile_id"],
+            "flight": row["flight"],
+            "year": row["year"],
+            "month": row["month"],
+            "acq_date": row["acq_date"],
+        }
+        for row in rows
+    ]
 
 
 def _tile_brief(row):
@@ -201,10 +298,14 @@ def facets():
     _require_catalog()
     flights = _fetch(
         """
-        SELECT site_name, flight, COUNT(*)::BIGINT AS tiles
+        SELECT site_name, flight,
+               MIN(acq_date) AS acq_date,
+               MIN(year) AS year,
+               MIN(month) AS month,
+               COUNT(*)::BIGINT AS tiles
         FROM read_parquet(?)
         GROUP BY 1, 2
-        ORDER BY 1, 2
+        ORDER BY 1, 3, 2
         """,
         [str(TILES_PARQUET)],
     )
@@ -227,6 +328,12 @@ def facets():
         ],
         "folds": {fold: {"test_sites": sites} for fold, sites in CV_FOLDS.items()},
         "sorts": list(SORTS),
+        "bounds": {
+            "nodata_min": NODATA_MIN,
+            "nodata_max": NODATA_MAX,
+            "m2_min": M2_MIN,
+            "m2_max": M2_MAX,
+        },
     }
 
 
@@ -242,10 +349,11 @@ def tiles(
     species: list[str] = Query(default=[]),
     labelled: bool = False,
     background_only: bool = False,
-    nodata_min: float | None = None,
-    nodata_max: float | None = None,
-    min_m2: float | None = None,
-    min_m2_species: str | None = None,
+    nodata_min: float | None = Query(default=None, ge=NODATA_MIN, le=NODATA_MAX),
+    nodata_max: float | None = Query(default=None, ge=NODATA_MIN, le=NODATA_MAX),
+    min_m2: float | None = Query(default=None, ge=M2_MIN, le=M2_MAX),
+    max_m2: float | None = Query(default=None, ge=M2_MIN, le=M2_MAX),
+    m2_species: str | None = None,
     sort: str = "label_m2",
     limit: int = Query(default=60, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -256,8 +364,8 @@ def tiles(
         raise HTTPException(status_code=400, detail=f"sort must be one of {', '.join(SORTS)}")
     where, params = _where(
         fold, role, split, site, flight, year, month, species, labelled,
-        nodata_min, nodata_max, min_m2, min_m2_species,
-        background_only=background_only,
+        nodata_min, nodata_max, min_m2, m2_species,
+        background_only=background_only, max_m2=max_m2,
     )
     px_cols = ", ".join(f"{name}_px" for name in SPECIES_NAMES)
     source, source_params = "FROM read_parquet(?) t", [str(TILES_PARQUET)]
@@ -298,6 +406,7 @@ def tile_detail(tile_id: str):
     for spec in SPECIES:
         name = spec["stats_name"]
         species.append({
+            "id": spec["id"],
             "stats_name": name,
             "name": spec["name"],
             "color": spec["color"],
@@ -336,8 +445,10 @@ def tile_detail(tile_id: str):
         "background": {"px": row["background_px"], "m2": row["background_m2"]},
         "roles": {fold: row[f"{fold}_role"] for fold in FOLDS},
         "species": species,
+        "label_ids": _label_ids(row["mask_path"]),
         "thumb": f"/thumbs/{row['tile_id']}.webp",
         "mask": f"/masks/{row['tile_id']}.webp",
+        "seasons": _seasons(row["site_name"], row["img_path"]),
     }
 
 
@@ -434,10 +545,11 @@ def stats(
     species: list[str] = Query(default=[]),
     labelled: bool = False,
     background_only: bool = False,
-    nodata_min: float | None = None,
-    nodata_max: float | None = None,
-    min_m2: float | None = None,
-    min_m2_species: str | None = None,
+    nodata_min: float | None = Query(default=None, ge=NODATA_MIN, le=NODATA_MAX),
+    nodata_max: float | None = Query(default=None, ge=NODATA_MIN, le=NODATA_MAX),
+    min_m2: float | None = Query(default=None, ge=M2_MIN, le=M2_MAX),
+    max_m2: float | None = Query(default=None, ge=M2_MIN, le=M2_MAX),
+    m2_species: str | None = None,
 ):
     _require_catalog()
     fold = _fold(fold)
@@ -445,7 +557,7 @@ def stats(
         fold=fold, split=split, site=site, flight=flight, year=year, month=month,
         species=species, labelled=labelled, background_only=background_only,
         nodata_min=nodata_min, nodata_max=nodata_max,
-        min_m2=min_m2, min_m2_species=min_m2_species,
+        min_m2=min_m2, max_m2=max_m2, m2_species=m2_species,
     )
     where, params = _where(role=role, include_role=True, **common)
     where_roles, params_roles = _where(role=role, include_role=False, **common)

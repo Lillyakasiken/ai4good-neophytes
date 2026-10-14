@@ -1,5 +1,6 @@
 <script>
   import { tick } from 'svelte';
+  import CopyButton from './CopyButton.svelte';
   import Zoom from './Zoom.svelte';
 
   let { tileId, mask } = $props();
@@ -492,40 +493,45 @@
         {/each}
       </select>
     </label>
-    <button
-      type="button"
-      class="stage"
-      aria-busy={busy}
-      aria-label="Enlarge preview"
-      disabled={!view?.image}
-      onclick={() => (zoomOpen = true)}
-    >
+    <div class="shot">
+      <button
+        type="button"
+        class="stage"
+        aria-busy={busy}
+        aria-label="Enlarge preview"
+        disabled={!view?.image}
+        onclick={() => (zoomOpen = true)}
+      >
+        {#if view?.image}
+          <img class="base" src={urlOf(view)} alt="" draggable="false" />
+        {:else if !problem}
+          <p class="wait">Rendering preview…</p>
+        {/if}
+        {#if canWipe}
+          <img
+            class="wipe"
+            src={urlOf(original)}
+            alt=""
+            draggable="false"
+            style:clip-path={`inset(0 0 0 ${wipe}%)`}
+          />
+        {/if}
+        {#if mask}
+          <img class="mask" src={mask} alt="" draggable="false" style:opacity={opacity} />
+        {/if}
+        <canvas
+          class="segment"
+          bind:this={segmentCanvas}
+          aria-hidden="true"
+          style:clip-path={canWipe ? `inset(0 ${100 - wipe}% 0 0)` : undefined}
+        ></canvas>
+      </button>
       {#if view?.image}
-        <img class="base" src={urlOf(view)} alt="" draggable="false" />
-      {:else if !problem}
-        <p class="wait">Rendering preview…</p>
+        <CopyButton overlay />
       {/if}
-      {#if canWipe}
-        <img
-          class="wipe"
-          src={urlOf(original)}
-          alt=""
-          draggable="false"
-          style:clip-path={`inset(0 0 0 ${wipe}%)`}
-        />
-      {/if}
-      {#if mask}
-        <img class="mask" src={mask} alt="" draggable="false" style:opacity={opacity} />
-      {/if}
-      <canvas
-        class="segment"
-        bind:this={segmentCanvas}
-        aria-hidden="true"
-        style:clip-path={canWipe ? `inset(0 ${100 - wipe}% 0 0)` : undefined}
-      ></canvas>
-    </button>
+    </div>
     {#if view?.image}
-      <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Filtered preview">
+      <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Filtered preview" bind:opacity>
         <img class="base" src={urlOf(view)} alt="Filtered preview" draggable="false" />
         {#if canWipe}
           <img

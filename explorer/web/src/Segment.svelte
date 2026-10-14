@@ -1,4 +1,6 @@
 <script>
+  import CopyButton from './CopyButton.svelte';
+
   let { tileId, mask } = $props();
 
   const FALLBACK_EDGES = [256, 512, 1024];
@@ -421,35 +423,40 @@
         {/each}
       </select>
     </label>
-    <div class="stage" aria-busy={busy}>
-      {#if baseUrl}
-        {#if promptKind === 'points'}
-          <button
-            type="button"
-            class="frame aim"
-            style:aspect-ratio={`${base.width} / ${base.height}`}
-            aria-label={boxTool ? 'Draw a region' : 'Add a point'}
-            onclick={onPreviewClick}
-            onpointerdown={onPointerDown}
-            onpointermove={onPointerMove}
-            onpointerup={onPointerUp}
-            onpointercancel={onPointerUp}
-          >
-            {@render frameBody()}
-          </button>
-        {:else}
-          <div class="frame" style:aspect-ratio={`${base.width} / ${base.height}`}>
-            {@render frameBody()}
+    <div class="shot">
+      <div class="stage" aria-busy={busy}>
+        {#if baseUrl}
+          {#if promptKind === 'points'}
+            <button
+              type="button"
+              class="frame aim"
+              style:aspect-ratio={`${base.width} / ${base.height}`}
+              aria-label={boxTool ? 'Draw a region' : 'Add a point'}
+              onclick={onPreviewClick}
+              onpointerdown={onPointerDown}
+              onpointermove={onPointerMove}
+              onpointerup={onPointerUp}
+              onpointercancel={onPointerUp}
+            >
+              {@render frameBody()}
+            </button>
+          {:else}
+            <div class="frame" style:aspect-ratio={`${base.width} / ${base.height}`}>
+              {@render frameBody()}
+            </div>
+          {/if}
+        {:else if !problem}
+          <p class="wait">Rendering preview…</p>
+        {/if}
+        {#if predBusy}
+          <div class="predicting" role="status" aria-live="polite">
+            <span class="spin" aria-hidden="true"></span>
+            Running prediction
           </div>
         {/if}
-      {:else if !problem}
-        <p class="wait">Rendering preview…</p>
-      {/if}
-      {#if predBusy}
-        <div class="predicting" role="status" aria-live="polite">
-          <span class="spin" aria-hidden="true"></span>
-          Running prediction
-        </div>
+      </div>
+      {#if baseUrl}
+        <CopyButton overlay />
       {/if}
     </div>
     <label class="slider">

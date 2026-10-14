@@ -1,4 +1,6 @@
 <script>
+  import { tick } from 'svelte';
+  import CopyButton from './CopyButton.svelte';
   import Process from './Process.svelte';
   import Segment from './Segment.svelte';
   import Zoom from './Zoom.svelte';
@@ -6,34 +8,62 @@
   let { tileId, fold, onclose } = $props();
 
   let tile = $state(null);
+  let activeId = $state(null);
   let error = $state('');
+  let loading = $state(false);
   let opacity = $state(0.8);
   let tab = $state('tile');
   let legendOpen = $state(false);
-  let maskLegend = $state(null);
   let zoomOpen = $state(false);
   let sharp = $state('');
   let sharpFor = $state('');
   let sharpBusy = $state(false);
+  // A failed season switch puts the selection back. Skip the fetch that write would start.
+  let ignoreNext = false;
 
-  const IGNORE = [
-    { kind: 'ignore', color: '#737373', label: 'unlabelled' },
-    { kind: 'ignore', color: '#facc15', label: 'uncertain' },
-  ];
+  const MONTHS = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  const IGNORE = {
+    254: { kind: 'ignore', color: '#737373', label: 'unlabelled' },
+    255: { kind: 'ignore', color: '#facc15', label: 'uncertain' },
+  };
 
   const ROLE_LABELS = { train: 'train', val: 'val', test: 'test', unused: 'unused' };
 
   $effect(() => {
     const id = tileId;
+    activeId = id;
     tile = null;
     error = '';
+    loading = false;
+    legendOpen = false;
     zoomOpen = false;
     sharp = '';
     sharpFor = '';
     sharpBusy = false;
+  });
+
+  $effect(() => {
+    function onKey(event) {
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      onclose();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  $effect(() => {
+    const id = activeId;
     if (!id) return;
+    if (ignoreNext) {
+      ignoreNext = false;
+      return;
+    }
+    const ctrl = new AbortController();
     let dead = false;
-    fetch('/api/tiles/' + id, { priority: 'high' })
+    loading = true;
+    error = '';
+    fetch('/api/tiles/' + id, { priority: 'high', signal: ctrl.signal })
       .then(async (res) => {
         if (!res.ok) throw new Error(await res.text());
         return res.json();
@@ -42,20 +72,68 @@
         if (!dead) tile = data;
       })
       .catch((err) => {
-        if (!dead) error = String(err.message || err);
+        if (dead || err.name === 'AbortError') return;
+        error = String(err.message || err);
+        if (tile?.tile_id && tile.tile_id !== id) {
+          ignoreNext = true;
+          activeId = tile.tile_id;
+        }
+      })
+      .finally(() => {
+        if (!dead) loading = false;
       });
-    legendOpen = false;
-    maskLegend = null;
-    function onKey(event) {
-      if (event.key !== 'Escape' || event.defaultPrevented) return;
-      onclose();
-    }
-    window.addEventListener('keydown', onKey);
     return () => {
       dead = true;
-      window.removeEventListener('keydown', onKey);
+      ctrl.abort();
     };
   });
+
+  function dayOf(acq) {
+    if (!acq || String(acq).length < 10) return '';
+    const day = Number(String(acq).slice(8, 10));
+    return Number.isFinite(day) ? String(day) : '';
+  }
+
+  function seasonLabel(item) {
+    const month = MONTHS[item.month] ?? item.month ?? '';
+    const day = dayOf(item.acq_date);
+    const when = [day, month, item.year].filter(Boolean).join(' ');
+    return item.tile_id ? when : `No tile here on ${when}`;
+  }
+
+  function chooseSeason(id) {
+    if (!id || id === activeId) return;
+    activeId = id;
+  }
+
+  async function onSeasonKey(event) {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    const group = event.currentTarget.closest('.seasons');
+    const buttons = [...group.querySelectorAll('button.season:not(:disabled)')];
+    const index = buttons.indexOf(event.currentTarget);
+    const next = buttons[index + (event.key === 'ArrowRight' ? 1 : -1)];
+    if (!next) return;
+    event.preventDefault();
+    next.click();
+    await tick();
+    group.querySelector('button.season.on')?.focus();
+  }
+
+  let seasons = $derived(tile?.seasons ?? []);
+  let seasonGroups = $derived.by(() => {
+    const groups = [];
+    for (const item of seasons) {
+      const year = item.year ?? '';
+      let group = groups.at(-1);
+      if (!group || group.year !== year) {
+        group = { year, items: [] };
+        groups.push(group);
+      }
+      group.items.push(item);
+    }
+    return groups;
+  });
+  let switching = $derived(Boolean(loading && tile && tile.tile_id !== activeId));
 
   function area(value) {
     if (value == null) return '—';
@@ -65,72 +143,23 @@
     return value.toFixed(2);
   }
 
-  function rgbOf(hex) {
-    const n = Number.parseInt(hex.slice(1), 16);
-    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-  }
-
-  function scanMask(src, palette) {
-    return new Promise((resolve) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        ctx.drawImage(img, 0, 0);
-        const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-        const hits = new Array(palette.length).fill(0);
-        const limit = 55 * 55;
-        for (let i = 0; i < data.length; i += 4) {
-          if (data[i + 3] < 140) continue;
-          let best = -1;
-          let bestD = limit;
-          for (let p = 0; p < palette.length; p++) {
-            const rgb = palette[p].rgb;
-            const d = (data[i] - rgb[0]) ** 2 + (data[i + 1] - rgb[1]) ** 2 + (data[i + 2] - rgb[2]) ** 2;
-            if (d < bestD) {
-              bestD = d;
-              best = p;
-            }
-          }
-          if (best >= 0) hits[best] += 1;
-        }
-        resolve(palette.filter((_, index) => hits[index] > 12));
-      };
-      img.onerror = () => resolve([]);
-      img.src = src;
-    });
-  }
-
-  $effect(() => {
-    const src = tile?.mask;
-    const species = tile?.species;
-    if (!src || !species) return;
-    const palette = [
-      ...species.map((spec) => ({
-        kind: 'species',
-        color: spec.color,
-        label: spec.name,
-        rgb: rgbOf(spec.color),
-      })),
-      ...IGNORE.map((item) => ({ ...item, rgb: rgbOf(item.color) })),
-    ];
-    let dead = false;
-    scanMask(src, palette).then((found) => {
-      if (!dead) maskLegend = found;
-    });
-    return () => {
-      dead = true;
-    };
-  });
-
-  let legend = $derived(
-    maskLegend ??
-      (tile?.species ?? [])
+  let legend = $derived.by(() => {
+    const species = tile?.species ?? [];
+    const ids = tile?.label_ids;
+    if (!ids) {
+      return species
         .filter((spec) => spec.px > 0)
-        .map((spec) => ({ kind: 'species', color: spec.color, label: spec.name })),
-  );
+        .map((spec) => ({ kind: 'species', color: spec.color, label: spec.name }));
+    }
+    const present = new Set(ids);
+    const items = species
+      .filter((spec) => present.has(spec.id))
+      .map((spec) => ({ kind: 'species', color: spec.color, label: spec.name }));
+    for (const id of [254, 255]) {
+      if (present.has(id)) items.push(IGNORE[id]);
+    }
+    return items;
+  });
   let shownIgnore = $derived(legend.filter((item) => item.kind === 'ignore'));
 
   function px(value) {
@@ -141,6 +170,7 @@
   $effect(() => {
     if (!zoomOpen || !tile?.tile_id || sharpFor === tile.tile_id) return;
     const id = tile.tile_id;
+    sharp = '';
     const ctrl = new AbortController();
     let dead = false;
     sharpBusy = true;
@@ -174,10 +204,10 @@
 
 <button type="button" class="drawer-back" aria-label="Close details" onclick={onclose}></button>
 <aside class="drawer" class:vision={tab === 'vision'} class:segment={tab === 'segment'}>
-  {#if error}
-    <p class="error">{error}</p>
-  {:else if !tile}
+  {#if !tile && !error}
     <p class="empty">Loading tile…</p>
+  {:else if !tile}
+    <p class="error">{error}</p>
   {:else}
     <header>
       <div>
@@ -186,6 +216,39 @@
       </div>
       <button type="button" class="close" onclick={onclose}>Close</button>
     </header>
+
+    {#if seasons.length > 1}
+      <div class="seasons" role="group" aria-label="Season of this tile" aria-busy={switching}>
+        {#each seasonGroups as group (group.year)}
+          <div class="season-year">
+            <span class="season-year-label">{group.year}</span>
+            <div class="season-months">
+              {#each group.items as item (`${group.year}-${item.month}-${item.flight}`)}
+                <button
+                  type="button"
+                  class="season"
+                  class:on={item.tile_id === activeId}
+                  class:off={!item.tile_id}
+                  class:pending={switching && item.tile_id === activeId}
+                  aria-pressed={item.tile_id ? item.tile_id === activeId : undefined}
+                  aria-label={seasonLabel(item)}
+                  title={seasonLabel(item)}
+                  disabled={!item.tile_id}
+                  onclick={() => chooseSeason(item.tile_id)}
+                  onkeydown={onSeasonKey}
+                >
+                  <span class="season-name">{MONTHS[item.month] ?? item.month}</span>
+                  <span class="season-day">{dayOf(item.acq_date)}</span>
+                </button>
+              {/each}
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+    {#if error}
+      <div class="season-error">{error}</div>
+    {/if}
 
     <div class="drawer-tabs" role="tablist" aria-label="Tile detail">
       <button type="button" role="tab" aria-selected={tab === 'tile'} class:on={tab === 'tile'} onclick={() => (tab = 'tile')}>
@@ -217,11 +280,14 @@
     {:else if tab === 'segment'}
       <Segment tileId={tile.tile_id} mask={tile.mask} />
     {:else}
-      <button type="button" class="stage" aria-label="Enlarge orthophoto" onclick={() => (zoomOpen = true)}>
-        <img src={tile.thumb} alt="" fetchpriority="high" draggable="false" />
-        <img class="mask" src={tile.mask} alt="" style:opacity={opacity} fetchpriority="high" draggable="false" />
-      </button>
-      <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Orthophoto" note={sharpBusy ? 'Loading a sharper view…' : ''}>
+      <div class="shot">
+        <button type="button" class="stage" class:busy={switching} aria-label="Enlarge orthophoto" onclick={() => (zoomOpen = true)}>
+          <img src={tile.thumb} alt="" fetchpriority="high" draggable="false" />
+          <img class="mask" src={tile.mask} alt="" style:opacity={opacity} fetchpriority="high" draggable="false" />
+        </button>
+        <CopyButton overlay />
+      </div>
+      <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Orthophoto" note={sharpBusy ? 'Loading a sharper view…' : ''} bind:opacity>
         <img src={sharp || tile.thumb} alt="Orthophoto" draggable="false" />
         <img class="mask" src={tile.mask} alt="" style:opacity={opacity} draggable="false" />
       </Zoom>
