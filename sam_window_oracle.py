@@ -10,12 +10,14 @@ Per tile and window size (exclusive grid, no overlap):
   2. SAM automatic masks on each positive window (SAM resizes the window to 1024).
   3. Inside each window the masks become non-overlapping regions: every pixel goes
      to the smallest mask covering it (as in sam_oracle.py).
-  4. Stitching: regions of two neighbouring windows are joined if they meet on
-     >= --edge-frac of the shorter of their two pieces of the shared border
-     (and on at least --min-edge-px pixels). Joins chain across windows.
-  5. Perfect cut-out classifier: a stitched segment whose valid pixels are
-     > --majority one species gets that species, otherwise background.
-     Pixels without a segment (negative windows, gaps) are background.
+  4. Perfect cut-out classifier: a region whose valid pixels are > --majority one
+     species gets that species, otherwise background. Pixels without a region
+     (negative windows, gaps) are background.
+  5. The windows are put back into the full tile, which is scored and drawn.
+
+Regions are not stitched across window borders: with a perfect majority-vote
+classifier, joining two regions can only keep or lower the score, so the
+unstitched map is the ceiling of SAM's masks.
 
 Tiles: --n-tiles labelled tiles of the cv3 test split (the /train folders of the
 held-out sites, as in test.py), drawn per species round robin over flights.
@@ -49,8 +51,6 @@ import torch
 import yaml
 from matplotlib.colors import to_rgb
 from scipy import ndimage
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
 
 from sam_oracle import IGNORE, N_CLS, load_config, read_tile
 
@@ -92,36 +92,6 @@ def window_regions(segs, size):
     lut = np.full(len(segs) + 1, -1, np.int32)
     lut[ids] = np.arange(len(ids))
     return lut[reg]
-
-
-def border_pairs(a, b, edge_frac, min_edge_px):
-    """Region pairs that meet on the shared border; a and b are the two facing pixel lines."""
-    ok = (a >= 0) & (b >= 0)
-    if not ok.any():
-        return []
-    pairs, counts = np.unique(np.stack([a[ok], b[ok]]), axis=1, return_counts=True)
-    len_a = dict(zip(*np.unique(a[a >= 0], return_counts=True)))
-    len_b = dict(zip(*np.unique(b[b >= 0], return_counts=True)))
-    return [(ra, rb) for (ra, rb), n in zip(pairs.T, counts)
-            if n >= min_edge_px and n >= edge_frac * min(len_a[ra], len_b[rb])]
-
-
-def stitch(reg, size, edge_frac, min_edge_px):
-    """Join regions across all inner window borders; returns segment id per pixel (-1 = none)."""
-    h, w = reg.shape
-    edges = []
-    for x in range(size, w, size):  # vertical borders
-        edges += border_pairs(reg[:, x - 1], reg[:, x], edge_frac, min_edge_px)
-    for y in range(size, h, size):  # horizontal borders
-        edges += border_pairs(reg[y - 1, :], reg[y, :], edge_frac, min_edge_px)
-    n = int(reg.max()) + 1
-    if n == 0:
-        return reg, 0
-    e = np.array(edges, np.int64).reshape(-1, 2)
-    graph = coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(n, n))
-    _, comp = connected_components(graph, directed=False)
-    seg = np.where(reg >= 0, comp[np.maximum(reg, 0)], -1)
-    return seg, len(e)
 
 
 def oracle_labels(seg, gt, valid, majority):
@@ -185,7 +155,7 @@ def save_vis(path, image, gt, base_pred, per_size, colors, title):
         pal = rng.uniform(0.2, 1, (max(int(seg.max()) + 1, 1), 3))
         seg_rgb = np.where((seg >= 0)[..., None], 0.35 * base + 0.65 * pal[np.maximum(seg, 0)], base)
         rows.append([(win, f"{size} px windows: {len(d['pos'])} positive"),
-                     (seg_rgb, f"stitched SAM segments ({d['n_seg']}, {d['n_join']} joins)"),
+                     (seg_rgb, f"SAM regions per window ({d['n_seg']})"),
                      (with_outlines(blend(d["pred"])), "oracle (+ label outlines)")])
     fig, axes = plt.subplots(len(rows), 3, figsize=(15, 5.1 * len(rows)))
     for r, row in enumerate(rows):
@@ -227,8 +197,6 @@ def main():
     parser.add_argument("--pos-thr", type=float, nargs="+", default=[0.001, 0.01, 0.05],
                         help="min labelled share of a positive window")
     parser.add_argument("--vis-thr", type=float, default=0.01, help="threshold shown in the figures")
-    parser.add_argument("--edge-frac", type=float, default=0.5)
-    parser.add_argument("--min-edge-px", type=int, default=5)
     parser.add_argument("--majority", type=float, default=0.5)
     parser.add_argument("--pps", type=int, default=32, help="AMG points per side")
     parser.add_argument("--iou-thr", type=float, default=0.7, help="AMG pred_iou_thresh")
@@ -297,20 +265,18 @@ def main():
                     regions[(y0, x0)], share[(y0, x0)] = window_regions(segs, size), lab
             for thr in args.pos_thr:
                 pos = [k for k, v in share.items() if v >= thr]
-                reg = np.full((h, w), -1, np.int32)
+                # # windows back into the full tile; region ids made unique across windows
+                seg = np.full((h, w), -1, np.int32)
                 offset = 0
                 for (y0, x0) in pos:
                     r = regions[(y0, x0)]
-                    reg[y0:y0 + size, x0:x0 + size] = np.where(r >= 0, r + offset, -1)
+                    seg[y0:y0 + size, x0:x0 + size] = np.where(r >= 0, r + offset, -1)
                     offset += int(r.max()) + 1
-                seg, n_join = stitch(reg, size, args.edge_frac, args.min_edge_px)
                 pred = oracle_labels(seg, gt, valid, args.majority)
                 confs[f"oracle_{size}_thr{thr}"] += confusion(gt, pred, valid)
-                n_seg = len(np.unique(seg[seg >= 0]))
-                info.update({f"pos_{size}_thr{thr}": len(pos), f"seg_{size}_thr{thr}": n_seg,
-                             f"join_{size}_thr{thr}": n_join})
+                info.update({f"pos_{size}_thr{thr}": len(pos), f"seg_{size}_thr{thr}": offset})
                 if thr == args.vis_thr:
-                    per_size[size] = dict(pos=pos, seg=seg, pred=pred, n_seg=n_seg, n_join=n_join)
+                    per_size[size] = dict(pos=pos, seg=seg, pred=pred, n_seg=offset)
         tile_rows.append(info)
 
         if t < args.n_vis and per_size:
@@ -330,7 +296,7 @@ def main():
     md = [f"# SAM window oracle vs. baseline (cv3 test, {len(tiles)} labelled tiles)\n",
           f"Baseline: `{args.baseline_ckpt}`. SAM 2.1 `{os.path.basename(args.sam_ckpt)}`, "
           f"points_per_side={args.pps}, pred_iou_thresh={args.iou_thr}, stability={args.stab_thr}. "
-          f"Stitching: edge_frac={args.edge_frac}, min_edge_px={args.min_edge_px}; majority > {args.majority}. "
+          f"No stitching across windows; majority > {args.majority}. "
           f"SAM {sam_time / max(n_windows, 1):.2f} s/window over {n_windows} windows.\n",
           "Oracle rows assume a perfect window classifier and a perfect cut-out classifier: "
           "they are ceilings, the baseline row is a real model. F1 as in test.py "
