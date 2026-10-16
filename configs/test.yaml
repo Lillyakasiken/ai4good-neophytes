@@ -11,7 +11,7 @@ defaults:
 
 # # Which run and which checkpoint to evaluate
 exp_name: ???        # required, e.g. 20260429_224213.131915_np_cv1_Unet_mit_b2_1024_s42
-ckpt_type: best      # 'best' (highest val_f1) or 'last'
+ckpt_type: best      # 'best' (highest val_f1_species; val_f1 for runs before 2026-10-12) or 'last'
 
 pl_seed: 42
 
