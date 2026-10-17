@@ -9,6 +9,7 @@ import math
 import os
 import re
 import threading
+import time
 from datetime import date, datetime
 
 import duckdb
@@ -43,6 +44,10 @@ from segment import (
     catalog as segment_catalog,
     run as segment_run,
 )
+import jobs as train_jobs
+import predict_client
+import wandb_query
+from runtime import TrainEnvError, gpu_lock
 from vision import catalog, load_source, render
 
 CLASSES, DISPLAY_ORDER, CV_FOLDS = load_names()
@@ -78,6 +83,11 @@ for _name in SPECIES_NAMES:
     SORTS[f"{_name}_m2"] = f"{_name}_m2 DESC, tile_id"
 
 app = FastAPI(title="Neophyte tile explorer")
+
+
+@app.on_event("startup")
+def _start_train_queue():
+    train_jobs.start_scheduler()
 THUMBS_DIR.mkdir(parents=True, exist_ok=True)
 MASKS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/thumbs", StaticFiles(directory=THUMBS_DIR), name="thumbs")
@@ -457,20 +467,26 @@ class PreviewIn(BaseModel):
     ops: list[dict] = Field(default_factory=list)
 
 
-def _tile_image_path(tile_id):
+def _tile_paths(tile_id):
     if len(tile_id) != 16 or any(c not in "0123456789abcdef" for c in tile_id):
         raise HTTPException(status_code=400, detail="tile_id must be 16 hex characters")
     _require_catalog()
     rows = _fetch(
-        "SELECT img_path FROM read_parquet(?) WHERE tile_id = ?",
+        "SELECT img_path, mask_path FROM read_parquet(?) WHERE tile_id = ?",
         [str(TILES_PARQUET), tile_id],
     )
     if not rows:
         raise HTTPException(status_code=404, detail="tile not found")
-    path = resolve_data_path(rows[0]["img_path"])
-    if not path.is_file():
+    image = resolve_data_path(rows[0]["img_path"])
+    if not image.is_file():
         raise HTTPException(status_code=404, detail="tile image is not on disk")
-    return path
+    mask = resolve_data_path(rows[0]["mask_path"]) if rows[0].get("mask_path") else None
+    return image, mask
+
+
+def _tile_image_path(tile_id):
+    image, _mask = _tile_paths(tile_id)
+    return image
 
 
 @app.get("/api/vision/ops")
@@ -531,6 +547,131 @@ def tile_segment(tile_id: str, body: SegmentIn):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class PredictIn(BaseModel):
+    ckpt: str
+
+
+_wandb_cache = {"until": 0.0, "body": None}
+
+
+@app.get("/api/checkpoints")
+def checkpoints():
+    """Trained checkpoints under lightning_logs. Reading them does not use the GPU."""
+    return predict_client.list_checkpoints()
+
+
+@app.post("/api/tiles/{tile_id}/predict")
+def tile_predict(tile_id: str, body: PredictIn):
+    """Class mask from a trained checkpoint. Refused while a training job is running."""
+    if train_jobs.training_active():
+        raise HTTPException(status_code=409, detail="A training job is using the GPU.")
+    if not gpu_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="The GPU is busy.")
+    try:
+        if train_jobs.training_active():
+            raise HTTPException(status_code=409, detail="A training job is using the GPU.")
+        try:
+            ckpt = predict_client.resolve_checkpoint(body.ckpt)
+        except predict_client.PredictError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        image, mask = _tile_paths(tile_id)
+        try:
+            payload = predict_client.request({
+                "cmd": "predict",
+                "ckpt": str(ckpt),
+                "image": str(image),
+                "mask": None if mask is None else str(mask),
+            })
+        except TrainEnvError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except predict_client.PredictError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if not payload.get("ok"):
+            raise HTTPException(status_code=400, detail=payload.get("error") or "prediction failed")
+        payload.pop("ok", None)
+        return payload
+    finally:
+        gpu_lock.release()
+
+
+@app.get("/api/gpu")
+def gpu():
+    """Utilization, memory, and compute processes from nvidia-smi."""
+    return train_jobs.gpu_status()
+
+
+@app.get("/api/train/options")
+def train_options():
+    """Data and model configs the training form is allowed to start."""
+    return train_jobs.train_options()
+
+
+class JobIn(BaseModel):
+    data: str
+    model: str
+    seed: int = 42
+    max_epochs: int = 50
+    check_val_every_n_epoch: int = 1
+    lr: float = 0.0001
+    batch_size_train: int = 8
+    batch_size_val: int = 2
+    precision: str = "bf16-mixed"
+    logger: str = "wandb"
+    run_test: bool = False
+    overrides: list[str] = Field(default_factory=list)
+
+
+@app.post("/api/jobs")
+def create_job(body: JobIn):
+    """Append a training job. The queue starts it in tmux when the GPU is free."""
+    try:
+        return train_jobs.enqueue(body.model_dump())
+    except train_jobs.JobError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/jobs")
+def get_jobs():
+    return train_jobs.list_jobs()
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    try:
+        return train_jobs.cancel(job_id)
+    except train_jobs.JobError as exc:
+        status = 404 if "unknown" in str(exc) else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+@app.get("/api/jobs/{job_id}/log")
+def job_log(job_id: str, offset: int = 0):
+    try:
+        return train_jobs.read_log(job_id, offset)
+    except train_jobs.JobError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/wandb/runs")
+def wandb_runs(refresh: bool = False):
+    """Recent runs in the ai4good-neophytes W&B project. Cached for about a minute."""
+    now = time.time()
+    if not refresh and _wandb_cache["body"] is not None and now < _wandb_cache["until"]:
+        return _wandb_cache["body"]
+    try:
+        body = wandb_query.fetch()
+    except TrainEnvError as exc:
+        body = {
+            "available": False,
+            "detail": str(exc),
+            "project": "ai4good-neophytes",
+            "runs": [],
+        }
+    _wandb_cache["body"] = body
+    _wandb_cache["until"] = now + (60 if body.get("available") else 10)
+    return body
 
 
 @app.get("/api/stats")

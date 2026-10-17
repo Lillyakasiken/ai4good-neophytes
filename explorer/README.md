@@ -6,7 +6,7 @@ The catalog is one Parquet row per tile, queried with DuckDB. Thumbnails are 256
 
 ## In the browser
 
-The page opens on the tile grid for cv3 train. Switch to Map to see one flight. Open a tile to look at the photo and its labels, try image filters, or ask for a mask.
+The page opens on the tile grid for cv3 train. Switch to Map to see one flight, or to Runs to watch the GPU, recent W&B runs, and the training queue. Open a tile to look at the photo and its labels, try image filters, ask for a zero-shot mask, or run a trained checkpoint.
 
 ```mermaid
 flowchart TD
@@ -17,6 +17,11 @@ flowchart TD
   tile --> photo["Photo and class mask"]
   tile --> vision["Vision"]
   tile --> segment["Segment"]
+  tile --> predict["Predict"]
+  page --> runs["Runs"]
+  runs --> queue["Training queue"]
+  runs --> wandb["Recent W&B runs"]
+  runs --> gpu["GPU"]
 ```
 
 ## Setup
@@ -50,6 +55,20 @@ The page opens on cv3 train, sorted by labelled area, with the class mask drawn 
 Open a tile and choose Vision to preview OpenCV filters and a gray-value histogram on that tile. The preview is computed in memory and is not written to disk. It does not change the thumbnails, the catalog, or the training data.
 
 Choose Segment to run a zero-shot mask on that same preview. The tab offers YOLOE-26s, which takes a text phrase, and SAM 2.1 tiny, which takes include and exclude points and boxes. Neither model is trained on the six neophytes, so the overlay is only a visual test. The first text prompt downloads `yoloe-26s-seg.pt` and a MobileCLIP encoder into `cache/weights` (about 254 MB for the encoder) and needs network access. That first call also installs the Ultralytics CLIP fork if it is missing (`pip install git+https://github.com/ultralytics/CLIP.git`). The mask is returned in the response and is not saved.
+
+## Predict, runs, and the GPU
+
+The explorer API stays in `explorer/.venv`. Prediction and training use the repo-root `.venv` from `pyproject.toml`. Create it once from the repo root:
+
+```bash
+uv sync
+```
+
+Choose Predict on an open tile, pick a checkpoint under `lightning_logs/`, and run it. The forward pass matches `test.py`: the whole tile at its own resolution, patching off. The overlay uses the same class colors as the ground-truth label. A half-resolution (`_ds2`) run is scaled down before the forward pass, the same way its test config does. A checkpoint that was trained with an nDSM reads that tile's DSM and DTM. The first load of an architecture can take a while. Prediction is refused while a training job is running, so the two do not share the GPU.
+
+Runs is the third view in the header. It lists recent runs from the W&B project `max-zehnder-university-of-z-rich/ai4good-neophytes`. If the panel says W&B is not logged in, run `uv run wandb login` once from the repo root. The same view has a form for a new training job and tails that job's log. Queue run writes the job to `explorer/cache/jobs/` and starts it in tmux (`np-<id>`) when `nvidia-smi` shows no compute process. Only one job runs at a time. The form's extra lines are `key=value` Hydra overrides with no spaces. The header readout (`GPU 84% · 18/24 GB`) stays visible on Tiles and Map.
+
+The API is bound to `127.0.0.1` because it can start training. Do not expose it on the network.
 
 ## The prepare scripts
 

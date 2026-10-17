@@ -119,7 +119,7 @@ def main(cfg: DictConfig) -> None:
     # %% training
     callbacks = get_callbacks(cfg.model.callbacks)
     if cfg.logger == 'wandb':
-        logger = WandbLogger(name=cfg.exp_name, project=cfg.log_name)
+        logger = WandbLogger(name=cfg.exp_name, project=cfg.log_name, entity=cfg.wandb_entity)
     else:
         logger = CSVLogger(cfg.log_dir, name=cfg.exp_name)
     trainer = pl.Trainer(max_epochs=cfg.model.max_epochs,

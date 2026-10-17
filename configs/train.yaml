@@ -25,6 +25,7 @@ deterministic_train: False  # True forces deterministic kernels (slower)
 # # (metrics.csv inside the run directory, no account needed).
 logger: wandb
 log_name: ai4good-neophytes  # W&B project name
+wandb_entity: max-zehnder-university-of-z-rich  # team that owns that project
 
 log_dir: lightning_logs
 log_path: ${log_dir}/${exp_name}

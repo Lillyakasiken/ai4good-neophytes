@@ -1,0 +1,26 @@
+# Starting point for elevation experiments: RGB + object height (nDSM = DSM - DTM),
+# fused into the pretrained MiT-b2 encoder at every scale (fusion_mode: stem).
+# The schedule matches the 512 development runs (30 epochs, validation every 3rd
+# epoch), so a run with neophytes_split_cv3_train_512 compares one-to-one with the
+# RGB baseline 20261013_002801.261406_np_cv3_Unet_mit_b2_512_s42.
+#
+#   python train.py data=neophytes_split_cv3_train_512 model=model_neophytes_mit_b2_ndsm_dev
+#   python test.py exp_name=<run>   # auto-selects neophytes_split_cv3_test (loads the nDSM)
+defaults:
+  - model
+
+name: ${model.model_name}_${model.encoder_name}_nDSM
+
+# # 'ndsm' here makes train.py set data.load_ndsm, which loads DSM + DTM per tile and
+# # subtracts them. Use 'dsm'/'dtm' only for ablations: the raw DSM is absolute
+# # altitude above sea level and mostly tells the model which site it is on.
+in_channels:
+  image: 3
+  ndsm: 1
+
+model_name: Unet
+encoder_name: mit_b2
+fusion_mode: stem     # concat = model_neophytes_mit_b2_ndsm_concat.yaml
+
+max_epochs: 30
+check_val_every_n_epoch: 3

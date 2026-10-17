@@ -41,7 +41,8 @@ button { cursor: pointer; }
   background: var(--haze);
 }
 
-.app.map-mode {
+.app.map-mode,
+.app.runs-mode {
   grid-template-rows: auto minmax(0, 1fr);
 }
 
@@ -133,8 +134,43 @@ header .role-name {
 
 .note li strong { font-weight: 600; }
 
-.view-switch {
+.header-tools {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.gpu-watch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--canopy);
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.gpu-watch input {
+  margin: 0;
+  accent-color: var(--canopy);
+}
+
+.gpu-chip {
+  margin: 0;
+  color: var(--canopy);
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.gpu-chip.paused {
+  opacity: 0.45;
+}
+
+.view-switch {
   display: flex;
   align-self: center;
   border: 1px solid var(--line);
@@ -258,7 +294,8 @@ label.field span { display: flex; gap: 4px; }
   grid-template-columns: 300px minmax(0, 1fr);
 }
 
-.workspace.map-mode {
+.workspace.map-mode,
+.workspace.runs-mode {
   grid-template-columns: minmax(0, 1fr);
 }
 
@@ -883,7 +920,9 @@ button.map-month { cursor: pointer; }
 
 .drawer-tabs {
   display: flex;
+  flex-wrap: wrap;
   width: fit-content;
+  max-width: 100%;
   margin: 0 0 12px;
   border: 1px solid var(--line);
   border-radius: 2px;

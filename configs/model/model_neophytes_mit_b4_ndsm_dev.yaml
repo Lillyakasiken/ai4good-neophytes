@@ -1,0 +1,25 @@
+# Best current RGB setup plus object height. The cv3 512 MiT-b4 runs
+# (20261014_210030 s42, 20261015_125425 s43) are the ones to copy: U-Net, MiT-b4,
+# 30 epochs, validation every 3rd epoch, lr 0.0001. They lead the development fold
+# on validation species F1 (0.833 and 0.835). nDSM = DSM - DTM is fused into the
+# pretrained encoder at every scale, same as model_neophytes_mit_b2_ndsm_dev.
+#
+#   python train.py data=neophytes_split_cv3_train_512 model=model_neophytes_mit_b4_ndsm_dev
+#   python test.py exp_name=<run>   # auto-selects neophytes_split_cv3_test (loads the nDSM)
+defaults:
+  - model
+
+name: ${model.model_name}_${model.encoder_name}_nDSM
+
+# 'ndsm' makes train.py set data.load_ndsm, which loads DSM + DTM per tile and
+# subtracts them. The raw DSM is absolute altitude and mostly identifies the site.
+in_channels:
+  image: 3
+  ndsm: 1
+
+model_name: Unet
+encoder_name: mit_b4
+fusion_mode: stem
+
+max_epochs: 30
+check_val_every_n_epoch: 3

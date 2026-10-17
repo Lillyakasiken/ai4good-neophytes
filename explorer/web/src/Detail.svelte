@@ -3,6 +3,7 @@
   import CopyButton from './CopyButton.svelte';
   import Process from './Process.svelte';
   import Segment from './Segment.svelte';
+  import Predict from './Predict.svelte';
   import Zoom from './Zoom.svelte';
 
   let { tileId, fold, onclose } = $props();
@@ -203,7 +204,7 @@
 </script>
 
 <button type="button" class="drawer-back" aria-label="Close details" onclick={onclose}></button>
-<aside class="drawer" class:vision={tab === 'vision'} class:segment={tab === 'segment'}>
+<aside class="drawer" class:vision={tab === 'vision'} class:segment={tab === 'segment' || tab === 'predict'}>
   {#if !tile && !error}
     <p class="empty">Loading tile…</p>
   {:else if !tile}
@@ -273,12 +274,21 @@
         </svg>
         Segment
       </button>
+      <button type="button" role="tab" aria-selected={tab === 'predict'} class:on={tab === 'predict'} onclick={() => (tab = 'predict')}>
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2.2 11.2 6.2 4.4l2.2 3.2 1.6-2.2 3.8 5.8" />
+          <path d="M2 13.2h12" />
+        </svg>
+        Predict
+      </button>
     </div>
 
     {#if tab === 'vision'}
       <Process tileId={tile.tile_id} mask={tile.mask} />
     {:else if tab === 'segment'}
       <Segment tileId={tile.tile_id} mask={tile.mask} />
+    {:else if tab === 'predict'}
+      <Predict tileId={tile.tile_id} thumb={tile.thumb} mask={tile.mask} />
     {:else}
       <div class="shot">
         <button type="button" class="stage" class:busy={switching} aria-label="Enlarge orthophoto" onclick={() => (zoomOpen = true)}>

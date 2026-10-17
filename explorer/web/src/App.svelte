@@ -5,6 +5,7 @@
   import Grid from './Grid.svelte';
   import Map from './Map.svelte';
   import Detail from './Detail.svelte';
+  import Runs from './Runs.svelte';
 
   let facets = $state(null);
   let stats = $state(null);
@@ -13,6 +14,8 @@
   let openId = $state(null);
   let infoOpen = $state(false);
   let view = $state('tiles');
+  let gpu = $state(null);
+  let watchGpu = $state(storedWatchGpu());
 
   function defaultFilters() {
     return {
@@ -89,6 +92,29 @@
   let heldOut = $derived(facets?.folds?.[filters.fold]?.test_sites ?? []);
   let colors = $derived(Object.fromEntries((facets?.species ?? []).map((s) => [s.stats_name, s.color])));
 
+  function storedWatchGpu() {
+    try {
+      return localStorage.getItem('explorer.watchGpu') !== '0';
+    } catch {
+      return true;
+    }
+  }
+
+  function gb(mib) {
+    if (mib == null) return '—';
+    const value = mib / 1024;
+    return value >= 10 ? value.toFixed(0) : value.toFixed(1);
+  }
+
+  let gpuText = $derived.by(() => {
+    if (!gpu) return watchGpu ? 'GPU …' : 'GPU';
+    if (!gpu.available || !gpu.gpus?.length) return 'GPU n/a';
+    return gpu.gpus.map((card) => {
+      const util = card.util == null ? '—' : `${Math.round(card.util)}%`;
+      return `GPU ${util} · ${gb(card.memory_used)}/${gb(card.memory_total)} GB`;
+    }).join('   ');
+  });
+
   onMount(async () => {
     const res = await fetch('/api/facets');
     if (!res.ok) {
@@ -96,6 +122,34 @@
       return;
     }
     facets = await res.json();
+  });
+
+  $effect(() => {
+    try {
+      localStorage.setItem('explorer.watchGpu', watchGpu ? '1' : '0');
+    } catch {
+      /* storage unavailable */
+    }
+  });
+
+  $effect(() => {
+    if (!watchGpu) return;
+    let dead = false;
+    async function poll() {
+      while (!dead) {
+        try {
+          const res = await fetch('/api/gpu');
+          if (res.ok && !dead) gpu = await res.json();
+        } catch {
+          /* keep the last readout */
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    }
+    poll();
+    return () => {
+      dead = true;
+    };
   });
 
   $effect(() => {
@@ -130,21 +184,29 @@
   });
 </script>
 
-<div class="app" class:map-mode={view === 'map'}>
+<div class="app" class:map-mode={view === 'map'} class:runs-mode={view === 'runs'}>
   <header>
     <div class="title-wrap">
       <div class="title-row">
-        <h1>{filters.fold}<span class="role-name">{ROLE[filters.role] ?? filters.role}</span></h1>
-        <button
-          type="button"
-          class="info"
-          aria-label="How this fold is split"
-          aria-expanded={infoOpen}
-          aria-controls="fold-note"
-          onclick={() => (infoOpen = !infoOpen)}
-        >i</button>
+        <h1>
+          {#if view === 'runs'}
+            Runs
+          {:else}
+            {filters.fold}<span class="role-name">{ROLE[filters.role] ?? filters.role}</span>
+          {/if}
+        </h1>
+        {#if view !== 'runs'}
+          <button
+            type="button"
+            class="info"
+            aria-label="How this fold is split"
+            aria-expanded={infoOpen}
+            aria-controls="fold-note"
+            onclick={() => (infoOpen = !infoOpen)}
+          >i</button>
+        {/if}
       </div>
-      {#if infoOpen}
+      {#if infoOpen && view !== 'runs'}
         <div class="note" id="fold-note" role="dialog" aria-label="How this fold is split">
           <p>
             The default baseline is a U-Net with a MiT-b2 encoder. It trains on the {filters.fold} split below.
@@ -166,6 +228,11 @@
         </div>
       {/if}
     </div>
+    <div class="header-tools">
+      <label class="gpu-watch" title="Keep reading GPU state">
+        <input type="checkbox" bind:checked={watchGpu} aria-label="Live GPU refresh" />
+        <span class="gpu-chip" class:paused={!watchGpu}>{gpuText}</span>
+      </label>
     <div class="view-switch" role="tablist" aria-label="Explorer view">
       <button type="button" role="tab" aria-selected={view === 'tiles'} class:on={view === 'tiles'} onclick={() => (view = 'tiles')}>
         <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -183,15 +250,25 @@
         </svg>
         Map
       </button>
+      <button type="button" role="tab" aria-selected={view === 'runs'} class:on={view === 'runs'} onclick={() => (view = 'runs')}>
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2 12.5 5.2 8.4l2.4 2.2 3-4.2L14 11" />
+          <path d="M2 3.5h12" />
+        </svg>
+        Runs
+      </button>
+    </div>
     </div>
   </header>
 
-  {#if view !== 'map'}
+  {#if view === 'tiles'}
     <Filters {facets} bind:filters bind:showLabels changed={filtersChanged} onreset={resetFilters} />
   {/if}
 
-  <div class="workspace" class:map-mode={view === 'map'}>
-    {#if view === 'map'}
+  <div class="workspace" class:map-mode={view === 'map'} class:runs-mode={view === 'runs'}>
+    {#if view === 'runs'}
+      <Runs {watchGpu} {gpu} />
+    {:else if view === 'map'}
       <Map {facets} bind:filters bind:showLabels onopen={(id) => (openId = id)} />
     {:else}
       {#if error}
