@@ -129,14 +129,17 @@ def main(cfg: DictConfig) -> None:
                          deterministic=cfg.deterministic_train,
                          check_val_every_n_epoch=cfg.model.check_val_every_n_epoch)
 
-    # # resume an interrupted run: same exp_name -> same folder -> picks up last.ckpt
+    # # resume an interrupted run: same exp_name -> same folder -> picks up last.ckpt.
+    # # Passing it as ckpt_path restores the full training state (optimizer, epoch,
+    # # LR schedule, callbacks), not just the weights -- loading only the weights would
+    # # restart the cosine schedule at the initial LR and train max_epochs more epochs.
     last_ckpt_path = os.path.join(cfg.log_path, 'checkpoints/last.ckpt')
-    if os.path.exists(last_ckpt_path):
-        print(f'Loading weights from: {last_ckpt_path}')
-        model = SegmentationModel.load_from_checkpoint(last_ckpt_path, weights_only=False).to(device)
+    resume_ckpt_path = last_ckpt_path if os.path.exists(last_ckpt_path) else None
+    if resume_ckpt_path:
+        print(f'Resuming training from: {resume_ckpt_path}')
 
     start_time = time.time()
-    trainer.fit(model, dataModule)
+    trainer.fit(model, dataModule, ckpt_path=resume_ckpt_path)
     print('Training finished. Elapsed Time:', round((time.time() - start_time) / 60, 2), 'min')
 
     # %% quick test-set pass with the best checkpoint

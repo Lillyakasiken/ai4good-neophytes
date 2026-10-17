@@ -14,16 +14,22 @@ GeoTiff. Two ways of dealing with the overlap:
 Empty (no-data) patches are skipped based on one downsampled read of the image,
 which saves most of the work on orthophotos with large empty margins.
 
+Models trained with the nDSM as an extra input (``ndsm`` in ``model.in_channels``)
+also get it here: set ``data.dsm_path`` and ``data.dtm_path`` to one DSM and one
+DTM GeoTiff per orthophoto, and the nDSM under every patch is computed on the fly.
+
 Run:
     python inference.py exp_name=<run directory in lightning_logs/>
     python inference.py data.batch_size=16 data.patch_overlap=128
     python inference.py blending=gaussian
+    python inference.py exp_name=<ndsm run> data.dsm_path=[<dsm.tif>] data.dtm_path=[<dtm.tif>]
 """
 
 import gc
 import logging
 import os
 import time
+import cv2
 import torch
 import hydra
 import rasterio
@@ -33,7 +39,9 @@ from tqdm import tqdm
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 from omegaconf import DictConfig
-from rasterio.windows import Window
+from rasterio.enums import Resampling
+from rasterio.windows import Window, from_bounds
+from rasterio.windows import bounds as window_bounds
 
 # Suppress the per-read EPSG:2056 CRS mismatch warning from GDAL -- harmless for inference
 logging.getLogger('rasterio._env').setLevel(logging.ERROR)
@@ -123,6 +131,87 @@ def _valid_area_m2(n_valid: int, patch_size: int, overlap: int, res) -> float:
     return n_valid * step * step * abs(res[0] * res[1])
 
 
+DSM_NODATA = -32767  # fallback when the raster has no nodata tag, as in NeophyteDataset
+
+
+class ElevationReader:
+    """nDSM (= DSM - DTM) under a window of the RGB orthophoto, prepared as in training.
+
+    DSM and DTM are separate GeoTiffs, usually coarser than the RGB, so the window is
+    matched by map coordinates, not by pixel offsets. The steps follow
+    ``NeophyteDataset._load_sample`` plus ``ndsm_transforms``: DTM resampled onto the
+    DSM grid, difference taken, nodata set to 0, bilinear resize to the RGB patch
+    size, then normalised with the training mean/std.
+
+    The rasters are opened lazily, so the reader can be pickled into DataLoader workers.
+    """
+
+    def __init__(self, dsm_path, dtm_path, rgb_path, mean, std):
+        self.dsm_path, self.dtm_path = dsm_path, dtm_path
+        self.mean, self.std = float(mean), float(std)
+        with rasterio.open(rgb_path) as src:
+            self.rgb_transform, rgb_crs = src.transform, src.crs
+        for path in (dsm_path, dtm_path):
+            with rasterio.open(path) as src:
+                if src.crs != rgb_crs:
+                    raise ValueError(f"CRS of {path} ({src.crs}) differs from the orthophoto ({rgb_crs})")
+        self._dsm = self._dtm = None
+
+    def __call__(self, x: int, y: int, size: int) -> np.ndarray:
+        if self._dsm is None:
+            self._dsm, self._dtm = rasterio.open(self.dsm_path), rasterio.open(self.dtm_path)
+        left, bottom, right, top = window_bounds(Window(x, y, size, size), self.rgb_transform)
+
+        # # DSM at its native resolution, DTM resampled onto the same grid
+        dsm_win = from_bounds(left, bottom, right, top, transform=self._dsm.transform)
+        shape = (max(1, round(dsm_win.height)), max(1, round(dsm_win.width)))
+        dsm_nodata = self._dsm.nodata if self._dsm.nodata is not None else DSM_NODATA
+        dtm_nodata = self._dtm.nodata if self._dtm.nodata is not None else DSM_NODATA
+        dsm = self._dsm.read(1, window=dsm_win, out_shape=shape, resampling=Resampling.nearest,
+                             boundless=True, fill_value=dsm_nodata).astype(np.float32)
+        dtm = self._dtm.read(1, window=from_bounds(left, bottom, right, top, transform=self._dtm.transform),
+                             out_shape=shape, resampling=Resampling.bilinear,
+                             boundless=True, fill_value=dtm_nodata).astype(np.float32)
+
+        nodata = (dsm == dsm_nodata) | np.isnan(dsm) | (dtm == dtm_nodata) | np.isnan(dtm)
+        ndsm = dsm - dtm
+        ndsm[nodata] = 0.0  # no height info where either is nodata
+        ndsm = cv2.resize(ndsm, (size, size), interpolation=cv2.INTER_LINEAR)
+        return ((ndsm - self.mean) / self.std)[np.newaxis].astype(np.float32)  # (1, H, W)
+
+
+def _make_elevation_reader(cfg, model, idx: int, image_path: str):
+    """ElevationReader for the idx-th orthophoto if the model needs the nDSM, else None.
+
+    Fails loudly instead of predicting without the input the model was trained on."""
+    aux_inputs = [k for k in model.hparams.in_channels if k != 'image']
+    if not aux_inputs:
+        return None
+    if aux_inputs != ['ndsm']:
+        raise NotImplementedError(f"inference.py supports only 'ndsm' as auxiliary input, "
+                                  f"the model expects {aux_inputs}")
+    dsm_paths, dtm_paths = cfg.data.get('dsm_path'), cfg.data.get('dtm_path')
+    if not dsm_paths or not dtm_paths:
+        raise ValueError("The model was trained with the nDSM: set data.dsm_path and "
+                         "data.dtm_path (one GeoTiff per entry of data.image_dir).")
+    n_images = len(cfg.data.image_dir)
+    if len(dsm_paths) != n_images or len(dtm_paths) != n_images:
+        raise ValueError(f"data.dsm_path and data.dtm_path need one entry per orthophoto "
+                         f"({n_images}), got {len(dsm_paths)} and {len(dtm_paths)}.")
+    return ElevationReader(dsm_paths[idx], dtm_paths[idx], image_path,
+                           cfg.data.ndsm_norm.mean, cfg.data.ndsm_norm.std)
+
+
+def _predict(model, imgs, ndsm=None):
+    """Softmax probabilities; routes the nDSM to the model as in training
+    (concatenated to RGB or fused into the encoder, depending on fusion_mode)."""
+    inputs = {'image': imgs}
+    if ndsm is not None:
+        inputs['ndsm'] = ndsm
+    x, aux = model.prepare_inputs(inputs)
+    return model(x, aux)
+
+
 def _print_stats(width, height, res, n_valid, n_total, area_m2, elapsed, out_path, blending):
     area_ha = area_m2 / 10_000
     full_area_ha = width * height * abs(res[0] * res[1]) / 10_000
@@ -146,12 +235,13 @@ class GeoTiffPatchDataset(Dataset):
     All-zero (no-data) patches are prefiltered at init time.
     """
 
-    def __init__(self, path: str, patch_size: int, overlap: int, transform=None):
+    def __init__(self, path: str, patch_size: int, overlap: int, transform=None, elevation=None):
         assert overlap % 2 == 0, "overlap must be even"
         self.path = path
         self.patch_size = patch_size
         self.ho = overlap // 2
         self.transform = transform
+        self.elevation = elevation  # ElevationReader or None
 
         with rasterio.open(path) as src:
             self.width = src.width
@@ -198,16 +288,20 @@ class GeoTiffPatchDataset(Dataset):
         if self.transform:
             patch = self.transform(image=patch)['image']
         cl, cr, ct, cb = self._crops(x, y)
-        return dict(image=patch, x=x, y=y, cl=cl, cr=cr, ct=ct, cb=cb)
+        out = dict(image=patch, x=x, y=y, cl=cl, cr=cr, ct=ct, cb=cb)
+        if self.elevation is not None:
+            out['ndsm'] = torch.from_numpy(self.elevation(x, y, self.patch_size))
+        return out
 
 
-def infer_image_hard_crop(image_path: str, out_path: str, model, cfg) -> tuple:
+def infer_image_hard_crop(image_path: str, out_path: str, model, cfg, elevation=None) -> tuple:
     """Hard-crop inference: argmax per patch, direct windowed write."""
     patch_size = cfg.data.patch_size
     overlap = cfg.data.patch_overlap
     transform = get_transforms(cfg.data.test_transforms)
 
-    dataset = GeoTiffPatchDataset(image_path, patch_size, overlap, transform=transform)
+    dataset = GeoTiffPatchDataset(image_path, patch_size, overlap, transform=transform,
+                                  elevation=elevation)
     loader = DataLoader(
         dataset,
         batch_size=cfg.data.batch_size,
@@ -235,7 +329,8 @@ def infer_image_hard_crop(image_path: str, out_path: str, model, cfg) -> tuple:
         try:
             for batch in tqdm(loader, desc=Path(image_path).name, unit='batch'):
                 imgs = batch['image'].to(device, non_blocking=True)
-                probs = model(imgs)
+                ndsm = batch['ndsm'].to(device, non_blocking=True) if 'ndsm' in batch else None
+                probs = _predict(model, imgs, ndsm)
                 if want_unc:
                     # normalized predictive entropy from the single-forward softmax probs
                     norm_ent = (-(probs * torch.log(probs + 1e-10)).sum(dim=1)).float().cpu().numpy()
@@ -273,7 +368,7 @@ def infer_image_hard_crop(image_path: str, out_path: str, model, cfg) -> tuple:
 # Gaussian-blended inference -- strip-based rolling accumulator
 # =============================================================================
 
-def infer_image_gaussian(image_path: str, out_path: str, model, cfg) -> tuple:
+def infer_image_gaussian(image_path: str, out_path: str, model, cfg, elevation=None) -> tuple:
     """
     Gaussian-blended inference using a rolling accumulator.
 
@@ -346,7 +441,11 @@ def infer_image_gaussian(image_path: str, out_path: str, model, cfg) -> tuple:
                     images.append(transform(image=patch)['image'])
 
                 imgs = torch.stack(images).to(device, non_blocking=True)
-                probs = model(imgs)
+                ndsm = None
+                if elevation is not None:
+                    ndsm = torch.from_numpy(np.stack([elevation(px, y, patch_size) for px in b_xs]))
+                    ndsm = ndsm.to(device, non_blocking=True)
+                probs = _predict(model, imgs, ndsm)
                 probs_np = probs.cpu().numpy()  # B x C x H x W
 
                 # Accumulate weighted probabilities
@@ -424,11 +523,12 @@ def main(cfg: DictConfig) -> None:
     os.makedirs(out_base, exist_ok=True)
 
     total_time, total_area = 0.0, 0.0
-    for image_path in cfg.data.image_dir:
+    for idx, image_path in enumerate(cfg.data.image_dir):
         stem = Path(image_path).stem
         out_path = os.path.join(out_base, f"{stem}_pred.tif")
         print(f"Processing: {image_path}")
-        t, a = infer_fn(image_path, out_path, model, cfg)
+        elevation = _make_elevation_reader(cfg, model, idx, image_path)
+        t, a = infer_fn(image_path, out_path, model, cfg, elevation=elevation)
         total_time += t
         total_area += a
         torch.cuda.empty_cache()
