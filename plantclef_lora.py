@@ -228,7 +228,7 @@ def main():
                        os.path.join(args.out_dir, "best.pt"))
 
     # %% test with the best epoch
-    model.load_state_dict(torch.load(os.path.join(args.out_dir, "best.pt")), strict=False)
+    model.load_state_dict(torch.load(os.path.join(args.out_dir, "best.pt"), weights_only=True), strict=False)
     y_te, p_te = predict(model, loaders["test"], res, mean, std)
     m = metrics_from_confusion(confusion(y_te, p_te))
     table = pd.DataFrame({"LoRA PlantCLEF": {**{names[c]: m["F1"][c] for c in range(1, N_CLS)},
