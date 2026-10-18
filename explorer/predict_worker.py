@@ -7,6 +7,7 @@ object per line on stdout. Torch stays loaded between requests. stderr is a log.
 import base64
 import io
 import json
+import math
 import sys
 import traceback
 import warnings
@@ -32,6 +33,8 @@ NDSM_MEAN = 1.43
 NDSM_STD = 3.10
 DSM_NODATA = -32767.0
 LOG_ROOT = ROOT / "lightning_logs"
+EXPLAIN_MODES = ("none", "gradcam", "saliency", "confidence", "entropy")
+SALIENCY_EDGE = 1024
 
 _model = None
 _model_path = None
@@ -181,6 +184,9 @@ def _load(ckpt, device):
     model = SegmentationModel.load_from_checkpoint(path, weights_only=False)
     model.eval()
     model.to(device)
+    # Attribution backpropagates to inputs and detached features, not weights.
+    for param in model.parameters():
+        param.requires_grad_(False)
     _model = model
     _model_path = path
     _device = device
@@ -203,7 +209,7 @@ def _release():
 
 
 def _lut():
-    classes, _, _ = load_names()
+    classes, display_order, _ = load_names()
     lut = np.zeros((256, 4), dtype=np.uint8)
     for spec in classes:
         if spec["id"] == 0:
@@ -213,7 +219,7 @@ def _lut():
     for value, rgb in IGNORE_COLORS.items():
         lut[value, :3] = rgb
         lut[value, 3] = 220
-    return lut, classes
+    return lut, classes, display_order
 
 
 def _png_b64(array):
@@ -226,6 +232,342 @@ def _jpeg_b64(rgb):
     buf = io.BytesIO()
     Image.fromarray(rgb, mode="RGB").save(buf, format="JPEG", quality=90)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _explain_request(req, num_classes):
+    mode = req.get("explain") or "none"
+    if mode not in EXPLAIN_MODES:
+        names = ", ".join(EXPLAIN_MODES)
+        raise ValueError(f"explain must be one of {names}")
+    raw = req.get("target_class")
+    if raw is None or raw == "":
+        return mode, None
+    try:
+        target = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_class must be an integer") from exc
+    if target < 0 or target >= num_classes:
+        raise ValueError(f"target_class must be between 0 and {num_classes - 1}")
+    return mode, target
+
+
+def _class_rows(classes, display_order):
+    by_id = {spec["id"]: spec for spec in classes}
+    rows = []
+    seen = set()
+    for class_id in list(display_order) + [spec["id"] for spec in classes]:
+        if class_id in seen or class_id == 0:
+            continue
+        seen.add(class_id)
+        spec = by_id.get(class_id)
+        if spec is None:
+            continue
+        rows.append({
+            "id": int(class_id),
+            "name": spec["name"],
+            "color": spec["color"],
+        })
+    return rows
+
+
+def _class_score(logits, target_class):
+    """Scalar used for Grad-CAM and input saliency.
+
+    A chosen class sums its logits on pixels predicted as that class. With no
+    choice, the score is the predicted species logit on every foreground pixel.
+    """
+    pred = logits.argmax(dim=1).detach()
+    if target_class is None:
+        foreground = pred[0] > 0
+        picked = logits[0].gather(0, pred[0].unsqueeze(0)).squeeze(0)
+        if bool(foreground.any()):
+            return picked[foreground].sum()
+        species = logits[:, 1:]
+        if species.shape[1] == 0:
+            return logits.sum()
+        return species.sum()
+    chosen = logits[0, target_class]
+    mask = pred[0] == target_class
+    if bool(mask.any()):
+        return chosen[mask].sum()
+    return chosen.sum()
+
+
+def _encode_features(model, batch_x, aux, fusion):
+    if fusion == "stem":
+        features = model.model.encoder(batch_x)
+        if model.elevation_fusion is not None and aux is not None:
+            features = model.elevation_fusion(aux, features)
+        return features
+    return model.model.encoder(batch_x)
+
+
+def _decoder_logits(model, features):
+    decoded = model.model.decoder(features)
+    return model.model.segmentation_head(decoded)
+
+
+def _output_stride(model):
+    encoder = getattr(getattr(model, "model", None), "encoder", None)
+    stride = int(getattr(encoder, "output_stride", 32) or 32)
+    return max(1, stride)
+
+
+def _limit_pair(batch_x, aux, limit, stride):
+    """Shrink a forward so attribution fits, keeping the encoder's stride."""
+    import torch.nn.functional as F
+
+    height, width = int(batch_x.shape[-2]), int(batch_x.shape[-1])
+    if max(height, width) <= limit:
+        return batch_x, aux, False
+    scale = limit / float(max(height, width))
+
+    def _fit(length):
+        fitted = int(length * scale) // stride * stride
+        return max(stride, fitted)
+
+    size = (_fit(height), _fit(width))
+    resized = F.interpolate(batch_x, size=size, mode="bilinear", align_corners=False)
+    resized_aux = None
+    if aux is not None:
+        resized_aux = F.interpolate(aux, size=size, mode="bilinear", align_corners=False)
+    return resized, resized_aux, True
+
+
+def _unit_interval(heat, valid, stretch):
+    heat = np.nan_to_num(heat.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    heat = np.maximum(heat, 0)
+    if heat.shape != valid.shape:
+        import cv2
+        heat = cv2.resize(heat, (valid.shape[1], valid.shape[0]), interpolation=cv2.INTER_LINEAR)
+    if stretch:
+        sample = heat[valid > 0]
+        if sample.size == 0:
+            sample = heat.reshape(-1)
+        peak = float(np.percentile(sample, 99)) if sample.size else 0.0
+        if peak <= 0:
+            peak = float(sample.max()) if sample.size else 0.0
+        heat = heat / peak if peak > 0 else heat
+    heat = np.clip(heat, 0.0, 1.0)
+    heat[valid == 0] = 0
+    return heat.astype(np.float32)
+
+
+def _importance_png(heat, alpha):
+    u8 = np.clip(np.round(heat * 255.0), 0, 255).astype(np.uint8)
+    rgba = np.zeros((u8.shape[0], u8.shape[1], 4), dtype=np.uint8)
+    rgba[..., 0] = u8
+    rgba[..., 1] = u8
+    rgba[..., 2] = u8
+    rgba[..., 3] = np.where(alpha > 0, np.uint8(255), np.uint8(0))
+    return _png_b64(rgba)
+
+
+def _confidence_map(probs, target_class):
+    if target_class is None:
+        if probs.shape[1] > 1:
+            heat = probs[0, 1:].max(dim=0).values
+        else:
+            heat = probs[0, 0]
+    else:
+        heat = probs[0, target_class]
+    return heat.detach().float().cpu().numpy()
+
+
+def _entropy_map(probs):
+    import torch
+    safe = probs.clamp_min(1e-8)
+    safe = safe / safe.sum(dim=1, keepdim=True)
+    entropy = -(safe * safe.log()).sum(dim=1)[0]
+    entropy = entropy / math.log(probs.shape[1])
+    return entropy.detach().float().cpu().numpy()
+
+
+def _gradcam(model, batch_x, aux, fusion, target_class):
+    """Seg-Grad-CAM on the deepest encoder map the decoder actually uses.
+
+    The encoder runs without a graph. Only the detached feature maps take
+    gradients, so a full tile does not store the backbone's activations.
+    """
+    import torch
+
+    with torch.no_grad():
+        raw = list(_encode_features(model, batch_x, aux, fusion))
+    deepest = None
+    for index in range(len(raw) - 1, -1, -1):
+        feat = raw[index]
+        spatial = (
+            torch.is_tensor(feat)
+            and feat.ndim == 4
+            and feat.shape[1] > 0
+            and min(feat.shape[-2:]) > 0
+        )
+        if spatial:
+            deepest = index
+            break
+    if deepest is None:
+        raise ValueError("This checkpoint has no spatial features for Grad-CAM.")
+    live = []
+    for index, feat in enumerate(raw):
+        if not torch.is_tensor(feat):
+            live.append(feat)
+            continue
+        leaf = feat.detach()
+        if index == deepest:
+            leaf = leaf.requires_grad_(True)
+        live.append(leaf)
+    del raw
+    with torch.enable_grad():
+        logits = _decoder_logits(model, live)
+        score = _class_score(logits, target_class)
+        if not score.requires_grad:
+            raise ValueError("Grad-CAM did not receive gradients for this checkpoint.")
+        model.zero_grad(set_to_none=True)
+        score.backward()
+    chosen = None
+    for index in range(len(live) - 1, -1, -1):
+        feat = live[index]
+        if torch.is_tensor(feat) and feat.grad is not None and feat.shape[1] > 0:
+            chosen = feat
+            break
+    if chosen is None:
+        raise ValueError("Grad-CAM did not receive gradients for this checkpoint.")
+    weights = chosen.grad.mean(dim=(2, 3), keepdim=True)
+    cam = torch.relu((weights * chosen).sum(dim=1, keepdim=True))
+    import torch.nn.functional as F
+    cam = F.interpolate(cam, size=logits.shape[-2:], mode="bilinear", align_corners=False)
+    heat = cam[0, 0].detach().float().cpu().numpy()
+    probs = torch.softmax(logits.detach(), dim=1)
+    del score, logits, live, cam
+    return heat, probs
+
+
+def _channel_attr(values, grads):
+    return (values.detach().float() * grads.detach().float()).abs().sum(dim=1)[0]
+
+
+def _saliency_groups(model, fusion, image, extra):
+    """Channel groups that should not drown each other when summed."""
+    if fusion == "stem":
+        groups = [(image, image.grad)]
+        if extra is not None and extra.grad is not None:
+            groups.append((extra, extra.grad))
+        return groups
+    channels = _as_dict(model.in_channels or {"image": image.shape[1]})
+    groups = []
+    offset = 0
+    for key, count in channels.items():
+        if key not in ("image", "ndsm"):
+            continue
+        count = int(count)
+        groups.append((image[:, offset:offset + count], image.grad[:, offset:offset + count]))
+        offset += count
+    if not groups:
+        groups.append((image, image.grad))
+    return groups
+
+
+def _saliency(model, batch_x, aux, fusion, target_class):
+    """Input times gradient, with RGB and nDSM kept as separate maps."""
+    import torch
+
+    image = batch_x.detach().requires_grad_(True)
+    extra = None if aux is None else aux.detach().requires_grad_(True)
+    use_amp = image.is_cuda
+    with torch.enable_grad(), torch.autocast(
+        device_type=image.device.type, dtype=torch.bfloat16, enabled=use_amp,
+    ):
+        logits = model._forward(image, extra)
+    score = _class_score(logits.float(), target_class)
+    if not score.requires_grad:
+        raise ValueError("Saliency did not receive gradients for this checkpoint.")
+    model.zero_grad(set_to_none=True)
+    score.backward()
+    if image.grad is None:
+        raise ValueError("Saliency did not receive gradients for this checkpoint.")
+    maps = [_channel_attr(values, grads) for values, grads in _saliency_groups(model, fusion, image, extra)]
+    heat = None
+    for part in maps:
+        plane = part.detach().float().cpu().numpy()
+        plane = np.nan_to_num(plane, nan=0.0, posinf=0.0, neginf=0.0)
+        plane = np.maximum(plane, 0)
+        peak = float(np.percentile(plane, 99)) if plane.size else 0.0
+        if peak <= 0:
+            peak = float(plane.max()) if plane.size else 0.0
+        if peak > 0:
+            plane = plane / peak
+        plane = np.clip(plane, 0.0, 1.0)
+        heat = plane if heat is None else np.maximum(heat, plane)
+    del score, logits, image, extra
+    import cv2
+    heat = cv2.GaussianBlur(heat.astype(np.float32), (0, 0), sigmaX=2)
+    return heat
+
+
+def _forward_probs(model, batch_x, aux):
+    import torch
+    with torch.inference_mode():
+        return model(batch_x, None if aux is None else aux)
+
+
+def _importance(model, batch_x, aux, fusion, explain, target_class, alpha):
+    """Return a [0, 1] map and, for Grad-CAM, the probabilities of that pass."""
+    import torch
+
+    reduced = False
+    probs = None
+    if explain == "gradcam":
+        heat = None
+        try:
+            heat, probs = _gradcam(model, batch_x, aux, fusion, target_class)
+        except torch.cuda.OutOfMemoryError:
+            heat, probs = None, None
+        if heat is None:
+            torch.cuda.empty_cache()
+            smaller, smaller_aux, did_scale = _limit_pair(
+                batch_x, aux, SALIENCY_EDGE, _output_stride(model),
+            )
+            if not did_scale:
+                raise ValueError("The GPU ran out of memory.")
+            try:
+                heat, _unused = _gradcam(model, smaller, smaller_aux, fusion, target_class)
+            except torch.cuda.OutOfMemoryError as exc:
+                torch.cuda.empty_cache()
+                raise ValueError("The GPU ran out of memory.") from exc
+            del _unused
+            reduced = True
+        heat = _unit_interval(heat, alpha, stretch=True)
+        return heat, probs, reduced
+    if explain == "saliency":
+        smaller, smaller_aux, _scaled = _limit_pair(
+            batch_x, aux, SALIENCY_EDGE, _output_stride(model),
+        )
+        heat = None
+        try:
+            heat = _saliency(model, smaller, smaller_aux, fusion, target_class)
+        except torch.cuda.OutOfMemoryError:
+            heat = None
+        if heat is None:
+            torch.cuda.empty_cache()
+            smaller, smaller_aux, _scaled = _limit_pair(
+                smaller, smaller_aux, SALIENCY_EDGE // 2, _output_stride(model),
+            )
+            reduced = True
+            try:
+                heat = _saliency(model, smaller, smaller_aux, fusion, target_class)
+            except torch.cuda.OutOfMemoryError as exc:
+                torch.cuda.empty_cache()
+                raise ValueError("The GPU ran out of memory.") from exc
+        heat = _unit_interval(heat, alpha, stretch=True)
+        return heat, None, reduced
+    probs = _forward_probs(model, batch_x, aux)
+    if explain == "confidence":
+        heat = _confidence_map(probs, target_class)
+        return _unit_interval(heat, alpha, stretch=False), probs, False
+    if explain == "entropy":
+        heat = _entropy_map(probs)
+        return _unit_interval(heat, alpha, stretch=False), probs, False
+    return None, probs, False
 
 
 def _predict(req):
@@ -307,10 +649,22 @@ def _predict(req):
         batch_x = torch.cat(parts, dim=1)
         aux = None
 
+    explain, target_class = _explain_request(req, int(model.num_classes))
+    batch_x = batch_x.to(device)
+    if aux is not None:
+        aux = aux.to(device)
+    importance = None
+    reduced = False
     try:
-        with torch.inference_mode():
-            probs = model(batch_x.to(device), None if aux is None else aux.to(device))
-            pred = probs.argmax(dim=1)[0].detach().cpu().numpy().astype(np.uint8)
+        if explain == "none":
+            probs = _forward_probs(model, batch_x, aux)
+        else:
+            importance, probs, reduced = _importance(
+                model, batch_x, aux, fusion, explain, target_class, alpha,
+            )
+            if probs is None:
+                probs = _forward_probs(model, batch_x, aux)
+        pred = probs.argmax(dim=1)[0].detach().cpu().numpy().astype(np.uint8)
     except torch.cuda.OutOfMemoryError as exc:
         torch.cuda.empty_cache()
         raise ValueError("The GPU ran out of memory.") from exc
@@ -319,7 +673,7 @@ def _predict(req):
         pred = cv2.resize(pred, (width, height), interpolation=cv2.INTER_NEAREST)
 
     pred[alpha == 0] = 0
-    lut, classes = _lut()
+    lut, classes, display_order = _lut()
     overlay = lut[pred]
     overlay[alpha == 0, 3] = 0
     label_overlay = None
@@ -356,6 +710,11 @@ def _predict(req):
         "ds2": ds2,
         "agreement": agreement,
         "counts": counts,
+        "classes": _class_rows(classes, display_order),
+        "explain": explain,
+        "target_class": target_class,
+        "importance_reduced": reduced,
+        "importance": None if importance is None else _importance_png(importance, alpha),
         "image": _jpeg_b64(rgb),
         "overlay": _png_b64(overlay),
         "label": None if label_overlay is None else _png_b64(label_overlay),

@@ -549,8 +549,13 @@ def tile_segment(tile_id: str, body: SegmentIn):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+EXPLAIN_MODES = ("none", "gradcam", "saliency", "confidence", "entropy")
+
+
 class PredictIn(BaseModel):
     ckpt: str
+    explain: str = "gradcam"
+    target_class: int | None = Field(default=None, ge=0, le=6)
 
 
 _wandb_cache = {"until": 0.0, "body": None}
@@ -565,6 +570,9 @@ def checkpoints():
 @app.post("/api/tiles/{tile_id}/predict")
 def tile_predict(tile_id: str, body: PredictIn):
     """Class mask from a trained checkpoint. Refused while a training job is running."""
+    if body.explain not in EXPLAIN_MODES:
+        names = ", ".join(EXPLAIN_MODES)
+        raise HTTPException(status_code=400, detail=f"explain must be one of {names}")
     if train_jobs.training_active():
         raise HTTPException(status_code=409, detail="A training job is using the GPU.")
     if not gpu_lock.acquire(blocking=False):
@@ -583,6 +591,8 @@ def tile_predict(tile_id: str, body: PredictIn):
                 "ckpt": str(ckpt),
                 "image": str(image),
                 "mask": None if mask is None else str(mask),
+                "explain": body.explain,
+                "target_class": body.target_class,
             })
         except TrainEnvError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc

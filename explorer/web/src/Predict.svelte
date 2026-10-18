@@ -17,7 +17,26 @@
     ['newest', 'Newest'],
     ['name', 'Name'],
   ];
+  const EXPLAINS = [
+    ['gradcam', 'Grad-CAM (Features)'],
+    ['saliency', 'Input Saliency (Pixels)'],
+    ['confidence', 'Class Confidence (Probability)'],
+    ['entropy', 'Uncertainty (Entropy)'],
+    ['none', 'Off'],
+  ];
+  const EXPLAIN_HINTS = {
+    gradcam: 'Bright areas are encoder features that raised the score for the chosen class.',
+    saliency: 'Bright areas are input pixels that raised that score. A large tile is reduced to 1024 px for this pass.',
+    confidence: 'Bright areas are where the chosen class is probable. With all species, where any species is probable.',
+    entropy: 'Bright areas are where the model is split between classes.',
+  };
   let ckpt = $state('');
+  let explain = $state('gradcam');
+  let targetClass = $state('');
+  let maskStyle = $state('spotlight');
+  let importanceOpacity = $state(0.85);
+  let spotUrl = $state('');
+  let spotFor = $state('');
   let labelOpacity = $state(0.55);
   let predOpacity = $state(0.75);
   let busy = $state(false);
@@ -40,12 +59,64 @@
   let imageUrl = $derived(shown?.image ? `data:image/jpeg;base64,${shown.image}` : thumb);
   let labelUrl = $derived(shown?.label ? `data:image/png;base64,${shown.label}` : mask);
   let overlayUrl = $derived(shown?.overlay ? `data:image/png;base64,${shown.overlay}` : '');
+  let wantsTarget = $derived(explain !== 'none' && explain !== 'entropy');
+  let chosenTarget = $derived.by(() => {
+    if (!wantsTarget || targetClass === '') return null;
+    const value = Number(targetClass);
+    return Number.isFinite(value) ? value : null;
+  });
+  let classChoices = $derived(shown?.classes ?? []);
+  let importanceFresh = $derived.by(() => {
+    if (!shown?.importance || shown.explain !== explain || explain === 'none') return false;
+    if (explain === 'entropy') return true;
+    return (shown.target_class ?? null) === chosenTarget;
+  });
+  let rawImportance = $derived(importanceFresh ? `data:image/png;base64,${shown.importance}` : '');
+  let importanceUrl = $derived.by(() => {
+    if (!rawImportance) return '';
+    if (maskStyle === 'grayscale') return rawImportance;
+    return spotFor === rawImportance ? spotUrl : '';
+  });
+  let importanceHint = $derived.by(() => {
+    const base = EXPLAIN_HINTS[explain] || '';
+    if (!base) return '';
+    const style = maskStyle === 'spotlight'
+      ? ' Unimportant parts of the photo are dimmed.'
+      : ' White is important and black is not.';
+    const reduced = shown?.importance_reduced && importanceFresh
+      ? ' This map was computed on a smaller copy because the GPU was full.'
+      : '';
+    const stale = shown && !importanceFresh
+      ? ' Run again to refresh this map.'
+      : '';
+    return base + style + reduced + stale;
+  });
 
   $effect(() => {
     tileId;
     result = null;
     resultFor = '';
     error = '';
+    spotUrl = '';
+    spotFor = '';
+  });
+
+  $effect(() => {
+    const src = rawImportance;
+    if (maskStyle !== 'spotlight' || !src) return;
+    let dead = false;
+    paintSpotlight(src).then((url) => {
+      if (dead) return;
+      spotUrl = url;
+      spotFor = src;
+    }).catch(() => {
+      if (dead) return;
+      spotUrl = '';
+      spotFor = '';
+    });
+    return () => {
+      dead = true;
+    };
   });
 
   $effect(() => {
@@ -160,6 +231,42 @@
     ckpt = path;
   }
 
+  function sameClass(id) {
+    return targetClass !== '' && Number(targetClass) === Number(id);
+  }
+
+  function pickClass(id) {
+    if (busy || !wantsTarget) return;
+    targetClass = sameClass(id) ? '' : String(id);
+  }
+
+  function paintSpotlight(src) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0);
+        const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = image.data;
+        for (let i = 0; i < data.length; i += 4) {
+          if (data[i + 3] === 0) continue;
+          const gray = data[i];
+          data[i] = 0;
+          data[i + 1] = 0;
+          data[i + 2] = 0;
+          data[i + 3] = 255 - gray;
+        }
+        ctx.putImageData(image, 0, 0);
+        resolve(canvas.toDataURL('image/png'));
+      };
+      img.onerror = () => reject(new Error('importance failed to load'));
+      img.src = src;
+    });
+  }
+
   async function run() {
     if (!ckpt || busy) return;
     const key = `${tileId}:${ckpt}`;
@@ -169,7 +276,11 @@
       const res = await fetch('/api/tiles/' + tileId + '/predict', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ckpt }),
+        body: JSON.stringify({
+          ckpt,
+          explain,
+          target_class: chosenTarget,
+        }),
       });
       if (!res.ok) throw new Error(await readError(res));
       result = await res.json();
@@ -198,6 +309,9 @@
         {#if overlayUrl}
           <img class="mask pred" src={overlayUrl} alt="" style:opacity={predOpacity} draggable="false" />
         {/if}
+        {#if importanceUrl}
+          <img class="mask importance" src={importanceUrl} alt="" style:opacity={importanceOpacity} draggable="false" />
+        {/if}
         {#if busy}
           <div class="predicting" role="status">Running prediction</div>
         {/if}
@@ -212,6 +326,17 @@
       Prediction
       <input type="range" min="0" max="1" step="0.05" bind:value={predOpacity} disabled={!overlayUrl} />
     </label>
+    <label class="slider">
+      Importance
+      <input type="range" min="0" max="1" step="0.05" bind:value={importanceOpacity} disabled={!importanceUrl} />
+    </label>
+    <div class="styles" role="group" aria-label="Importance display">
+      <button type="button" class:on={maskStyle === 'spotlight'} aria-pressed={maskStyle === 'spotlight'} disabled={!rawImportance} onclick={() => (maskStyle = 'spotlight')}>Spotlight</button>
+      <button type="button" class:on={maskStyle === 'grayscale'} aria-pressed={maskStyle === 'grayscale'} disabled={!rawImportance} onclick={() => (maskStyle = 'grayscale')}>Grayscale</button>
+    </div>
+    {#if importanceHint}
+      <p class="hint">{importanceHint}</p>
+    {/if}
     {#if shown?.agreement != null}
       <p class="agree">Agrees with the label on {percent(shown.agreement)} of labelled pixels.</p>
     {/if}
@@ -276,6 +401,23 @@
     {:else if ranked.some((item) => item.metrics?.test_f1_species != null)}
       <p class="hint">test and val are that run's species F1. The test score is from the best checkpoint.</p>
     {/if}
+    <label class="field">
+      Importance
+      <select bind:value={explain} disabled={busy || !ckpt}>
+        {#each EXPLAINS as [value, label]}
+          <option {value}>{label}</option>
+        {/each}
+      </select>
+    </label>
+    <label class="field">
+      Class
+      <select bind:value={targetClass} disabled={busy || !ckpt || !wantsTarget}>
+        <option value="">All predicted species</option>
+        {#each classChoices as spec (spec.id)}
+          <option value={String(spec.id)}>{spec.name}</option>
+        {/each}
+      </select>
+    </label>
     <button type="button" class="run" onclick={run} disabled={busy || !ckpt}>
       {busy ? 'Running…' : 'Run'}
     </button>
@@ -286,9 +428,18 @@
       <ul class="hits">
         {#each shown.counts as item (item.id)}
           <li>
-            <i class="swatch" style:--swatch={item.color}></i>
-            <span class="binomial">{item.name}</span>
-            <span class="num">{item.px.toLocaleString()} px</span>
+            <button
+              type="button"
+              class:on={wantsTarget && sameClass(item.id)}
+              aria-pressed={wantsTarget && sameClass(item.id)}
+              disabled={busy || !wantsTarget}
+              title={wantsTarget ? 'Use this class for the importance map' : ''}
+              onclick={() => pickClass(item.id)}
+            >
+              <i class="swatch" style:--swatch={item.color}></i>
+              <span class="binomial">{item.name}</span>
+              <span class="num">{item.px.toLocaleString()} px</span>
+            </button>
           </li>
         {/each}
       </ul>
@@ -424,12 +575,52 @@
     padding: 0;
   }
 
-  .hits li {
+  .hits li { border-bottom: 1px solid var(--line); }
+
+  .hits button {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 4px 0;
-    border-bottom: 1px solid var(--line);
+    width: 100%;
+    padding: 4px 2px;
+    border: 0;
+    background: transparent;
+    color: var(--ink);
+    text-align: left;
+  }
+
+  .hits button.on {
+    background: color-mix(in srgb, var(--canopy) 12%, white);
+  }
+
+  .hits button:disabled {
+    opacity: 1;
+    cursor: default;
+  }
+
+  .styles {
+    display: flex;
+    gap: 6px;
+    margin: 0 0 8px;
+  }
+
+  .styles button {
+    border: 1px solid var(--line);
+    background: transparent;
+    border-radius: 2px;
+    padding: 3px 8px;
+    font-size: 12px;
+    color: var(--ink);
+  }
+
+  .styles button.on {
+    background: color-mix(in srgb, var(--canopy) 12%, white);
+    border-color: var(--canopy);
+  }
+
+  .styles button:disabled {
+    opacity: 0.45;
+    cursor: default;
   }
 
   .num {
@@ -442,7 +633,10 @@
 
   .problem { color: #8c2f2f; font-size: 13px; }
 
+  .importance { z-index: 2; }
+
   .predicting {
+    z-index: 3;
     position: absolute;
     left: 8px;
     bottom: 8px;
