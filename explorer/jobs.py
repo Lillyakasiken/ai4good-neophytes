@@ -346,18 +346,48 @@ def cancel(job_id):
     return _public(match)
 
 
-def read_log(job_id, offset):
+def read_log(job_id, offset, tail=None):
     if not re.fullmatch(r"[0-9]{14,20}", job_id):
         raise JobError("unknown job")
     path = JOBS_DIR / f"{job_id}.log"
     if not path.is_file():
         return {"offset": 0, "text": ""}
     size = path.stat().st_size
+    if tail:
+        return {"offset": size, "text": _tail_entries(path, tail, size)}
     offset = max(0, min(int(offset), size))
     with open(path, "rb") as handle:
         handle.seek(offset)
         chunk = handle.read(64_000)
     return {"offset": offset + len(chunk), "text": chunk.decode("utf-8", "replace")}
+
+
+def _tail_entries(path, count, size):
+    """Last ``count`` log records, split on newlines and progress-bar returns.
+
+    Reads backward from the end so a long run does not have to be loaded whole.
+    """
+    count = max(1, min(int(count), 5000))
+    if size <= 0:
+        return ""
+    window = 64_000
+    pos = size
+    data = b""
+    with open(path, "rb") as handle:
+        while True:
+            parts = re.split(rb"[\r\n]+", data)
+            if parts and parts[-1] == b"":
+                parts.pop()
+            # A window that starts mid-file begins with a partial record.
+            complete = parts[1:] if pos > 0 and parts else parts
+            if len(complete) >= count or pos == 0:
+                chosen = (parts if pos == 0 else complete)[-count:]
+                return "\n".join(part.decode("utf-8", "replace") for part in chosen)
+            take = min(window, pos)
+            pos -= take
+            handle.seek(pos)
+            data = handle.read(take) + data
+            window = min(window * 2, 1_048_576)
 
 
 def _start(job):

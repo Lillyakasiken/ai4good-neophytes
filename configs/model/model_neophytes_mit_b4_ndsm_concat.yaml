@@ -1,0 +1,23 @@
+# Same inputs and schedule as model_neophytes_mit_b4_ndsm_dev, but the nDSM is
+# concatenated to RGB before the encoder. The 4-channel stem cannot keep its
+# pretrained weights. Stem fusion is model_neophytes_mit_b4_ndsm_dev.yaml.
+#
+#   python train.py data=neophytes_split_cv3_train_512 model=model_neophytes_mit_b4_ndsm_concat
+#   python test.py exp_name=<run>   # auto-selects neophytes_split_cv3_test (loads the nDSM)
+defaults:
+  - model
+
+name: ${model.model_name}_${model.encoder_name}_nDSM_concat
+
+# 'ndsm' makes train.py set data.load_ndsm, which loads DSM + DTM per tile and
+# subtracts them. The raw DSM is absolute altitude and mostly identifies the site.
+in_channels:
+  image: 3
+  ndsm: 1
+
+model_name: Unet
+encoder_name: mit_b4
+fusion_mode: concat
+
+max_epochs: 30
+check_val_every_n_epoch: 3

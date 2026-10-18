@@ -30,6 +30,7 @@
   let logText = $state('');
   let logOffset = $state(0);
   let logEl = $state(null);
+  let logWindow = $state('200');
   let stick = true;
 
   let samples = $state([]);
@@ -37,6 +38,7 @@
 
   let wandb = $state(null);
   let wandbError = $state('');
+  let now = $state(Date.now());
 
   // Last model whose schedule was copied into the fields. Plain lets so editing
   // a field does not run this again and put the config's values back.
@@ -218,19 +220,29 @@
 
   $effect(() => {
     const id = openId;
+    const window = logWindow;
     if (!id) return;
     let dead = false;
     let offset = 0;
     let text = '';
+    const tail = window === 'all' ? 0 : Number(window);
     logText = '';
     logOffset = 0;
     async function poll() {
       while (!dead) {
         try {
-          const res = await fetch(`/api/jobs/${id}/log?offset=${offset}`);
+          const url = tail
+            ? `/api/jobs/${id}/log?tail=${tail}`
+            : `/api/jobs/${id}/log?offset=${offset}`;
+          const res = await fetch(url);
           if (res.ok) {
             const body = await res.json();
-            if (!dead && body.text) {
+            if (!dead && tail) {
+              if (body.text !== text) {
+                text = body.text || '';
+                logText = text;
+              }
+            } else if (!dead && body.text) {
               text += body.text;
               logText = text;
               offset = body.offset;
@@ -272,6 +284,13 @@
       dead = true;
       clearInterval(timer);
     };
+  });
+
+  $effect(() => {
+    const timer = setInterval(() => {
+      now = Date.now();
+    }, 30000);
+    return () => clearInterval(timer);
   });
 
   async function enqueue() {
@@ -336,6 +355,28 @@
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return value;
     return date.toLocaleString();
+  }
+
+  function formatDuration(ms) {
+    const total = Math.max(0, Math.floor(ms / 60000));
+    const days = Math.floor(total / 1440);
+    const hours = Math.floor((total % 1440) / 60);
+    const minutes = total % 60;
+    const parts = [];
+    if (days) parts.push(`${days}d`);
+    if (days || hours) parts.push(`${hours}h`);
+    parts.push(`${minutes}m`);
+    return parts.join(' ');
+  }
+
+  function duration(run) {
+    const start = Date.parse(run.created_at);
+    if (Number.isNaN(start)) return '—';
+    let end = NaN;
+    if (run.finished_at) end = Date.parse(run.finished_at);
+    else if (run.state === 'running') end = now;
+    if (Number.isNaN(end) || end < start) return '—';
+    return formatDuration(end - start);
   }
 </script>
 
@@ -567,7 +608,19 @@
       </section>
 
       <section class="card log-card">
-        <h2>Log {#if openId}<span class="hint">{openId}</span>{/if}</h2>
+        <div class="log-head">
+          <h2>Log {#if openId}<span class="hint">{openId}</span>{/if}</h2>
+          <label class="log-window">
+            Show
+            <select bind:value={logWindow}>
+              <option value="100">100 recent</option>
+              <option value="200">200 recent</option>
+              <option value="500">500 recent</option>
+              <option value="1000">1,000 recent</option>
+              <option value="all">All</option>
+            </select>
+          </label>
+        </div>
         <pre class="log" bind:this={logEl} onscroll={onLogScroll}>{logText || 'Log output appears here once the job starts.'}</pre>
       </section>
     </div>
@@ -592,6 +645,8 @@
               <th>Run</th>
               <th>State</th>
               <th>Created</th>
+              <th>Finished</th>
+              <th>Duration</th>
               <th>val F1 species</th>
               <th>test F1 species</th>
               <th>Encoder</th>
@@ -609,6 +664,8 @@
                 </td>
                 <td>{run.state}</td>
                 <td>{when(run.created_at)}</td>
+                <td>{when(run.finished_at) || '—'}</td>
+                <td class="num">{duration(run)}</td>
                 <td class="num">{metric(run, 'val_f1_species')}</td>
                 <td class="num">{metric(run, 'test_f1_species')}</td>
                 <td>{run.encoder ?? '—'}</td>
@@ -755,6 +812,27 @@
   }
 
   .log { max-height: 280px; margin: 0; }
+
+  .log-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
+
+  .log-head h2 { margin: 0; }
+
+  .log-window {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    flex: none;
+    color: var(--mist);
+  }
+
+  .log-window select { width: auto; }
 
   .run, .wandb-head button, .cancel {
     border: 0;

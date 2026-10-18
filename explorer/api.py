@@ -647,9 +647,9 @@ def cancel_job(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/log")
-def job_log(job_id: str, offset: int = 0):
+def job_log(job_id: str, offset: int = 0, tail: int = 0):
     try:
-        return train_jobs.read_log(job_id, offset)
+        return train_jobs.read_log(job_id, offset, tail or None)
     except train_jobs.JobError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

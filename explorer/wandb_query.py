@@ -16,6 +16,27 @@ TEAM = "max-zehnder-university-of-z-rich"
 METRICS = ("val_f1_species", "test_f1_species", "val_f1", "train_loss")
 
 
+def _stamp(value):
+    if not value:
+        return ""
+    return value if isinstance(value, str) else str(value)
+
+
+def _finished_at(run):
+    """When a finished run stopped.
+
+    wandb-metadata.json only records startedAt. The last heartbeat is the
+    completion time W&B keeps once the run state is finished.
+    """
+    if run.state != "finished":
+        return ""
+    try:
+        heartbeat = run.heartbeat_at
+    except AttributeError:
+        return ""
+    return _stamp(heartbeat)
+
+
 def _entity(api):
     """Team that owns the project, unless WANDB_ENTITY names another one."""
     preferred = os.environ.get("WANDB_ENTITY") or TEAM
@@ -49,13 +70,13 @@ def _script_payload(limit):
             value = summary.get(key)
             if isinstance(value, (int, float)) and value == value:
                 metrics[key] = float(value)
-        created = run.created_at
         rows.append({
             "id": run.id,
             "name": run.name,
             "state": run.state,
             "url": run.url,
-            "created_at": created if isinstance(created, str) else str(created or ""),
+            "created_at": _stamp(run.created_at),
+            "finished_at": _finished_at(run),
             "encoder": config.get("encoder_name"),
             "learning_rate": config.get("learning_rate"),
             "metrics": metrics,
