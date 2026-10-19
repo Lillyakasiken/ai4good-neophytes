@@ -16,6 +16,8 @@ Split as for the cv3 baseline (split_cv3.yaml):
          --bg-fraction of the tiles (as bg_fraction in data.yaml); class-balanced loss
   val    the val folders of the training sites, sampled the same way; picks the
          regularisation C (as the baseline picks its best epoch on val)
+  val_full  every tile of those val folders (real background share, as the baseline's
+         validation); only scored, for the val -> test gap
   test   every window of every tile of the held-out sites (as test.py)
 
 Rows per window size, all scored on test with metrics_from_confusion (as test.py):
@@ -64,6 +66,12 @@ def split_tiles(stats_csv, split_yaml, bg_fraction, max_tiles, rng):
         if max_tiles:
             d = d.sample(min(max_tiles, len(d)), random_state=int(rng.integers(1 << 31)))
         out[split] = d.reset_index(drop=True)
+    # # every val tile, as the baseline's validation and as test: val -> test is then a pure site gap.
+    # # Drawn after the other splits, so their rng draws (and the cached embeddings) stay the same.
+    d = df[df["img_path"].str.startswith(tuple(p.rstrip("/") + "/" for p in dirs["val"]))]
+    if max_tiles:
+        d = d.sample(min(max_tiles, len(d)), random_state=int(rng.integers(1 << 31)))
+    out["val_full"] = d.reset_index(drop=True)
     return out
 
 
@@ -217,7 +225,7 @@ def main():
     for size in args.sizes:
         sel = {s: emb[s]["size"] == size for s in emb}
         y = {s: emb[s]["label"][sel[s]] for s in emb}
-        rows, notes = {}, []
+        rows, notes, gap = {}, [], {}
         prior = np.bincount(y["train"], weights=np.where(bg_tile[sel["train"]], w_bg, 1.0), minlength=N_CLS)
         prior /= prior.sum()
         notes.append(f"real background prior {prior[0]:.1%} (train windows {np.mean(y['train'] == 0):.1%})")
@@ -230,9 +238,15 @@ def main():
                 f1_val = metrics_from_confusion(confusion(y["val"], head.predict(X["val"])))["F1-avg-wo0"]
                 if best is None or f1_val > best[0]:
                     best = (f1_val, C, head)
-            rows[name] = metrics_from_confusion(confusion(y["test"], best[2].predict(X["test"])))
-            logits = best[2].decision_function(X["test"]) + np.log(prior[best[2].classes_] + 1e-12)
-            rows[name + " + prior"] = metrics_from_confusion(confusion(y["test"], best[2].classes_[logits.argmax(1)]))
+            for s in ["val_full", "test"]:
+                logits = best[2].decision_function(X[s])
+                adj = logits + np.log(prior[best[2].classes_] + 1e-12)
+                m = {name: metrics_from_confusion(confusion(y[s], best[2].classes_[logits.argmax(1)])),
+                     name + " + prior": metrics_from_confusion(confusion(y[s], best[2].classes_[adj.argmax(1)]))}
+                for k, v in m.items():
+                    gap.setdefault(k, {})[s] = v["F1-avg-wo0"]
+                    if s == "test":
+                        rows[k] = v
             notes.append(f"{name}: C = {best[1]:g} (val F1-avg-wo0 {best[0]:.3f})")
         rows["zero-shot top1"] = metrics_from_confusion(confusion(y["test"], emb["test"]["top1"][sel["test"]]))
         p6 = {s: emb[s]["p6"][sel[s]] for s in emb}
@@ -246,8 +260,13 @@ def main():
                                   "P-avg-wo0": m["Precision-avg-wo0"], "R-avg-wo0": m["Recall-avg-wo0"]}
                               for k, m in rows.items()}).T
         n = np.bincount(y["test"], minlength=N_CLS)
+        gap = pd.DataFrame(gap).T.rename(columns={"val_full": "full val F1-avg-wo0", "test": "test F1-avg-wo0"})
+        gap["gap"] = gap["full val F1-avg-wo0"] - gap["test F1-avg-wo0"]
+        n_val = np.bincount(y["val_full"], minlength=N_CLS)
         md += [f"\n## {size} px windows\n", "Test windows: " + ", ".join(f"{names[c]} {n[c]}" for c in range(N_CLS))
-               + ". " + "; ".join(notes) + ".\n", table.to_markdown(floatfmt=".3f")]
+               + ". " + "; ".join(notes) + ".\n", table.to_markdown(floatfmt=".3f"),
+               f"\nGeneralisation gap: full val ({len(tiles['val_full'])} tiles, background share "
+               f"{n_val[0] / n_val.sum():.1%}) vs held-out test, window F1:\n", gap.to_markdown(floatfmt=".3f")]
     with open(os.path.join(args.out_dir, "summary.md"), "w") as f:
         f.write("\n".join(md) + "\n")
     print("\n".join(md))

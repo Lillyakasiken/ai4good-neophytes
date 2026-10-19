@@ -17,6 +17,7 @@ window holds no species pixel, skipped in between (plantclef_probe.window_label)
          windows; class-balanced cross-entropy (as the probe's head); flips, 90 degree
          rotations and colour jitter
   val    the val folders, sampled the same way; picks the best epoch (F1-avg-wo0)
+  val_full  every tile of the val folders (real background share); only scored, for the gap
   test   every window of every held-out tile, best epoch, metrics_from_confusion
 
     python plantclef_lora.py --size 256
@@ -140,6 +141,8 @@ def main():
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--max-tiles", type=int, default=0, help="tiles per split for a quick check (0 = all)")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="no training: load best.pt and log.csv from --out-dir and score full val + test")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -206,7 +209,10 @@ def main():
 
     # %% train, best epoch on val
     log, best = [], -1.0
-    for epoch in range(args.epochs):
+    if args.eval_only:
+        log = pd.read_csv(os.path.join(args.out_dir, "log.csv")).to_dict("records")
+        best = max(r["val_f1_wo0"] for r in log)
+    for epoch in range(0 if args.eval_only else args.epochs):
         model.train()
         t0, losses = time.time(), []
         for step, (img, y) in enumerate(loaders["train"]):
@@ -247,6 +253,13 @@ def main():
     np.savez(os.path.join(args.out_dir, "test_logits.npz"), label=y_te, logits=l_te, prior=prior)
     rows = {"LoRA PlantCLEF": metrics_from_confusion(confusion(y_te, l_te.argmax(1))),
             "LoRA PlantCLEF + prior": metrics_from_confusion(confusion(y_te, (l_te + np.log(prior + 1e-12)).argmax(1)))}
+    # # generalisation gap: every val tile (real background share, as the baseline's validation) vs test
+    y_vf, l_vf = predict(model, loaders["val_full"], res, mean, std)
+    gap = pd.DataFrame({k: {"full val F1-avg-wo0": metrics_from_confusion(confusion(y_vf, pred(l_vf)))["F1-avg-wo0"],
+                            "test F1-avg-wo0": rows[k]["F1-avg-wo0"]}
+                        for k, pred in [("LoRA PlantCLEF", lambda l: l.argmax(1)),
+                                        ("LoRA PlantCLEF + prior", lambda l: (l + np.log(prior + 1e-12)).argmax(1))]}).T
+    gap["gap"] = gap["full val F1-avg-wo0"] - gap["test F1-avg-wo0"]
     table = pd.DataFrame({k: {**{names[c]: m["F1"][c] for c in range(1, N_CLS)}, "F1-avg-wo0": m["F1-avg-wo0"],
                               "P-avg-wo0": m["Precision-avg-wo0"], "R-avg-wo0": m["Recall-avg-wo0"]}
                           for k, m in rows.items()}).T
@@ -258,7 +271,10 @@ def main():
           "Test windows: " + ", ".join(f"{names[c]} {counts['test'][c]}" for c in range(N_CLS))
           + f". Real background prior of the training sites {prior[0]:.1%}; compare '+ prior' with the probe's "
           f"'linear PlantCLEF + prior' row.\n",
-          table.to_markdown(floatfmt=".3f")]
+          table.to_markdown(floatfmt=".3f"),
+          f"\nGeneralisation gap: full val ({len(tiles['val_full'])} tiles, background share "
+          f"{counts['val_full'][0] / counts['val_full'].sum():.1%}) vs held-out test, window F1:\n",
+          gap.to_markdown(floatfmt=".3f")]
     with open(os.path.join(args.out_dir, "summary.md"), "w") as f:
         f.write("\n".join(md) + "\n")
     print("\n".join(md))
