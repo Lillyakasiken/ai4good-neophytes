@@ -33,6 +33,13 @@ SIZES = (256, 512, 1024)
 POS_THR = 0.01  # as plantclef_probe.py --pos-thr
 
 
+def md_table(df):
+    """DataFrame -> markdown table, 3 decimals (the shared env has no tabulate for to_markdown)."""
+    rows = [["", *map(str, df.columns)], ["---"] * (len(df.columns) + 1)]
+    rows += [[str(i), *(f"{v:.3f}" for v in r)] for i, r in zip(df.index, df.to_numpy())]
+    return "\n".join("| " + " | ".join(r) + " |" for r in rows)
+
+
 def pred_window_label(pred, n_cls, pos_thr):
     """Window label of a predicted mask (invalid pixels = n_cls): dominant species or background."""
     px = np.bincount(pred.ravel(), minlength=n_cls + 1)[:n_cls]
@@ -130,10 +137,10 @@ def main(cfg: DictConfig) -> None:
           f"training sites); test: {res['test']['n_tiles']} tiles (held-out sites). Window rule as "
           f"plantclef_probe.window_label (pos-thr {POS_THR:.0%}); compare the window rows with the probe's and "
           f"LoRA's generalisation-gap tables at the same size.\n",
-          "## Generalisation gap\n", gap.to_markdown(floatfmt=".3f")]
+          "## Generalisation gap\n", md_table(gap)]
     for u, title in [("px", "pixel F1"), *[(s, f"window F1, {s} px") for s in SIZES]]:
         tab = pd.DataFrame({sp: row(res[sp][u]) for sp in ["val", "test"]}).T
-        md += [f"\n## {title}\n", tab.to_markdown(floatfmt=".3f")]
+        md += [f"\n## {title}\n", md_table(tab)]
         if u != "px":
             md.append("\nTest windows: " + ", ".join(f"{names[c]} {res['test'][f'n{u}'][c]}" for c in range(N_CLS))
                       + "; full val windows: " + ", ".join(f"{names[c]} {res['val'][f'n{u}'][c]}"
