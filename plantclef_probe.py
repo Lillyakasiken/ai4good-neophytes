@@ -202,11 +202,25 @@ def main():
     md = ["# Linear probe on frozen embeddings, cv3 held-out sites\n",
           f"Windows: exclusive grid, resized to 518; species window = dominant species >= {args.pos_thr:.0%} "
           f"of valid pixels. Train/val: labelled tiles + {args.bg_fraction:.0%} background-only tiles; "
-          f"test: every tile of the held-out sites ({len(tiles['test'])} tiles). F1 as in test.py.\n"]
+          f"test: every tile of the held-out sites ({len(tiles['test'])} tiles). F1 as in test.py. "
+          f"'+ prior': logits shifted by the log class prior of all windows of the training sites "
+          f"(background-only tiles reweighted to their full count), since the class-balanced head "
+          f"assumes equal priors.\n"]
+    # # background-only tiles of the training sites were subsampled to bg_fraction; weight
+    # # their windows back up to the full count to get the real class prior (no test labels used)
+    with open(args.split_yaml) as f:
+        train_dirs = tuple(p.rstrip("/") + "/" for p in yaml.safe_load(f)["image_dir"]["train"])
+    stats = pd.read_csv(args.stats_csv)
+    n_bg_all = (stats["img_path"].str.startswith(train_dirs) & (stats["only_background"] == 1)).sum()
+    w_bg = n_bg_all / max(1, tiles["train"]["only_background"].sum())
+    bg_tile = tiles["train"]["only_background"].to_numpy()[emb["train"]["tile"]] == 1
     for size in args.sizes:
         sel = {s: emb[s]["size"] == size for s in emb}
         y = {s: emb[s]["label"][sel[s]] for s in emb}
         rows, notes = {}, []
+        prior = np.bincount(y["train"], weights=np.where(bg_tile[sel["train"]], w_bg, 1.0), minlength=N_CLS)
+        prior /= prior.sum()
+        notes.append(f"real background prior {prior[0]:.1%} (train windows {np.mean(y['train'] == 0):.1%})")
         for key, name in [("pc", "linear PlantCLEF"), ("dino", "linear DINOv2")]:
             scaler = StandardScaler().fit(emb["train"][key][sel["train"]].astype(np.float32))
             X = {s: scaler.transform(emb[s][key][sel[s]].astype(np.float32)) for s in emb}
@@ -217,6 +231,8 @@ def main():
                 if best is None or f1_val > best[0]:
                     best = (f1_val, C, head)
             rows[name] = metrics_from_confusion(confusion(y["test"], best[2].predict(X["test"])))
+            logits = best[2].decision_function(X["test"]) + np.log(prior[best[2].classes_] + 1e-12)
+            rows[name + " + prior"] = metrics_from_confusion(confusion(y["test"], best[2].classes_[logits.argmax(1)]))
             notes.append(f"{name}: C = {best[1]:g} (val F1-avg-wo0 {best[0]:.3f})")
         rows["zero-shot top1"] = metrics_from_confusion(confusion(y["test"], emb["test"]["top1"][sel["test"]]))
         p6 = {s: emb[s]["p6"][sel[s]] for s in emb}
