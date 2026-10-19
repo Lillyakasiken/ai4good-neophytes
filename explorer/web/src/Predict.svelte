@@ -357,8 +357,15 @@
     {#if importanceHint}
       <p class="hint">{importanceHint}</p>
     {/if}
-    {#if shown?.agreement != null}
-      <p class="agree">Agrees with the label on {percent(shown.agreement)} of labelled pixels.</p>
+    {#if shown?.agreement != null || shown?.agreement_species != null}
+      <p class="agree">
+        {#if shown?.agreement != null}
+          <span>Agrees with the label on {percent(shown.agreement)} of labelled pixels, including background.</span>
+        {/if}
+        {#if shown?.agreement_species != null}
+          <span>Agrees on {percent(shown.agreement_species)} of labelled species pixels.</span>
+        {/if}
+      </p>
     {/if}
     {#if selected?.ds2 || shown?.ds2}
       <p class="hint">Same pass as test.py for a half-resolution run: the tile is scaled down before the forward pass.</p>
@@ -650,6 +657,12 @@
   }
 
   .agree, .hint { margin: 8px 0 0; color: var(--mist); font-size: 12px; }
+
+  .agree {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
 
   .problem { color: #8c2f2f; font-size: 13px; }
 

@@ -678,6 +678,7 @@ def _predict(req):
     overlay[alpha == 0, 3] = 0
     label_overlay = None
     agreement = None
+    agreement_species = None
     if label is not None:
         shown = label.copy()
         shown[alpha == 0] = 0
@@ -686,6 +687,9 @@ def _predict(req):
         valid = (alpha > 0) & (label != 254) & (label != 255)
         if int(valid.sum()) > 0:
             agreement = float((pred[valid] == label[valid]).mean())
+        species = valid & (label > 0)
+        if int(species.sum()) > 0:
+            agreement_species = float((pred[species] == label[species]).mean())
 
     by_id = {spec["id"]: spec for spec in classes}
     counts = []
@@ -709,6 +713,7 @@ def _predict(req):
         "height": height,
         "ds2": ds2,
         "agreement": agreement,
+        "agreement_species": agreement_species,
         "counts": counts,
         "classes": _class_rows(classes, display_order),
         "explain": explain,
