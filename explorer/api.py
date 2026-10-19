@@ -5,6 +5,8 @@ Run from this directory, with its virtualenv:
     uvicorn api:app --port 8000
 """
 
+import hashlib
+import json
 import math
 import os
 import re
@@ -556,9 +558,146 @@ class PredictIn(BaseModel):
     ckpt: str
     explain: str = "gradcam"
     target_class: int | None = Field(default=None, ge=0, le=6)
+    force: bool = False
 
 
 _wandb_cache = {"until": 0.0, "body": None}
+
+PRED_DIR = CACHE / "predictions"
+PRED_INDEX = PRED_DIR / "index.json"
+PRED_VERSION = 1
+PRED_CAP_BYTES = 2 * 1024 ** 3
+_pred_lock = threading.RLock()
+
+
+def _file_sig(path):
+    if path is None or not path.is_file():
+        return ""
+    stat = path.stat()
+    return f"{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}"
+
+
+def _pred_key(image, mask, ckpt, explain, target_class):
+    raw = "\n".join([
+        str(PRED_VERSION),
+        _file_sig(image),
+        _file_sig(mask),
+        _file_sig(ckpt),
+        explain,
+        "" if target_class is None else str(int(target_class)),
+    ])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _load_pred_index():
+    if not PRED_INDEX.is_file():
+        return {}
+    try:
+        data = json.loads(PRED_INDEX.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_pred_index(index):
+    PRED_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PRED_INDEX.with_suffix(".tmp")
+    tmp.write_text(json.dumps(index))
+    os.replace(tmp, PRED_INDEX)
+
+
+def _pred_stats_unlocked(index):
+    return {
+        "count": len(index),
+        "bytes": sum(int(item.get("bytes") or 0) for item in index.values()),
+    }
+
+
+def _drop_pred(index, key):
+    path = PRED_DIR / f"{key}.json"
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    index.pop(key, None)
+
+
+def _prune_preds(index):
+    total = _pred_stats_unlocked(index)["bytes"]
+    if total <= PRED_CAP_BYTES:
+        return
+    ordered = sorted(index.items(), key=lambda item: item[1].get("saved_at") or 0)
+    for key, item in ordered:
+        if total <= PRED_CAP_BYTES:
+            break
+        _drop_pred(index, key)
+        total -= int(item.get("bytes") or 0)
+
+
+def _remember_pred(key, meta, payload):
+    PRED_DIR.mkdir(parents=True, exist_ok=True)
+    saved_at = time.time()
+    path = PRED_DIR / f"{key}.json"
+    tmp = PRED_DIR / f".{key}.tmp"
+    tmp.write_text(json.dumps({
+        "saved_at": saved_at,
+        **meta,
+        "payload": payload,
+    }))
+    os.replace(tmp, path)
+    with _pred_lock:
+        index = _load_pred_index()
+        index[key] = {**meta, "saved_at": saved_at, "bytes": path.stat().st_size}
+        _prune_preds(index)
+        _write_pred_index(index)
+    return saved_at
+
+
+def _read_pred(key):
+    path = PRED_DIR / f"{key}.json"
+    try:
+        data = json.loads(path.read_text())
+        payload = data.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("bad cache")
+    except (OSError, json.JSONDecodeError, ValueError):
+        with _pred_lock:
+            index = _load_pred_index()
+            if key in index:
+                _drop_pred(index, key)
+                _write_pred_index(index)
+        return None
+    out = dict(payload)
+    out["cached"] = True
+    out["saved_at"] = data.get("saved_at")
+    return out
+
+
+def _matching_preds(index, tile_id, image, mask, ckpt):
+    image_sig = _file_sig(image)
+    mask_sig = _file_sig(mask)
+    ckpt_sig = _file_sig(ckpt)
+    ckpt_path = str(ckpt)
+    found = []
+    for key, item in index.items():
+        if item.get("tile_id") != tile_id or item.get("ckpt") != ckpt_path:
+            continue
+        if item.get("image_sig") != image_sig or item.get("mask_sig") != mask_sig:
+            continue
+        if item.get("ckpt_sig") != ckpt_sig:
+            continue
+        found.append((item.get("saved_at") or 0, key))
+    found.sort()
+    return found
+
+
+def _resolve_predict(tile_id, ckpt_path):
+    try:
+        ckpt = predict_client.resolve_checkpoint(ckpt_path)
+    except predict_client.PredictError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    image, mask = _tile_paths(tile_id)
+    return image, mask, ckpt
 
 
 @app.get("/api/checkpoints")
@@ -567,12 +706,77 @@ def checkpoints():
     return predict_client.list_checkpoints()
 
 
+@app.get("/api/predictions/cache")
+def prediction_cache():
+    """How many saved predictions are on disk. Does not use the GPU."""
+    with _pred_lock:
+        return _pred_stats_unlocked(_load_pred_index())
+
+
+@app.delete("/api/predictions/cache")
+def clear_prediction_cache():
+    """Delete every saved prediction. Does not unload the model."""
+    with _pred_lock:
+        index = _load_pred_index()
+        for key in list(index):
+            _drop_pred(index, key)
+        _write_pred_index(index)
+        return _pred_stats_unlocked(index)
+
+
+@app.get("/api/tiles/{tile_id}/predict/saved")
+def tile_predict_saved(tile_id: str, ckpt: str = Query(min_length=1)):
+    """Newest saved prediction for this tile and checkpoint, or 404."""
+    image, mask, resolved = _resolve_predict(tile_id, ckpt)
+    with _pred_lock:
+        found = _matching_preds(_load_pred_index(), tile_id, image, mask, resolved)
+    if not found:
+        raise HTTPException(status_code=404, detail="no saved prediction")
+    payload = _read_pred(found[-1][1])
+    if payload is None:
+        raise HTTPException(status_code=404, detail="no saved prediction")
+    return payload
+
+
+@app.delete("/api/tiles/{tile_id}/predict/saved")
+def tile_predict_clear(tile_id: str, ckpt: str = Query(min_length=1)):
+    """Delete saved predictions for this tile and checkpoint."""
+    _image, _mask, resolved = _resolve_predict(tile_id, ckpt)
+    ckpt_path = str(resolved)
+    with _pred_lock:
+        index = _load_pred_index()
+        for key, item in list(index.items()):
+            if item.get("tile_id") == tile_id and item.get("ckpt") == ckpt_path:
+                _drop_pred(index, key)
+        _write_pred_index(index)
+        return _pred_stats_unlocked(index)
+
+
+@app.post("/api/predict/release")
+def predict_release():
+    """Unload the prediction checkpoint. A training job is left running."""
+    if train_jobs.training_active():
+        raise HTTPException(status_code=409, detail="A training job is using the GPU.")
+    try:
+        return predict_client.release()
+    except TrainEnvError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except predict_client.PredictError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/api/tiles/{tile_id}/predict")
 def tile_predict(tile_id: str, body: PredictIn):
-    """Class mask from a trained checkpoint. Refused while a training job is running."""
+    """Class mask from a trained checkpoint. A saved result skips the GPU."""
     if body.explain not in EXPLAIN_MODES:
         names = ", ".join(EXPLAIN_MODES)
         raise HTTPException(status_code=400, detail=f"explain must be one of {names}")
+    image, mask, ckpt = _resolve_predict(tile_id, body.ckpt)
+    key = _pred_key(image, mask, ckpt, body.explain, body.target_class)
+    if not body.force:
+        hit = _read_pred(key)
+        if hit is not None:
+            return hit
     if train_jobs.training_active():
         raise HTTPException(status_code=409, detail="A training job is using the GPU.")
     if not gpu_lock.acquire(blocking=False):
@@ -580,11 +784,6 @@ def tile_predict(tile_id: str, body: PredictIn):
     try:
         if train_jobs.training_active():
             raise HTTPException(status_code=409, detail="A training job is using the GPU.")
-        try:
-            ckpt = predict_client.resolve_checkpoint(body.ckpt)
-        except predict_client.PredictError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        image, mask = _tile_paths(tile_id)
         try:
             payload = predict_client.request({
                 "cmd": "predict",
@@ -601,6 +800,17 @@ def tile_predict(tile_id: str, body: PredictIn):
         if not payload.get("ok"):
             raise HTTPException(status_code=400, detail=payload.get("error") or "prediction failed")
         payload.pop("ok", None)
+        saved_at = _remember_pred(key, {
+            "tile_id": tile_id,
+            "ckpt": str(ckpt),
+            "image_sig": _file_sig(image),
+            "mask_sig": _file_sig(mask),
+            "ckpt_sig": _file_sig(ckpt),
+            "explain": body.explain,
+            "target_class": body.target_class,
+        }, payload)
+        payload["cached"] = False
+        payload["saved_at"] = saved_at
         return payload
     finally:
         gpu_lock.release()

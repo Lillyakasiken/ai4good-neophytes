@@ -354,13 +354,57 @@ def _unit_interval(heat, valid, stretch):
 
 
 def _importance_png(heat, alpha):
+    """Warm color whose opacity is the heat. Empty margin stays transparent."""
     u8 = np.clip(np.round(heat * 255.0), 0, 255).astype(np.uint8)
     rgba = np.zeros((u8.shape[0], u8.shape[1], 4), dtype=np.uint8)
-    rgba[..., 0] = u8
-    rgba[..., 1] = u8
-    rgba[..., 2] = u8
-    rgba[..., 3] = np.where(alpha > 0, np.uint8(255), np.uint8(0))
+    rgba[..., 0] = 214
+    rgba[..., 1] = 92
+    rgba[..., 2] = 31
+    strength = u8.copy()
+    strength[alpha == 0] = 0
+    rgba[..., 3] = strength
     return _png_b64(rgba)
+
+
+def _mask_edge(mask):
+    import cv2
+
+    if not np.any(mask):
+        return mask
+    kernel = np.ones((3, 3), np.uint8)
+    plate = mask.astype(np.uint8)
+    return (cv2.dilate(plate, kernel) > 0) & (cv2.erode(plate, kernel) == 0)
+
+
+def _paint(rgba, mask, ids, lut, alpha=None):
+    if not np.any(mask):
+        return
+    picked = lut[ids[mask]]
+    if alpha is not None:
+        picked = picked.copy()
+        picked[:, 3] = alpha
+    rgba[mask] = picked
+
+
+def _comparison(pred, label, alpha, lut):
+    """One layer: agreed fill, extra pixels, missed outlines, wrong-class borders."""
+    rgba = np.zeros((*pred.shape, 4), dtype=np.uint8)
+    visible = alpha > 0
+    ignore = np.isin(label, (254, 255))
+    valid = visible & ~ignore
+    agree = valid & (pred == label) & (label > 0)
+    extra = valid & (pred > 0) & (label == 0)
+    missed = valid & (label > 0) & (pred == 0)
+    wrong = valid & (pred > 0) & (label > 0) & (pred != label)
+    _paint(rgba, agree, label, lut, alpha=168)
+    _paint(rgba, extra, pred, lut, alpha=255)
+    _paint(rgba, wrong, pred, lut, alpha=255)
+    extra_edge = _mask_edge(extra)
+    rgba[extra_edge] = (255, 255, 255, 255)
+    _paint(rgba, _mask_edge(wrong), label, lut, alpha=255)
+    _paint(rgba, _mask_edge(missed), label, lut, alpha=255)
+    _paint(rgba, visible & ignore, label, lut)
+    return rgba
 
 
 def _confidence_map(probs, target_class):
@@ -694,18 +738,28 @@ def _predict(req):
     by_id = {spec["id"]: spec for spec in classes}
     counts = []
     visible = alpha > 0
+    scored = None if label is None else (alpha > 0) & (label != 254) & (label != 255)
     for class_id, spec in by_id.items():
         if class_id == 0:
             continue
         px = int(((pred == class_id) & visible).sum())
-        if px <= 0:
-            continue
-        counts.append({
+        row = {
             "id": class_id,
             "name": spec["name"],
             "color": spec["color"],
             "px": px,
-        })
+        }
+        if scored is not None:
+            row["tp"] = int(((pred == class_id) & (label == class_id) & scored).sum())
+            row["fp"] = int(((pred == class_id) & (label != class_id) & scored).sum())
+            row["fn"] = int(((label == class_id) & (pred != class_id) & scored).sum())
+        if px <= 0 and not (row.get("tp") or row.get("fp") or row.get("fn")):
+            continue
+        counts.append(row)
+
+    comparison = None
+    if label is not None:
+        comparison = _png_b64(_comparison(pred, label, alpha, lut))
 
     return {
         "ok": True,
@@ -723,6 +777,7 @@ def _predict(req):
         "image": _jpeg_b64(rgb),
         "overlay": _png_b64(overlay),
         "label": None if label_overlay is None else _png_b64(label_overlay),
+        "comparison": comparison,
     }
 
 

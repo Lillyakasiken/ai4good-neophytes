@@ -5,6 +5,7 @@
   import Segment from './Segment.svelte';
   import Predict from './Predict.svelte';
   import Zoom from './Zoom.svelte';
+  import { paintIsolate } from './isolate.js';
 
   let { tileId, fold, onclose } = $props();
 
@@ -15,6 +16,8 @@
   let opacity = $state(0.8);
   let tab = $state('tile');
   let legendOpen = $state(false);
+  let focusColor = $state('');
+  let isolatedMask = $state('');
   let zoomOpen = $state(false);
   let sharp = $state('');
   let sharpFor = $state('');
@@ -38,6 +41,8 @@
     error = '';
     loading = false;
     legendOpen = false;
+    focusColor = '';
+    isolatedMask = '';
     zoomOpen = false;
     sharp = '';
     sharpFor = '';
@@ -169,6 +174,24 @@
   }
 
   $effect(() => {
+    const src = tile?.mask;
+    const color = focusColor;
+    if (!src || !color) {
+      isolatedMask = '';
+      return;
+    }
+    let dead = false;
+    paintIsolate(src, color).then((url) => {
+      if (!dead) isolatedMask = url;
+    }).catch(() => {
+      if (!dead) isolatedMask = '';
+    });
+    return () => {
+      dead = true;
+    };
+  });
+
+  $effect(() => {
     if (!zoomOpen || !tile?.tile_id || sharpFor === tile.tile_id) return;
     const id = tile.tile_id;
     sharp = '';
@@ -288,18 +311,18 @@
     {:else if tab === 'segment'}
       <Segment tileId={tile.tile_id} mask={tile.mask} />
     {:else if tab === 'predict'}
-      <Predict tileId={tile.tile_id} thumb={tile.thumb} mask={tile.mask} />
+      <Predict tileId={tile.tile_id} thumb={tile.thumb} mask={tile.mask} bind:focusColor />
     {:else}
       <div class="shot">
         <button type="button" class="stage" class:busy={switching} aria-label="Enlarge orthophoto" onclick={() => (zoomOpen = true)}>
-          <img src={tile.thumb} alt="" fetchpriority="high" draggable="false" />
-          <img class="mask" src={tile.mask} alt="" style:opacity={opacity} fetchpriority="high" draggable="false" />
+          <img class="photo" class:dim={!!focusColor} src={tile.thumb} alt="" fetchpriority="high" draggable="false" />
+          <img class="mask" src={isolatedMask || tile.mask} alt="" style:opacity={opacity} fetchpriority="high" draggable="false" />
         </button>
         <CopyButton overlay />
       </div>
       <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Orthophoto" note={sharpBusy ? 'Loading a sharper view…' : ''} bind:opacity>
-        <img src={sharp || tile.thumb} alt="Orthophoto" draggable="false" />
-        <img class="mask" src={tile.mask} alt="" style:opacity={opacity} draggable="false" />
+        <img class="photo" class:dim={!!focusColor} src={sharp || tile.thumb} alt="Orthophoto" draggable="false" />
+        <img class="mask" src={isolatedMask || tile.mask} alt="" style:opacity={opacity} draggable="false" />
       </Zoom>
       <label class="slider">
         Labels
@@ -308,10 +331,24 @@
     {/if}
     <div class="legend">
       {#each legend as item}
-        <span>
-          <i class="swatch" style:--swatch={item.color}></i>
-          {#if item.kind === 'species'}<span class="binomial">{item.label}</span>{:else}{item.label}{/if}
-        </span>
+        {#if item.kind === 'species'}
+          <button
+            type="button"
+            class:on={focusColor === item.color}
+            style:--swatch={item.color}
+            aria-pressed={focusColor === item.color}
+            title="Show only this class"
+            onclick={() => (focusColor = focusColor === item.color ? '' : item.color)}
+          >
+            <i class="swatch" style:--swatch={item.color}></i>
+            <span class="binomial">{item.label}</span>
+          </button>
+        {:else}
+          <span>
+            <i class="swatch" style:--swatch={item.color}></i>
+            {item.label}
+          </span>
+        {/if}
       {/each}
       {#if shownIgnore.length}
         <button

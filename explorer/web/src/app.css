@@ -1092,7 +1092,23 @@ button.stage:disabled {
 
 .stage img { width: 100%; height: 100%; object-fit: contain; display: block; }
 
-.stage .mask { position: absolute; inset: 0; }
+.stage img.photo.dim {
+  filter: saturate(0.75) brightness(0.92);
+}
+
+.stage .mask { position: absolute; inset: 0; image-rendering: pixelated; }
+
+.legend button {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+}
+
+.legend button.on {
+  background: color-mix(in srgb, var(--swatch) 28%, white);
+}
 
 .slider {
   display: flex;
@@ -1180,6 +1196,7 @@ th { color: var(--mist); font-weight: 500; }
 .legend-note + .hint { margin-top: 8px; }
 
 .legend span,
+.legend button,
 td .binomial {
   display: inline-flex;
   align-items: center;

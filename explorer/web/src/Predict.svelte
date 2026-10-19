@@ -1,12 +1,15 @@
 <script>
   import CopyButton from './CopyButton.svelte';
   import Zoom from './Zoom.svelte';
+  import { paintImportance, paintIsolate } from './isolate.js';
 
-  let { tileId, thumb, mask } = $props();
+  let { tileId, thumb, mask, focusColor = $bindable('') } = $props();
 
   let checkpoints = $state([]);
+  let checkpointsLoading = $state(true);
   let listError = $state('');
   let runs = $state([]);
+  let scoresLoading = $state(true);
   let scoresNote = $state('');
   let query = $state('');
   let sortBy = $state('test');
@@ -18,6 +21,13 @@
     ['newest', 'Newest'],
     ['name', 'Name'],
   ];
+  const VIEWS = [
+    ['photo', 'Photo'],
+    ['labels', 'Labels'],
+    ['prediction', 'Prediction'],
+    ['compare', 'Compare'],
+    ['importance', 'Importance'],
+  ];
   const EXPLAINS = [
     ['gradcam', 'Grad-CAM (Features)'],
     ['saliency', 'Input Saliency (Pixels)'],
@@ -26,25 +36,40 @@
     ['none', 'Off'],
   ];
   const EXPLAIN_HINTS = {
-    gradcam: 'Bright areas are encoder features that raised the score for the chosen class.',
-    saliency: 'Bright areas are input pixels that raised that score. A large tile is reduced to 1024 px for this pass.',
-    confidence: 'Bright areas are where the chosen class is probable. With all species, where any species is probable.',
-    entropy: 'Bright areas are where the model is split between classes.',
+    gradcam: 'Warm color marks encoder features that raised the score for the chosen class.',
+    saliency: 'Warm color marks input pixels that raised that score. A large tile is reduced to 1024 px for this pass.',
+    confidence: 'Warm color marks where the chosen class is probable. With all species, where any species is probable.',
+    entropy: 'Warm color marks where the model is split between classes.',
   };
   let ckpt = $state('');
   let explain = $state('gradcam');
   let targetClass = $state('');
-  let maskStyle = $state('spotlight');
-  let importanceOpacity = $state(0.85);
-  let spotUrl = $state('');
-  let spotFor = $state('');
-  let labelOpacity = $state(0.55);
-  let predOpacity = $state(0.75);
+  let maskStyle = $state('heat');
+  let view = $state('prediction');
+  let compareKind = $state('wipe');
+  let strength = $state(0.65);
+  let wipe = $state(0.5);
+  let styledUrl = $state('');
+  let styledFor = $state('');
+  let labelPaint = $state('');
+  let labelPaintFor = $state('');
+  let predPaint = $state('');
+  let predPaintFor = $state('');
+  let comparePaint = $state('');
+  let comparePaintFor = $state('');
   let busy = $state(false);
+  let loadingSaved = $state(false);
   let error = $state('');
   let result = $state(null);
   let resultFor = $state('');
   let zoomOpen = $state(false);
+  let seamDrag = null;
+  let seenKey = '';
+  let fetchGen = 0;
+  let training = $state(false);
+  let cacheCount = $state(0);
+  let cacheBytes = $state(0);
+  let gpuNote = $state('');
 
   let ranked = $derived.by(() => rankCheckpoints(checkpoints, runs, sortBy));
   let visible = $derived.by(() => {
@@ -61,6 +86,7 @@
   let imageUrl = $derived(shown?.image ? `data:image/jpeg;base64,${shown.image}` : thumb);
   let labelUrl = $derived(shown?.label ? `data:image/png;base64,${shown.label}` : mask);
   let overlayUrl = $derived(shown?.overlay ? `data:image/png;base64,${shown.overlay}` : '');
+  let comparisonUrl = $derived(shown?.comparison ? `data:image/png;base64,${shown.comparison}` : '');
   let wantsTarget = $derived(explain !== 'none' && explain !== 'entropy');
   let chosenTarget = $derived.by(() => {
     if (!wantsTarget || targetClass === '') return null;
@@ -73,18 +99,39 @@
     if (explain === 'entropy') return true;
     return (shown.target_class ?? null) === chosenTarget;
   });
-  let rawImportance = $derived(importanceFresh ? `data:image/png;base64,${shown.importance}` : '');
-  let importanceUrl = $derived.by(() => {
-    if (!rawImportance) return '';
-    if (maskStyle === 'grayscale') return rawImportance;
-    return spotFor === rawImportance ? spotUrl : '';
+  let rawImportance = $derived(shown?.importance ? `data:image/png;base64,${shown.importance}` : '');
+  let importanceUrl = $derived(styledFor === `${rawImportance}|${maskStyle}` ? styledUrl : '');
+  let shownView = $derived.by(() => {
+    if ((view === 'prediction' || view === 'compare') && !overlayUrl) return 'labels';
+    if (view === 'importance' && (!rawImportance || explain === 'none')) return overlayUrl ? 'prediction' : 'labels';
+    if (view === 'compare' && compareKind === 'agreement' && !comparisonUrl) return 'compare';
+    return view;
   });
+  let wipeOn = $derived(shownView === 'compare' && (compareKind === 'wipe' || !comparisonUrl));
+  let agreementOn = $derived(shownView === 'compare' && compareKind === 'agreement' && !!comparisonUrl);
+  let layerOpacity = $derived(wipeOn ? 1 : strength);
+  let dimPhoto = $derived(shownView === 'labels' || shownView === 'prediction' || shownView === 'compare');
+  let labelShown = $derived.by(() => {
+    if (!focusColor) return labelUrl;
+    return labelPaintFor === `${labelUrl}|${focusColor}` ? labelPaint : '';
+  });
+  let predShown = $derived.by(() => {
+    if (!focusColor) return overlayUrl;
+    return predPaintFor === `${overlayUrl}|${focusColor}` ? predPaint : '';
+  });
+  let compareShown = $derived.by(() => {
+    if (!focusColor) return comparisonUrl;
+    return comparePaintFor === `${comparisonUrl}|${focusColor}` ? comparePaint : '';
+  });
+  let wipeClip = $derived(wipeOn ? `inset(0 ${(1 - wipe) * 100}% 0 0)` : undefined);
   let importanceHint = $derived.by(() => {
     const base = EXPLAIN_HINTS[explain] || '';
-    if (!base) return '';
+    if (!base || shownView !== 'importance') return '';
     const style = maskStyle === 'spotlight'
       ? ' Unimportant parts of the photo are dimmed.'
-      : ' White is important and black is not.';
+      : maskStyle === 'grayscale'
+        ? ' White is important and black is not.'
+        : ' Clear areas did not matter for the score.';
     const reduced = shown?.importance_reduced && importanceFresh
       ? ' This map was computed on a smaller copy because the GPU was full.'
       : '';
@@ -93,30 +140,120 @@
       : '';
     return base + style + reduced + stale;
   });
+  let modeNote = $derived.by(() => {
+    if (shownView === 'compare' && agreementOn) return '';
+    if (wipeOn) return 'Left is the prediction. Right is the label. Drag the line to move the split.';
+    if (shownView === 'importance') return '';
+    if (focusColor) return 'Other classes are faded. Click the class again to show all.';
+    return '';
+  });
+  let sliderLabel = $derived.by(() => {
+    if (wipeOn) return 'Split';
+    if (shownView === 'labels') return 'Labels';
+    if (shownView === 'importance') return 'Importance';
+    if (agreementOn) return 'Agreement';
+    if (shownView === 'prediction') return 'Prediction';
+    return 'Overlay';
+  });
 
   $effect(() => {
-    tileId;
+    const id = tileId;
+    const path = ckpt;
+    const key = `${id}:${path}`;
+    if (seenKey && seenKey !== key) focusColor = '';
+    seenKey = key;
     result = null;
     resultFor = '';
     error = '';
-    spotUrl = '';
-    spotFor = '';
+    styledUrl = '';
+    styledFor = '';
     zoomOpen = false;
+    gpuNote = '';
+    if (!id || !path) return;
+    const gen = ++fetchGen;
+    const ctrl = new AbortController();
+    loadingSaved = true;
+    fetch(`/api/tiles/${id}/predict/saved?ckpt=${encodeURIComponent(path)}`, { signal: ctrl.signal })
+      .then(async (res) => {
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error(await readError(res));
+        return res.json();
+      })
+      .then((data) => {
+        if (gen !== fetchGen || !data) return;
+        result = data;
+        resultFor = key;
+      })
+      .catch((err) => {
+        if (err.name === 'AbortError') return;
+      })
+      .finally(() => {
+        if (gen === fetchGen) loadingSaved = false;
+      });
+    return () => {
+      ctrl.abort();
+    };
   });
 
   $effect(() => {
     const src = rawImportance;
-    if (maskStyle !== 'spotlight' || !src) return;
+    const style = maskStyle;
+    if (!src) return;
     let dead = false;
-    paintSpotlight(src).then((url) => {
+    paintImportance(src, style).then((url) => {
       if (dead) return;
-      spotUrl = url;
-      spotFor = src;
+      styledUrl = url;
+      styledFor = `${src}|${style}`;
     }).catch(() => {
       if (dead) return;
-      spotUrl = '';
-      spotFor = '';
+      styledUrl = '';
+      styledFor = '';
     });
+    return () => {
+      dead = true;
+    };
+  });
+
+  $effect(() => {
+    const src = labelUrl;
+    const color = focusColor;
+    if (!src || !color) return;
+    let dead = false;
+    paintIsolate(src, color).then((url) => {
+      if (dead) return;
+      labelPaint = url;
+      labelPaintFor = `${src}|${color}`;
+    }).catch(() => {});
+    return () => {
+      dead = true;
+    };
+  });
+
+  $effect(() => {
+    const src = overlayUrl;
+    const color = focusColor;
+    if (!src || !color) return;
+    let dead = false;
+    paintIsolate(src, color).then((url) => {
+      if (dead) return;
+      predPaint = url;
+      predPaintFor = `${src}|${color}`;
+    }).catch(() => {});
+    return () => {
+      dead = true;
+    };
+  });
+
+  $effect(() => {
+    const src = comparisonUrl;
+    const color = focusColor;
+    if (!src || !color) return;
+    let dead = false;
+    paintIsolate(src, color).then((url) => {
+      if (dead) return;
+      comparePaint = url;
+      comparePaintFor = `${src}|${color}`;
+    }).catch(() => {});
     return () => {
       dead = true;
     };
@@ -137,6 +274,9 @@
       .catch((err) => {
         if (err.name === 'AbortError') return;
         listError = String(err.message || err);
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) checkpointsLoading = false;
       });
     return () => ctrl.abort();
   });
@@ -156,6 +296,23 @@
       .catch((err) => {
         if (err.name === 'AbortError') return;
         scoresNote = String(err.message || err);
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) scoresLoading = false;
+      });
+    return () => ctrl.abort();
+  });
+
+  $effect(() => {
+    const ctrl = new AbortController();
+    refreshCache(ctrl.signal);
+    fetch('/api/gpu', { signal: ctrl.signal })
+      .then(async (res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data) training = !!data.training;
+      })
+      .catch((err) => {
+        if (err.name === 'AbortError') return;
       });
     return () => ctrl.abort();
   });
@@ -238,43 +395,78 @@
     return targetClass !== '' && Number(targetClass) === Number(id);
   }
 
-  function pickClass(id) {
-    if (busy || !wantsTarget) return;
-    targetClass = sameClass(id) ? '' : String(id);
+  function pickClass(id, color) {
+    if (busy) return;
+    const on = focusColor === color;
+    focusColor = on ? '' : color;
+    if (!wantsTarget) return;
+    targetClass = on ? '' : String(id);
   }
 
-  function paintSpotlight(src) {
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        ctx.drawImage(img, 0, 0);
-        const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const data = image.data;
-        for (let i = 0; i < data.length; i += 4) {
-          if (data[i + 3] === 0) continue;
-          const gray = data[i];
-          data[i] = 0;
-          data[i + 1] = 0;
-          data[i + 2] = 0;
-          data[i + 3] = 255 - gray;
-        }
-        ctx.putImageData(image, 0, 0);
-        resolve(canvas.toDataURL('image/png'));
-      };
-      img.onerror = () => reject(new Error('importance failed to load'));
-      img.src = src;
-    });
+  function viewDisabled(mode) {
+    if (mode === 'prediction' || mode === 'compare') return !overlayUrl;
+    if (mode === 'importance') return explain === 'none' || !rawImportance;
+    return false;
+  }
+
+  function openZoom(event) {
+    if (event.target.closest('.seam')) return;
+    zoomOpen = true;
+  }
+
+  function moveSeam(event, stage) {
+    const rect = stage.getBoundingClientRect();
+    if (!rect.width) return;
+    const x = (event.clientX - rect.left) / rect.width;
+    wipe = Math.min(1, Math.max(0, x));
+  }
+
+  function onSeamDown(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    const stage = event.currentTarget.closest('.stage');
+    if (!stage) return;
+    seamDrag = { id: event.pointerId, stage };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    moveSeam(event, stage);
+  }
+
+  function onSeamMove(event) {
+    if (!seamDrag || event.pointerId !== seamDrag.id) return;
+    moveSeam(event, seamDrag.stage);
+  }
+
+  function onSeamUp(event) {
+    if (!seamDrag || event.pointerId !== seamDrag.id) return;
+    seamDrag = null;
+  }
+
+  async function refreshCache(signal) {
+    try {
+      const res = await fetch('/api/predictions/cache', { signal });
+      if (!res.ok) return;
+      const data = await res.json();
+      cacheCount = data.count ?? 0;
+      cacheBytes = data.bytes ?? 0;
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+    }
+  }
+
+  function applyStats(data) {
+    cacheCount = data.count ?? 0;
+    cacheBytes = data.bytes ?? 0;
   }
 
   async function run() {
     if (!ckpt || busy) return;
     const key = `${tileId}:${ckpt}`;
+    const rerun = !!shown;
+    const gen = ++fetchGen;
+    loadingSaved = false;
     busy = true;
     error = '';
+    gpuNote = '';
     try {
       const res = await fetch('/api/tiles/' + tileId + '/predict', {
         method: 'POST',
@@ -283,11 +475,15 @@
           ckpt,
           explain,
           target_class: chosenTarget,
+          force: rerun,
         }),
       });
       if (!res.ok) throw new Error(await readError(res));
-      result = await res.json();
+      const data = await res.json();
+      if (gen !== fetchGen) return;
+      result = data;
       resultFor = key;
+      refreshCache();
     } catch (err) {
       error = String(err.message || err);
     } finally {
@@ -295,67 +491,225 @@
     }
   }
 
+  async function clearSaved() {
+    if (!tileId || !ckpt || busy) return;
+    fetchGen += 1;
+    loadingSaved = false;
+    error = '';
+    try {
+      const res = await fetch(`/api/tiles/${tileId}/predict/saved?ckpt=${encodeURIComponent(ckpt)}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(await readError(res));
+      applyStats(await res.json());
+      result = null;
+      resultFor = '';
+    } catch (err) {
+      error = String(err.message || err);
+    }
+  }
+
+  async function clearAll() {
+    if (busy || !cacheCount) return;
+    if (!confirm(`Delete all ${cacheCount} saved predictions?`)) return;
+    fetchGen += 1;
+    loadingSaved = false;
+    error = '';
+    try {
+      const res = await fetch('/api/predictions/cache', { method: 'DELETE' });
+      if (!res.ok) throw new Error(await readError(res));
+      applyStats(await res.json());
+      result = null;
+      resultFor = '';
+    } catch (err) {
+      error = String(err.message || err);
+    }
+  }
+
+  async function freeGpu() {
+    if (busy || training) return;
+    error = '';
+    gpuNote = '';
+    try {
+      const res = await fetch('/api/predict/release', { method: 'POST' });
+      if (!res.ok) throw new Error(await readError(res));
+      const data = await res.json();
+      gpuNote = data.released ? 'Prediction model unloaded. The next run loads it again.' : 'No prediction model was loaded.';
+    } catch (err) {
+      error = String(err.message || err);
+    }
+  }
+
   function percent(value) {
     if (value == null || Number.isNaN(value)) return '';
     return `${Math.round(value * 1000) / 10}%`;
   }
+
+  function sizeLabel(bytes) {
+    if (!bytes) return '0 MB';
+    if (bytes < 1024 ** 2) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+    if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+    return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  }
+
+  function savedWhen(ts) {
+    if (!ts) return 'Saved';
+    const date = new Date(ts * 1000);
+    if (Number.isNaN(date.getTime())) return 'Saved';
+    return `Saved · ${date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`;
+  }
+
+  function coverageNote() {
+    const rows = shown?.counts ?? [];
+    if (!rows.some((row) => row.fp != null)) return '';
+    let predPx = 0;
+    let labelPx = 0;
+    for (const row of rows) {
+      predPx += row.px || 0;
+      labelPx += (row.tp || 0) + (row.fn || 0);
+    }
+    const gap = predPx - labelPx;
+    if (gap > 0) return `The prediction covers ${gap.toLocaleString()} more species pixels than the label.`;
+    if (gap < 0) return `The label covers ${(-gap).toLocaleString()} more species pixels than the prediction.`;
+    return 'The prediction and the label cover the same number of species pixels.';
+  }
+
+  function share(part, item) {
+    const total = (item.tp || 0) + (item.fp || 0) + (item.fn || 0);
+    if (!total) return 0;
+    return (100 * part) / total;
+  }
 </script>
 
+{#snippet spinner()}
+  <span class="spin" aria-hidden="true"></span>
+{/snippet}
+
+{#snippet agreementKey(onDark)}
+  <ul class="key" class:ondark={onDark} aria-label="Agreement marks">
+    <li><i class="mark both"></i> Both</li>
+    <li><i class="mark extra"></i> White edge: prediction only</li>
+    <li><i class="mark miss"></i> Outline: label only</li>
+    <li><i class="mark wrong"></i> Colored edge: prediction, edge is the label</li>
+  </ul>
+{/snippet}
+
+{#snippet viewBar(onDark)}
+  <div class="views" class:ondark={onDark} role="group" aria-label="Prediction view">
+    {#each VIEWS as [mode, label]}
+      {@const waiting = loadingSaved && (mode === 'prediction' || mode === 'compare' || mode === 'importance')}
+      <button
+        type="button"
+        class:on={shownView === mode}
+        class:wait={waiting}
+        aria-pressed={shownView === mode}
+        aria-busy={waiting}
+        disabled={viewDisabled(mode)}
+        onclick={() => (view = mode)}
+      >{#if waiting}{@render spinner()}{/if}{label}</button>
+    {/each}
+  </div>
+{/snippet}
+
 {#snippet layers(alt)}
-  <img src={imageUrl} alt={alt} draggable="false" />
-  {#if labelUrl}
-    <img class="mask" src={labelUrl} alt="" style:opacity={labelOpacity} draggable="false" />
+  <img class="photo" class:dim={dimPhoto} src={imageUrl} alt={alt} draggable="false" />
+  {#if labelShown && (shownView === 'labels' || wipeOn)}
+    <img class="mask" src={labelShown} alt="" style:opacity={layerOpacity} draggable="false" />
   {/if}
-  {#if overlayUrl}
-    <img class="mask pred" src={overlayUrl} alt="" style:opacity={predOpacity} draggable="false" />
+  {#if predShown && (shownView === 'prediction' || wipeOn)}
+    <img class="mask pred" src={predShown} alt="" style:opacity={layerOpacity} style:clip-path={wipeClip} draggable="false" />
   {/if}
-  {#if importanceUrl}
-    <img class="mask importance" src={importanceUrl} alt="" style:opacity={importanceOpacity} draggable="false" />
+  {#if compareShown && agreementOn}
+    <img class="mask pred" src={compareShown} alt="" style:opacity={layerOpacity} draggable="false" />
+  {/if}
+  {#if importanceUrl && shownView === 'importance'}
+    <img class="mask importance" src={importanceUrl} alt="" style:opacity={strength} draggable="false" />
+  {/if}
+  {#if wipeOn}
+    {#if wipe > 0.02}<span class="badge left">Prediction</span>{/if}
+    {#if wipe < 0.98}<span class="badge right">Labels</span>{/if}
+    <div
+      class="seam"
+      style:left="{wipe * 100}%"
+      aria-hidden="true"
+      onpointerdown={onSeamDown}
+      onpointermove={onSeamMove}
+      onpointerup={onSeamUp}
+      onpointercancel={onSeamUp}
+    ></div>
   {/if}
 {/snippet}
 
 <div class="lab">
   <div class="preview">
     <div class="shot">
-      <button type="button" class="stage" aria-busy={busy} aria-label="Enlarge prediction" onclick={() => (zoomOpen = true)}>
+      <button type="button" class="stage" aria-busy={busy || loadingSaved} aria-label="Enlarge prediction" onclick={openZoom}>
         {@render layers('')}
         {#if busy}
-          <div class="predicting" role="status">Running prediction</div>
+          <div class="predicting" role="status">{@render spinner()} Running prediction</div>
+        {:else if loadingSaved}
+          <div class="predicting quiet" role="status">{@render spinner()} Loading saved prediction</div>
+        {/if}
+        {#if shown?.saved_at && !busy}
+          <span class="saved">{savedWhen(shown.saved_at)}</span>
         {/if}
       </button>
       <CopyButton overlay />
     </div>
-    <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Prediction" bind:opacity={labelOpacity}>
+    <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Prediction">
       {#snippet toolbar()}
-        <label class="zoom-slider">
-          Prediction
-          <input type="range" min="0" max="1" step="0.05" bind:value={predOpacity} disabled={!overlayUrl} aria-label="Prediction opacity" />
-        </label>
-        <label class="zoom-slider">
-          Importance
-          <input type="range" min="0" max="1" step="0.05" bind:value={importanceOpacity} disabled={!importanceUrl} aria-label="Importance opacity" />
-        </label>
+        {@render viewBar(true)}
+        {#if wipeOn}
+          <label class="zoom-slider">
+            Split
+            <input type="range" min="0" max="1" step="0.01" bind:value={wipe} aria-label="Comparison split" />
+          </label>
+        {:else if shownView === 'compare'}
+          <label class="zoom-slider">
+            Agreement
+            <input type="range" min="0" max="1" step="0.05" bind:value={strength} aria-label="Agreement opacity" />
+          </label>
+          {#if agreementOn}
+            {@render agreementKey(true)}
+          {/if}
+        {/if}
       {/snippet}
       {@render layers('Prediction')}
     </Zoom>
-    <label class="slider">
-      Labels
-      <input type="range" min="0" max="1" step="0.05" bind:value={labelOpacity} />
-    </label>
-    <label class="slider">
-      Prediction
-      <input type="range" min="0" max="1" step="0.05" bind:value={predOpacity} disabled={!overlayUrl} />
-    </label>
-    <label class="slider">
-      Importance
-      <input type="range" min="0" max="1" step="0.05" bind:value={importanceOpacity} disabled={!importanceUrl} />
-    </label>
-    <div class="styles" role="group" aria-label="Importance display">
-      <button type="button" class:on={maskStyle === 'spotlight'} aria-pressed={maskStyle === 'spotlight'} disabled={!rawImportance} onclick={() => (maskStyle = 'spotlight')}>Spotlight</button>
-      <button type="button" class:on={maskStyle === 'grayscale'} aria-pressed={maskStyle === 'grayscale'} disabled={!rawImportance} onclick={() => (maskStyle = 'grayscale')}>Grayscale</button>
-    </div>
+    {@render viewBar(false)}
+    {#if shownView === 'compare' && overlayUrl}
+      <div class="styles" role="group" aria-label="Comparison display">
+        <button type="button" class:on={compareKind === 'wipe'} aria-pressed={compareKind === 'wipe'} onclick={() => (compareKind = 'wipe')}>Wipe</button>
+        <button type="button" class:on={compareKind === 'agreement'} aria-pressed={compareKind === 'agreement'} disabled={!comparisonUrl} onclick={() => (compareKind = 'agreement')}>Agreement</button>
+      </div>
+    {/if}
+    {#if shownView !== 'photo'}
+      <label class="slider">
+        {sliderLabel}
+        {#if wipeOn}
+          <input type="range" min="0" max="1" step="0.01" bind:value={wipe} aria-label="Comparison split" />
+        {:else}
+          <input type="range" min="0" max="1" step="0.05" bind:value={strength} aria-label="{sliderLabel} opacity" />
+        {/if}
+        <span class="readout">{wipeOn ? `${Math.round(wipe * 100)}%` : `${Math.round(strength * 100)}%`}</span>
+      </label>
+    {/if}
+    {#if shownView === 'importance'}
+      <div class="styles" role="group" aria-label="Importance display">
+        <button type="button" class:on={maskStyle === 'heat'} aria-pressed={maskStyle === 'heat'} disabled={!rawImportance} onclick={() => (maskStyle = 'heat')}>Heat</button>
+        <button type="button" class:on={maskStyle === 'spotlight'} aria-pressed={maskStyle === 'spotlight'} disabled={!rawImportance} onclick={() => (maskStyle = 'spotlight')}>Spotlight</button>
+        <button type="button" class:on={maskStyle === 'grayscale'} aria-pressed={maskStyle === 'grayscale'} disabled={!rawImportance} onclick={() => (maskStyle = 'grayscale')}>Grayscale</button>
+      </div>
+    {/if}
     {#if importanceHint}
       <p class="hint">{importanceHint}</p>
+    {/if}
+    {#if agreementOn}
+      {@render agreementKey(false)}
+      {#if coverageNote()}
+        <p class="hint">{coverageNote()}</p>
+      {/if}
+    {/if}
+    {#if modeNote}
+      <p class="hint">{modeNote}</p>
     {/if}
     {#if shown?.agreement != null || shown?.agreement_species != null}
       <p class="agree">
@@ -413,17 +767,25 @@
                 <span class="sub">{item.kind}{item.ds2 ? ' · half res' : ''} · {item.file}</span>
               </span>
               <span class="scores">
-                <span>test {f1(item, 'test_f1_species')}</span>
-                <span>val {f1(item, 'val_f1_species')}</span>
+                {#if scoresLoading}
+                  {@render spinner()}
+                {:else}
+                  <span>test {f1(item, 'test_f1_species')}</span>
+                  <span>val {f1(item, 'val_f1_species')}</span>
+                {/if}
               </span>
             </button>
           </li>
         {/each}
       </ul>
+    {:else if checkpointsLoading}
+      <p class="hint loading" role="status">{@render spinner()} Loading checkpoints</p>
     {:else if checkpoints.length}
       <p class="hint">No checkpoint matches.</p>
     {/if}
-    {#if scoresNote}
+    {#if scoresLoading}
+      <p class="hint loading" role="status">{@render spinner()} Loading test and val F1</p>
+    {:else if scoresNote}
       <p class="hint">{scoresNote}</p>
     {:else if ranked.some((item) => item.metrics?.test_f1_species != null)}
       <p class="hint">test and val are that run's species F1. The test score is from the best checkpoint.</p>
@@ -445,9 +807,22 @@
         {/each}
       </select>
     </label>
-    <button type="button" class="run" onclick={run} disabled={busy || !ckpt}>
-      {busy ? 'Running…' : 'Run'}
-    </button>
+    <div class="actions">
+      <button type="button" class="run" onclick={run} disabled={busy || loadingSaved || !ckpt} aria-busy={busy || loadingSaved}>
+        {#if busy || loadingSaved}{@render spinner()}{/if}
+        {shown || loadingSaved ? 'Re-run' : 'Run'}
+      </button>
+      <button type="button" onclick={clearSaved} disabled={busy || !shown}>Clear saved</button>
+      <button type="button" onclick={clearAll} disabled={busy || !cacheCount}>Clear all saved ({cacheCount} · {sizeLabel(cacheBytes)})</button>
+    </div>
+    <div class="actions">
+      <button type="button" onclick={freeGpu} disabled={busy || training} title={training ? 'A training job is using the GPU' : 'Unload the prediction model from GPU memory'}>
+        Free GPU
+      </button>
+    </div>
+    {#if gpuNote}
+      <p class="hint">{gpuNote}</p>
+    {/if}
     <div class="hist-head">
       <h3>Predicted classes</h3>
     </div>
@@ -457,19 +832,29 @@
           <li>
             <button
               type="button"
-              class:on={wantsTarget && sameClass(item.id)}
-              aria-pressed={wantsTarget && sameClass(item.id)}
-              disabled={busy || !wantsTarget}
-              title={wantsTarget ? 'Use this class for the importance map' : ''}
-              onclick={() => pickClass(item.id)}
+              class:on={focusColor === item.color}
+              aria-pressed={focusColor === item.color}
+              disabled={busy}
+              title={wantsTarget ? 'Show this class and use it for the importance map' : 'Show only this class'}
+              onclick={() => pickClass(item.id, item.color)}
             >
               <i class="swatch" style:--swatch={item.color}></i>
               <span class="binomial">{item.name}</span>
+              {#if item.tp != null}
+                <span class="split" title="{item.tp.toLocaleString()} correct, {item.fp.toLocaleString()} extra, {item.fn.toLocaleString()} missed">
+                  <i style:width="{share(item.tp, item)}%" style:background={item.color}></i>
+                  <i class="fp" style:width="{share(item.fp, item)}%"></i>
+                  <i class="fn" style:width="{share(item.fn, item)}%"></i>
+                </span>
+              {/if}
               <span class="num">{item.px.toLocaleString()} px</span>
             </button>
           </li>
         {/each}
       </ul>
+      {#if shown.counts.some((item) => item.tp != null)}
+        <p class="hint">Bar: correct, extra, missed. Click a class to fade the others.</p>
+      {/if}
     {:else if shown}
       <p class="hint">No species pixels in this prediction.</p>
     {:else if !checkpoints.length && !listError}
@@ -580,15 +965,29 @@
     white-space: nowrap;
   }
 
-  .run {
-    border: 0;
-    border-radius: 2px;
-    background: var(--canopy);
-    color: var(--sheet);
-    padding: 7px 14px;
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
   }
 
-  .run:disabled { opacity: 0.55; }
+  .actions button, .run {
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--ink);
+    padding: 6px 10px;
+    font-size: 12px;
+  }
+
+  .run {
+    border-color: var(--canopy);
+    background: var(--canopy);
+    color: var(--sheet);
+  }
+
+  .actions button:disabled, .run:disabled { opacity: 0.55; }
 
   .hist-head h3 {
     margin: 14px 0 8px;
@@ -620,18 +1019,17 @@
     background: color-mix(in srgb, var(--canopy) 12%, white);
   }
 
-  .hits button:disabled {
-    opacity: 1;
-    cursor: default;
-  }
-
-  .styles {
+  .views, .styles {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
-    margin: 0 0 8px;
+    margin: 8px 0;
   }
 
-  .styles button {
+  .views button, .styles button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     border: 1px solid var(--line);
     background: transparent;
     border-radius: 2px;
@@ -640,20 +1038,97 @@
     color: var(--ink);
   }
 
-  .styles button.on {
+  .views button.on, .styles button.on {
     background: color-mix(in srgb, var(--canopy) 12%, white);
     border-color: var(--canopy);
   }
 
-  .styles button:disabled {
+  .views.ondark button {
+    color: var(--sheet);
+    border-color: rgba(244, 248, 249, 0.35);
+  }
+
+  .views.ondark button.on {
+    background: rgba(244, 248, 249, 0.16);
+    border-color: var(--sheet);
+  }
+
+  .views button:disabled, .styles button:disabled {
     opacity: 0.45;
     cursor: default;
   }
+
+  .views button.wait {
+    opacity: 1;
+  }
+
+  .split {
+    display: flex;
+    width: 72px;
+    height: 7px;
+    overflow: hidden;
+    background: color-mix(in srgb, var(--line) 70%, white);
+    flex: none;
+  }
+
+  .split i { display: block; height: 100%; }
+  .split .fp { background: #f4f8f9; box-shadow: inset 0 0 0 1px #b42318; }
+  .split .fn { background: repeating-linear-gradient(-45deg, #8a5a00, #8a5a00 1px, transparent 1px, transparent 3px); }
 
   .num {
     margin-left: auto;
     color: var(--mist);
     font-variant-numeric: tabular-nums;
+  }
+
+  .readout {
+    min-width: 2.6em;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+
+  .key {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-size: 12px;
+    color: var(--ink);
+  }
+
+  .key li {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .key.ondark { color: var(--sheet); }
+
+  .mark {
+    width: 16px;
+    height: 12px;
+    flex: none;
+    box-sizing: border-box;
+  }
+
+  .mark.both { background: color-mix(in srgb, var(--canopy) 55%, white); }
+
+  .mark.extra {
+    background: var(--canopy);
+    box-shadow: inset 0 0 0 2px #fff, inset 0 0 0 3px rgba(18, 32, 36, 0.45);
+  }
+
+  .mark.miss {
+    border: 2px solid var(--canopy);
+    background: transparent;
+  }
+
+  .mark.wrong {
+    background: var(--canopy);
+    box-shadow: inset 0 0 0 2px #e2256a;
   }
 
   .agree, .hint { margin: 8px 0 0; color: var(--mist); font-size: 12px; }
@@ -673,10 +1148,105 @@
     position: absolute;
     left: 8px;
     bottom: 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     padding: 4px 8px;
     background: rgba(18, 32, 36, 0.72);
     color: var(--sheet);
     font-size: 12px;
+  }
+
+  .spin {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid color-mix(in srgb, var(--mist) 45%, white);
+    border-top-color: var(--canopy);
+    border-radius: 50%;
+    flex: none;
+    box-sizing: border-box;
+    animation: spin 0.75s linear infinite;
+  }
+
+  .predicting .spin,
+  .models button.on .spin,
+  .views.ondark .spin {
+    border-color: rgba(244, 248, 249, 0.35);
+    border-top-color: var(--sheet);
+  }
+
+  .hint.loading {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .run {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .spin { animation: none; opacity: 0.85; }
+  }
+
+  .predicting.quiet { bottom: 32px; }
+
+  .saved {
+    z-index: 3;
+    position: absolute;
+    left: 8px;
+    top: 8px;
+    padding: 3px 7px;
+    background: rgba(18, 32, 36, 0.72);
+    color: var(--sheet);
+    font-size: 11px;
+    pointer-events: none;
+  }
+
+  .badge {
+    position: absolute;
+    z-index: 3;
+    bottom: 8px;
+    padding: 2px 6px;
+    background: rgba(18, 32, 36, 0.72);
+    color: var(--sheet);
+    font-size: 11px;
+    pointer-events: none;
+  }
+
+  .badge.left { left: 8px; }
+  .badge.right { right: 8px; }
+
+  .seam {
+    position: absolute;
+    z-index: 4;
+    top: 0;
+    bottom: 0;
+    width: 14px;
+    margin-left: -7px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: ew-resize;
+    pointer-events: auto;
+  }
+
+  .seam::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 6px;
+    width: 2px;
+    background: #f4f8f9;
+    box-shadow: 0 0 0 1px rgba(18, 32, 36, 0.65);
   }
 
   .pred { z-index: 1; }

@@ -100,6 +100,32 @@ def stop():
         _stop_proc(proc)
 
 
+def release():
+    """Unload the checkpoint. Does nothing when the worker is not running."""
+    global _proc
+    with _lock:
+        proc = _proc
+        if proc is None or proc.poll() is not None:
+            return {"ok": True, "released": False}
+        try:
+            proc.stdin.write((json.dumps({"cmd": "release"}) + "\n").encode())
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            _proc = None
+            _stop_proc(proc)
+            raise PredictError("predict worker exited") from exc
+        try:
+            payload = _read_json(proc, 30)
+        except PredictError:
+            _proc = None
+            _stop_proc(proc)
+            raise
+    if not payload.get("ok"):
+        raise PredictError(payload.get("error") or "could not free the GPU")
+    payload["released"] = True
+    return payload
+
+
 def _readline(proc, timeout):
     box = []
 
