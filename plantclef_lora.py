@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 import torch
+import yaml
 from rasterio.windows import Window
 
 from plantclef_probe import PC_DIR, PC_MODEL, SPECIES, confusion, split_tiles, window_label
@@ -113,12 +114,12 @@ def to_input(img, res, mean, std, augment):
 @torch.no_grad()
 def predict(model, loader, res, mean, std):
     model.eval()
-    preds, labels = [], []
+    logits, labels = [], []
     for img, y in loader:
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            preds.append(model(to_input(img, res, mean, std, False)).argmax(1).cpu())
+            logits.append(model(to_input(img, res, mean, std, False)).float().cpu())
         labels.append(y)
-    return torch.cat(labels).numpy(), torch.cat(preds).numpy()
+    return torch.cat(labels).numpy(), torch.cat(logits).numpy()
 
 
 def main():
@@ -160,6 +161,8 @@ def main():
     for split, t in tiles.items():
         index = window_index(t, args.size, args.pos_thr, args.workers)
         counts[split] = np.bincount(index["label"], minlength=N_CLS)
+        if split == "train":
+            train_index = index
         print(f"{split}: {len(t)} tiles, {len(index)} windows, per class {counts[split].tolist()}", flush=True)
         loaders[split] = torch.utils.data.DataLoader(Windows(t, index, args.size), batch_size=args.batch,
                                                      shuffle=split == "train", num_workers=args.workers,
@@ -217,8 +220,8 @@ def main():
             if (step + 1) % 200 == 0:
                 print(f"  epoch {epoch} step {step + 1}/{len(loaders['train'])} loss {np.mean(losses[-200:]):.4f}",
                       flush=True)
-        y_val, p_val = predict(model, loaders["val"], res, mean, std)
-        f1_val = metrics_from_confusion(confusion(y_val, p_val))["F1-avg-wo0"]
+        y_val, l_val = predict(model, loaders["val"], res, mean, std)
+        f1_val = metrics_from_confusion(confusion(y_val, l_val.argmax(1)))["F1-avg-wo0"]
         log.append(dict(epoch=epoch, train_loss=np.mean(losses), val_f1_wo0=f1_val, minutes=(time.time() - t0) / 60))
         print(log[-1], flush=True)
         pd.DataFrame(log).to_csv(os.path.join(args.out_dir, "log.csv"), index=False)
@@ -229,17 +232,32 @@ def main():
 
     # %% test with the best epoch
     model.load_state_dict(torch.load(os.path.join(args.out_dir, "best.pt"), weights_only=True), strict=False)
-    y_te, p_te = predict(model, loaders["test"], res, mean, std)
-    m = metrics_from_confusion(confusion(y_te, p_te))
-    table = pd.DataFrame({"LoRA PlantCLEF": {**{names[c]: m["F1"][c] for c in range(1, N_CLS)},
-                                             "F1-avg-wo0": m["F1-avg-wo0"], "P-avg-wo0": m["Precision-avg-wo0"],
-                                             "R-avg-wo0": m["Recall-avg-wo0"]}}).T
+    y_te, l_te = predict(model, loaders["test"], res, mean, std)
+    # # the class-balanced loss assumes equal priors: shift the logits by the log class prior of all
+    # # windows of the training sites, background-only tiles weighted back to their full count
+    # # (as the '+ prior' rows of plantclef_probe.py; no test labels used)
+    with open(args.split_yaml) as f:
+        train_dirs = tuple(p.rstrip("/") + "/" for p in yaml.safe_load(f)["image_dir"]["train"])
+    stats = pd.read_csv(args.stats_csv)
+    n_bg_all = (stats["img_path"].str.startswith(train_dirs) & (stats["only_background"] == 1)).sum()
+    w_bg = n_bg_all / max(1, tiles["train"]["only_background"].sum())
+    bg_tile = tiles["train"]["only_background"].to_numpy()[train_index["tile"].to_numpy()] == 1
+    prior = np.bincount(train_index["label"], weights=np.where(bg_tile, w_bg, 1.0), minlength=N_CLS)
+    prior /= prior.sum()
+    np.savez(os.path.join(args.out_dir, "test_logits.npz"), label=y_te, logits=l_te, prior=prior)
+    rows = {"LoRA PlantCLEF": metrics_from_confusion(confusion(y_te, l_te.argmax(1))),
+            "LoRA PlantCLEF + prior": metrics_from_confusion(confusion(y_te, (l_te + np.log(prior + 1e-12)).argmax(1)))}
+    table = pd.DataFrame({k: {**{names[c]: m["F1"][c] for c in range(1, N_CLS)}, "F1-avg-wo0": m["F1-avg-wo0"],
+                              "P-avg-wo0": m["Precision-avg-wo0"], "R-avg-wo0": m["Recall-avg-wo0"]}
+                          for k, m in rows.items()}).T
     best_epoch = int(pd.DataFrame(log)["val_f1_wo0"].idxmax())
     md = [f"# LoRA on PlantCLEF, cv3 held-out sites, {args.size} px windows\n",
           f"LoRA r={args.rank}, alpha={args.alpha} on qkv; lr {args.lr} (LoRA) / {args.lr_head} (head); "
           f"{args.epochs} epochs, best epoch {best_epoch} (val F1-avg-wo0 {best:.3f}). Same windows, labels and "
           f"split as plantclef_probe.py; compare with its 'linear PlantCLEF' row at {args.size} px.\n",
-          "Test windows: " + ", ".join(f"{names[c]} {counts['test'][c]}" for c in range(N_CLS)) + ".\n",
+          "Test windows: " + ", ".join(f"{names[c]} {counts['test'][c]}" for c in range(N_CLS))
+          + f". Real background prior of the training sites {prior[0]:.1%}; compare '+ prior' with the probe's "
+          f"'linear PlantCLEF + prior' row.\n",
           table.to_markdown(floatfmt=".3f")]
     with open(os.path.join(args.out_dir, "summary.md"), "w") as f:
         f.write("\n".join(md) + "\n")
