@@ -6,6 +6,7 @@
   import Map from './Map.svelte';
   import Detail from './Detail.svelte';
   import Runs from './Runs.svelte';
+  import Model from './Model.svelte';
 
   let facets = $state(null);
   let stats = $state(null);
@@ -14,6 +15,7 @@
   let openId = $state(null);
   let infoOpen = $state(false);
   let view = $state('tiles');
+  let modelTileId = $state(null);
   let gpu = $state(null);
   let watchGpu = $state(storedWatchGpu());
 
@@ -54,6 +56,12 @@
 
   function resetFilters() {
     filters = defaultFilters();
+  }
+
+  function openModel(id) {
+    if (id) modelTileId = id;
+    openId = null;
+    view = 'model';
   }
 
   function setNumber(params, key, value) {
@@ -186,18 +194,20 @@
   });
 </script>
 
-<div class="app" class:map-mode={view === 'map'} class:runs-mode={view === 'runs'}>
+<div class="app" class:map-mode={view === 'map'} class:runs-mode={view === 'runs'} class:model-mode={view === 'model'}>
   <header>
     <div class="title-wrap">
       <div class="title-row">
         <h1>
           {#if view === 'runs'}
             Runs
+          {:else if view === 'model'}
+            Model
           {:else}
             {filters.fold}<span class="role-name">{ROLE[filters.role] ?? filters.role}</span>
           {/if}
         </h1>
-        {#if view !== 'runs'}
+        {#if view !== 'runs' && view !== 'model'}
           <button
             type="button"
             class="info"
@@ -208,7 +218,7 @@
           >i</button>
         {/if}
       </div>
-      {#if infoOpen && view !== 'runs'}
+      {#if infoOpen && view !== 'runs' && view !== 'model'}
         <div class="note" id="fold-note" role="dialog" aria-label="How this fold is split">
           <p>
             The default baseline is a U-Net with a MiT-b2 encoder. It trains on the {filters.fold} split below.
@@ -252,6 +262,14 @@
         </svg>
         Map
       </button>
+      <button type="button" role="tab" aria-selected={view === 'model'} class:on={view === 'model'} onclick={() => openModel(openId)}>
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M8 1.6 14.2 4.8 8 8 1.8 4.8Z" />
+          <path d="M1.8 7.2 8 10.4 14.2 7.2" />
+          <path d="M1.8 9.8 8 13 14.2 9.8" />
+        </svg>
+        Model
+      </button>
       <button type="button" role="tab" aria-selected={view === 'runs'} class:on={view === 'runs'} onclick={() => (view = 'runs')}>
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M2 12.5 5.2 8.4l2.4 2.2 3-4.2L14 11" />
@@ -267,8 +285,10 @@
     <Filters {facets} bind:filters bind:showLabels changed={filtersChanged} onreset={resetFilters} />
   {/if}
 
-  <div class="workspace" class:map-mode={view === 'map'} class:runs-mode={view === 'runs'}>
-    {#if view === 'runs'}
+  <div class="workspace" class:map-mode={view === 'map'} class:runs-mode={view === 'runs'} class:model-mode={view === 'model'}>
+    {#if view === 'model'}
+      <Model {facets} initialTileId={modelTileId} fold={filters.fold} />
+    {:else if view === 'runs'}
       <Runs {watchGpu} {gpu} />
     {:else if view === 'map'}
       <Map {facets} bind:filters bind:showLabels onopen={(id) => (openId = id)} />
@@ -286,5 +306,5 @@
 </div>
 
 {#if openId}
-  <Detail tileId={openId} fold={filters.fold} onclose={() => (openId = null)} />
+  <Detail tileId={openId} fold={filters.fold} onclose={() => (openId = null)} onopenmodel={openModel} />
 {/if}

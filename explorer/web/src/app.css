@@ -42,7 +42,8 @@ button { cursor: pointer; }
 }
 
 .app.map-mode,
-.app.runs-mode {
+.app.runs-mode,
+.app.model-mode {
   grid-template-rows: auto minmax(0, 1fr);
 }
 
@@ -357,7 +358,8 @@ label.field span { display: flex; gap: 4px; }
 }
 
 .workspace.map-mode,
-.workspace.runs-mode {
+.workspace.runs-mode,
+.workspace.model-mode {
   grid-template-columns: minmax(0, 1fr);
 }
 

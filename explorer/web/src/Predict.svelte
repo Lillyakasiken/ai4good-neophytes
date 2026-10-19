@@ -3,7 +3,7 @@
   import Zoom from './Zoom.svelte';
   import { paintImportance, paintIsolate } from './isolate.js';
 
-  let { tileId, thumb, mask, focusColor = $bindable('') } = $props();
+  let { tileId, thumb, mask, focusColor = $bindable(''), onopenmodel = null } = $props();
 
   let checkpoints = $state([]);
   let checkpointsLoading = $state(true);
@@ -754,6 +754,11 @@
   </div>
 
   <div class="controls">
+    {#if onopenmodel}
+      <button type="button" class="model-link" onclick={() => onopenmodel(tileId)}>
+        See how this model reads the photo
+      </button>
+    {/if}
     <div class="finder">
       <label class="field grow">
         Checkpoint
@@ -895,6 +900,17 @@
   }
 
   .preview, .controls { min-width: 0; }
+
+  .model-link {
+    margin: 0 0 10px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--canopy);
+    font-size: 13px;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
 
   .field {
     display: flex;

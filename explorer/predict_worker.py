@@ -614,7 +614,243 @@ def _importance(model, batch_x, aux, fusion, explain, target_class, alpha):
     return None, probs, False
 
 
-def _predict(req):
+TRACE_EDGE = 512
+TRACE_GRID = 128
+# Outside the photo, and not a class id. The pixel probe uses this to say "empty".
+TRACE_EMPTY = 253
+
+
+def _fit_hw(height, width, edge):
+    if max(height, width) <= edge:
+        return height, width
+    scale = edge / float(max(height, width))
+    return max(1, int(round(height * scale))), max(1, int(round(width * scale)))
+
+
+def _resize_hw(array, height, width, interpolation):
+    import cv2
+
+    if array.shape[0] == height and array.shape[1] == width:
+        return array
+    return cv2.resize(array, (width, height), interpolation=interpolation)
+
+
+def _is_spatial(feat):
+    shape = getattr(feat, "shape", None)
+    if shape is None or getattr(feat, "ndim", 0) != 4:
+        return False
+    if int(shape[1]) <= 0:
+        return False
+    return min(int(shape[-2]), int(shape[-1])) > 0
+
+
+def _preview_numpy(feat, edge):
+    """(C, h, w) numpy copy, plus the feature map's real height, width, and channels."""
+    import torch.nn.functional as F
+
+    native_c = int(feat.shape[1])
+    native_h = int(feat.shape[-2])
+    native_w = int(feat.shape[-1])
+    work = feat.detach().float()
+    if work.ndim == 4:
+        work = work[:1]
+    if max(native_h, native_w) > edge:
+        scale = edge / float(max(native_h, native_w))
+        nh = max(1, int(round(native_h * scale)))
+        nw = max(1, int(round(native_w * scale)))
+        work = F.interpolate(work, size=(nh, nw), mode="bilinear", align_corners=False)
+    return np.ascontiguousarray(work[0].cpu().numpy()), native_h, native_w, native_c
+
+
+def _valid_for(alpha, height, width):
+    import cv2
+
+    if alpha.shape[0] == height and alpha.shape[1] == width:
+        return alpha
+    return cv2.resize(alpha, (width, height), interpolation=cv2.INTER_NEAREST)
+
+
+def _pca_rgb(feat, valid):
+    """Three-color picture of a feature map. Similar pixels get similar colors."""
+    channels, height, width = feat.shape
+    flat = np.nan_to_num(feat.reshape(channels, -1).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    keep = min(3, channels)
+    try:
+        count = flat.shape[1]
+        sample = flat
+        if count > 6000:
+            pick = np.random.default_rng(0).choice(count, 6000, replace=False)
+            sample = flat[:, pick]
+        centered = sample - sample.mean(axis=1, keepdims=True)
+        cov = centered @ centered.T
+        _evals, evecs = np.linalg.eigh(cov)
+        basis = evecs[:, np.argsort(_evals)[::-1][:keep]]
+        projected = basis.T @ (flat - flat.mean(axis=1, keepdims=True))
+    except np.linalg.LinAlgError:
+        projected = flat[:keep]
+    if keep < 3:
+        projected = np.pad(projected, ((0, 3 - keep), (0, 0)))
+    rgb = np.zeros((height, width, 3), np.uint8)
+    for index in range(3):
+        plane = projected[index].reshape(height, width)
+        sample = plane[valid > 0] if valid is not None and np.any(valid > 0) else plane.reshape(-1)
+        low = float(np.percentile(sample, 2)) if sample.size else 0.0
+        high = float(np.percentile(sample, 98)) if sample.size else 1.0
+        if high <= low:
+            high = low + 1e-6
+        rgb[..., index] = np.clip((plane - low) / (high - low) * 255.0, 0, 255).astype(np.uint8)
+    return rgb
+
+
+def _pick_channels(feat, count=3):
+    """A few channels that actually vary across the tile, spaced apart."""
+    channels = feat.shape[0]
+    if channels <= count:
+        return list(range(channels))
+    variance = np.nan_to_num(feat.reshape(channels, -1).var(axis=1), nan=0.0)
+    order = np.argsort(variance)[::-1]
+    gap = max(1, channels // 20)
+    chosen = []
+    for index in order:
+        index = int(index)
+        if all(abs(index - other) > gap for other in chosen):
+            chosen.append(index)
+        if len(chosen) == count:
+            break
+    if len(chosen) < count:
+        for index in order:
+            index = int(index)
+            if index not in chosen:
+                chosen.append(index)
+            if len(chosen) == count:
+                break
+    return chosen
+
+
+def _rgb_png(rgb, valid):
+    rgba = np.zeros((rgb.shape[0], rgb.shape[1], 4), np.uint8)
+    rgba[..., :3] = rgb[..., :3]
+    if valid is None:
+        rgba[..., 3] = 255
+    else:
+        rgba[..., 3] = np.where(valid > 0, 255, 0).astype(np.uint8)
+    return _png_b64(np.ascontiguousarray(rgba))
+
+
+def _gray_png(plane, valid):
+    heat = _unit_interval(plane, valid, stretch=True)
+    u8 = np.clip(np.round(heat * 255.0), 0, 255).astype(np.uint8)
+    rgba = np.zeros((*u8.shape, 4), np.uint8)
+    rgba[..., 0] = rgba[..., 1] = rgba[..., 2] = u8
+    rgba[..., 3] = np.where(valid > 0, 255, 0).astype(np.uint8)
+    return _png_b64(rgba)
+
+
+def _tint_png(prob, rgb, valid):
+    prob = np.clip(np.nan_to_num(prob.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0)
+    if prob.shape != valid.shape:
+        import cv2
+        prob = cv2.resize(prob, (valid.shape[1], valid.shape[0]), interpolation=cv2.INTER_LINEAR)
+    strength = np.clip(np.round(prob * 255.0), 0, 255).astype(np.uint8)
+    strength[valid == 0] = 0
+    rgba = np.zeros((*strength.shape, 4), np.uint8)
+    rgba[..., 0], rgba[..., 1], rgba[..., 2] = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+    rgba[..., 3] = strength
+    return _png_b64(rgba)
+
+
+def _terrain_png(plane, valid):
+    heat = _unit_interval(np.maximum(plane, 0), valid, stretch=True)
+    stops = np.array([
+        [27, 63, 54],
+        [90, 140, 72],
+        [196, 177, 90],
+        [244, 248, 249],
+    ], np.float32)
+    position = heat * (len(stops) - 1)
+    left = np.floor(position).astype(np.int32).clip(0, len(stops) - 2)
+    mix = (position - left)[..., None]
+    rgb = stops[left] * (1.0 - mix) + stops[left + 1] * mix
+    rgba = np.zeros((*heat.shape, 4), np.uint8)
+    rgba[..., :3] = np.clip(np.round(rgb), 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.where(valid > 0, 255, 0).astype(np.uint8)
+    return _png_b64(rgba)
+
+
+def _ink(rgb):
+    red, green, blue = (int(channel) for channel in rgb)
+    if red + green + blue < 48:
+        return (18, 32, 36)
+    return (red, green, blue)
+
+
+def _color_overlay(ids, alpha, lut):
+    rgba = lut[ids].copy()
+    rgba[alpha == 0, 3] = 0
+    return _png_b64(np.ascontiguousarray(rgba))
+
+
+def _feature_pictures(feat, alpha):
+    preview, native_h, native_w, native_c = _preview_numpy(feat, TRACE_EDGE)
+    valid = _valid_for(alpha, preview.shape[1], preview.shape[2])
+    energy = np.abs(preview).mean(axis=0)
+    samples = []
+    for index in _pick_channels(preview, 3):
+        samples.append({
+            "index": int(index),
+            "image": _gray_png(preview[index], valid),
+        })
+    return {
+        "preview": preview,
+        "valid": valid,
+        "height": native_h,
+        "width": native_w,
+        "channels": native_c,
+        "energy": _importance_png(_unit_interval(energy, valid, stretch=True), valid),
+        "pca": _rgb_png(_pca_rgb(preview, valid), valid),
+        "samples": samples,
+    }
+
+
+def _class_catalog(num_classes):
+    _lut_colors, classes, display_order = _lut()
+    by_id = {spec["id"]: spec for spec in classes}
+    rows = []
+    for class_id in range(num_classes):
+        spec = by_id.get(class_id)
+        if spec is None:
+            rows.append({"id": class_id, "name": f"Class {class_id}", "color": "#5d6e74", "rgb": (93, 110, 116)})
+        else:
+            rows.append({
+                "id": class_id,
+                "name": spec["name"],
+                "color": spec["color"],
+                "rgb": tuple(int(channel) for channel in spec["rgb"]),
+            })
+    return rows, display_order
+
+
+def _head_facts(model, decoded, logits):
+    import torch.nn as nn
+
+    kernel = None
+    for module in model.model.segmentation_head.modules():
+        if isinstance(module, nn.Conv2d):
+            kernel = int(module.kernel_size[0])
+            break
+    decoded_h = int(decoded.shape[-2])
+    logits_h = int(logits.shape[-2])
+    upsample = max(1, int(round(logits_h / float(decoded_h)))) if decoded_h else 1
+    return {
+        "kernel": kernel,
+        "upsample": upsample,
+        "in_channels": int(decoded.shape[1]),
+        "out_classes": int(logits.shape[1]),
+    }
+
+
+def _inputs(req):
+    """Tile tensors for one checkpoint, prepared the same way as test.py."""
     import cv2
     import torch
 
@@ -629,7 +865,8 @@ def _predict(req):
     exp_dir = ckpt.parent.parent
     mean, std, ndsm_mean, ndsm_std, ds2 = _norms(exp_dir)
     rgb, alpha = _read_rgb(image_path)
-    height, width = rgb.shape[:2]
+    native_h, native_w = rgb.shape[:2]
+    height, width = native_h, native_w
     label = None
     if mask_path is not None and mask_path.is_file():
         try:
@@ -649,8 +886,6 @@ def _predict(req):
         alpha = cv2.resize(alpha, (width, height), interpolation=cv2.INTER_NEAREST)
         if label is not None:
             label = cv2.resize(label, (width, height), interpolation=cv2.INTER_NEAREST)
-    model_h, model_w = height, width
-    model_rgb = rgb
 
     torch.set_float32_matmul_precision("medium")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -658,14 +893,14 @@ def _predict(req):
     channels = _as_dict(model.in_channels or {"image": 3})
     fusion = str(model.fusion_mode or "concat")
 
-    image = model_rgb.astype(np.float32) / 255.0
+    image = rgb.astype(np.float32) / 255.0
     image = (image - mean) / std
     image_t = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1))).unsqueeze(0)
 
     ndsm = None
     needs_ndsm = any(key == "ndsm" for key in channels)
     if needs_ndsm:
-        ndsm = _read_ndsm(image_path, model_h, model_w)
+        ndsm = _read_ndsm(image_path, height, width)
         if ndsm is None:
             raise ValueError("This checkpoint expects an nDSM, and this tile has no DSM/DTM.")
         ndsm_t = torch.from_numpy(((ndsm - ndsm_mean) / ndsm_std).astype(np.float32)).unsqueeze(0).unsqueeze(0)
@@ -693,10 +928,49 @@ def _predict(req):
         batch_x = torch.cat(parts, dim=1)
         aux = None
 
-    explain, target_class = _explain_request(req, int(model.num_classes))
     batch_x = batch_x.to(device)
     if aux is not None:
         aux = aux.to(device)
+    return {
+        "model": model,
+        "batch_x": batch_x,
+        "aux": aux,
+        "fusion": fusion,
+        "channels": channels,
+        "rgb": rgb,
+        "alpha": alpha,
+        "label": label,
+        "norm_image": image,
+        "ndsm": ndsm,
+        "height": height,
+        "width": width,
+        "native_height": native_h,
+        "native_width": native_w,
+        "ds2": ds2,
+        "mean": mean,
+        "std": std,
+        "ndsm_mean": ndsm_mean,
+        "ndsm_std": ndsm_std,
+    }
+
+
+def _predict(req):
+    import cv2
+    import torch
+
+    prepared = _inputs(req)
+    model = prepared["model"]
+    batch_x = prepared["batch_x"]
+    aux = prepared["aux"]
+    fusion = prepared["fusion"]
+    rgb = prepared["rgb"]
+    alpha = prepared["alpha"]
+    label = prepared["label"]
+    height = prepared["height"]
+    width = prepared["width"]
+    ds2 = prepared["ds2"]
+
+    explain, target_class = _explain_request(req, int(model.num_classes))
     importance = None
     reduced = False
     try:
@@ -781,6 +1055,245 @@ def _predict(req):
     }
 
 
+def _trace(req):
+    """Snapshots of one forward pass, as pictures rather than tensors.
+
+    The encoder's first map is the photo itself, and MiT leaves an empty map
+    in the list the decoder still expects. Those are kept for the forward and
+    left out of the pictures.
+    """
+    import cv2
+    import torch
+    import torch.nn.functional as F
+
+    prepared = _inputs(req)
+    model = prepared["model"]
+    batch_x = prepared["batch_x"]
+    aux = prepared["aux"]
+    fusion = prepared["fusion"]
+    rgb = prepared["rgb"]
+    alpha = prepared["alpha"]
+    label = prepared["label"]
+    height = prepared["height"]
+    width = prepared["width"]
+    ds2 = prepared["ds2"]
+    mean = prepared["mean"]
+    std = prepared["std"]
+
+    try:
+        hparams = model.hparams
+        architecture = str(hparams["model"])
+        encoder_name = str(hparams["encoder_name"])
+        trained_crop = int(hparams["img_size"] or 0)
+    except Exception:
+        architecture, encoder_name, trained_crop = "", "", 0
+
+    scales = {}
+    if model.elevation_fusion is not None:
+        for key, value in model.elevation_fusion.get_fusion_scales().items():
+            scales[int(str(key).rsplit("stage", 1)[-1])] = round(float(value), 4)
+
+    try:
+        with torch.inference_mode():
+            raw = list(_encode_features(model, batch_x, aux, fusion))
+            decoded = model.model.decoder(raw)
+            head_in = decoded
+            if isinstance(decoded, (list, tuple)):
+                spatial = [feat for feat in decoded if _is_spatial(feat)]
+                if not spatial:
+                    raise ValueError("This checkpoint's decoder did not return a picture.")
+                head_in = spatial[-1]
+            logits = model.model.segmentation_head(head_in)
+            if not _is_spatial(logits):
+                raise ValueError("This checkpoint did not return a class score for every pixel.")
+
+            encoder_stages = []
+            input_channels = int(batch_x.shape[1])
+            for index, feat in enumerate(raw):
+                if not _is_spatial(feat):
+                    continue
+                native_h, native_w = int(feat.shape[-2]), int(feat.shape[-1])
+                native_c = int(feat.shape[1])
+                if native_h == height and native_w == width and native_c <= input_channels:
+                    continue
+                pictures = _feature_pictures(feat, alpha)
+                stride = max(1, int(round(height / float(native_h)))) if native_h else 1
+                encoder_stages.append({
+                    "index": int(index),
+                    "height": pictures["height"],
+                    "width": pictures["width"],
+                    "channels": pictures["channels"],
+                    "stride": stride,
+                    "elev_scale": scales.get(index),
+                    "shape": [1, pictures["channels"], pictures["height"], pictures["width"]],
+                    "energy": pictures["energy"],
+                    "pca": pictures["pca"],
+                    "samples": pictures["samples"],
+                })
+
+            decoder_view = _feature_pictures(head_in, alpha)
+            head = _head_facts(model, head_in, logits)
+            pred = logits.argmax(dim=1)[0].detach().to(torch.uint8).cpu().numpy()
+            logit_min = float(logits.detach().min())
+            logit_max = float(logits.detach().max())
+            probs = torch.softmax(logits.float(), dim=1)
+            del raw, decoded, head_in, logits
+
+            view_h, view_w = _fit_hw(height, width, TRACE_EDGE)
+            preview = F.interpolate(probs, size=(view_h, view_w), mode="bilinear", align_corners=False)
+            entropy = _entropy_map(preview)
+            preview_np = preview[0].detach().float().cpu().numpy()
+            grid_t = F.interpolate(probs, size=(TRACE_GRID, TRACE_GRID), mode="bilinear", align_corners=False)
+            grid = (grid_t[0].clamp(0, 1) * 255.0).round().to(torch.uint8).cpu().numpy()
+            del probs, preview, grid_t
+    except torch.cuda.OutOfMemoryError as exc:
+        torch.cuda.empty_cache()
+        raise ValueError("The GPU ran out of memory.") from exc
+
+    if pred.shape != (height, width):
+        pred = cv2.resize(pred, (width, height), interpolation=cv2.INTER_NEAREST)
+    pred[alpha == 0] = 0
+
+    view_h, view_w = _fit_hw(height, width, TRACE_EDGE)
+    valid_view = _valid_for(alpha, view_h, view_w)
+    small_alpha = cv2.resize(alpha, (TRACE_GRID, TRACE_GRID), interpolation=cv2.INTER_NEAREST)
+    grid = np.ascontiguousarray(grid)
+    grid[:, small_alpha == 0] = 0
+
+    photo = _resize_hw(rgb, view_h, view_w, cv2.INTER_AREA)
+    norm_vis = np.clip((prepared["norm_image"] + 2.0) / 4.0 * 255.0, 0, 255).astype(np.uint8)
+    norm_vis = _resize_hw(norm_vis, view_h, view_w, cv2.INTER_AREA)
+
+    ndsm_image = None
+    ndsm_stats = None
+    if prepared["ndsm"] is not None:
+        ndsm_view = _resize_hw(prepared["ndsm"], view_h, view_w, cv2.INTER_AREA)
+        ndsm_image = _terrain_png(ndsm_view, valid_view)
+        sample = prepared["ndsm"][alpha > 0]
+        if sample.size:
+            ndsm_stats = {
+                "min": round(float(np.min(sample)), 2),
+                "max": round(float(np.max(sample)), 2),
+                "mean": round(float(np.mean(sample)), 2),
+            }
+
+    catalog, display_order = _class_catalog(int(model.num_classes))
+    probabilities = []
+    for row, plane in zip(catalog, preview_np):
+        probabilities.append({
+            "id": row["id"],
+            "name": row["name"],
+            "color": row["color"],
+            "image": _tint_png(plane, _ink(row["rgb"]), valid_view),
+        })
+
+    lut, _classes, _order = _lut()
+    pred_view = _resize_hw(pred, view_h, view_w, cv2.INTER_NEAREST)
+    label_image = None
+    label_grid = None
+    agreement = None
+    agreement_species = None
+    if label is not None:
+        shown = label.copy()
+        shown[alpha == 0] = 0
+        shown_view = _resize_hw(shown, view_h, view_w, cv2.INTER_NEAREST)
+        label_image = _color_overlay(shown_view, valid_view, lut)
+        label_small = cv2.resize(label, (TRACE_GRID, TRACE_GRID), interpolation=cv2.INTER_NEAREST)
+        label_small = label_small.astype(np.uint8, copy=True)
+        label_small[small_alpha == 0] = np.uint8(TRACE_EMPTY)
+        label_grid = {
+            "width": TRACE_GRID,
+            "height": TRACE_GRID,
+            "data": base64.b64encode(np.ascontiguousarray(label_small).tobytes()).decode("ascii"),
+        }
+        valid = (alpha > 0) & (label != 254) & (label != 255)
+        if int(valid.sum()) > 0:
+            agreement = float((pred[valid] == label[valid]).mean())
+        species = valid & (label > 0)
+        if int(species.sum()) > 0:
+            agreement_species = float((pred[species] == label[species]).mean())
+
+    by_id = {row["id"]: row for row in catalog}
+    counts = []
+    visible = alpha > 0
+    scored = None if label is None else (alpha > 0) & (label != 254) & (label != 255)
+    for class_id, row in by_id.items():
+        if class_id == 0:
+            continue
+        px = int(((pred == class_id) & visible).sum())
+        item = {
+            "id": class_id,
+            "name": row["name"],
+            "color": row["color"],
+            "px": px,
+        }
+        if scored is not None:
+            item["tp"] = int(((pred == class_id) & (label == class_id) & scored).sum())
+            item["fp"] = int(((pred == class_id) & (label != class_id) & scored).sum())
+            item["fn"] = int(((label == class_id) & (pred != class_id) & scored).sum())
+        if px <= 0 and not (item.get("tp") or item.get("fp") or item.get("fn")):
+            continue
+        counts.append(item)
+
+    entropy_u = _unit_interval(entropy, valid_view, stretch=False)
+    return {
+        "ok": True,
+        "width": width,
+        "height": height,
+        "native_width": prepared["native_width"],
+        "native_height": prepared["native_height"],
+        "ds2": ds2,
+        "fusion": fusion,
+        "architecture": architecture,
+        "encoder": encoder_name,
+        "trained_crop": trained_crop,
+        "num_classes": int(model.num_classes),
+        "in_channels": {str(key): int(value) for key, value in prepared["channels"].items()},
+        "input_shape": [int(value) for value in batch_x.shape],
+        "aux_shape": None if aux is None else [int(value) for value in aux.shape],
+        "norm": {
+            "rgb_mean": [round(float(value), 4) for value in mean],
+            "rgb_std": [round(float(value), 4) for value in std],
+            "ndsm_mean": round(float(prepared["ndsm_mean"]), 4),
+            "ndsm_std": round(float(prepared["ndsm_std"]), 4),
+        },
+        "image": _jpeg_b64(photo),
+        "normalized": _jpeg_b64(norm_vis),
+        "ndsm": ndsm_image,
+        "ndsm_stats": ndsm_stats,
+        "encoder_stages": encoder_stages,
+        "decoder": {
+            "height": decoder_view["height"],
+            "width": decoder_view["width"],
+            "channels": decoder_view["channels"],
+            "stride": max(1, int(round(height / float(decoder_view["height"])))) if decoder_view["height"] else 1,
+            "shape": [1, decoder_view["channels"], decoder_view["height"], decoder_view["width"]],
+            "energy": decoder_view["energy"],
+            "pca": decoder_view["pca"],
+            "samples": decoder_view["samples"],
+        },
+        "head": head,
+        "logit_min": None if math.isnan(logit_min) else round(logit_min, 3),
+        "logit_max": None if math.isnan(logit_max) else round(logit_max, 3),
+        "classes": [{"id": row["id"], "name": row["name"], "color": row["color"]} for row in catalog],
+        "display_order": [int(class_id) for class_id in display_order],
+        "probabilities": probabilities,
+        "entropy": _importance_png(entropy_u, valid_view),
+        "prob_grid": {
+            "width": TRACE_GRID,
+            "height": TRACE_GRID,
+            "classes": int(grid.shape[0]),
+            "data": base64.b64encode(grid.tobytes()).decode("ascii"),
+        },
+        "label_grid": label_grid,
+        "overlay": _color_overlay(pred_view, valid_view, lut),
+        "label": label_image,
+        "counts": counts,
+        "agreement": agreement,
+        "agreement_species": agreement_species,
+    }
+
+
 def main():
     for line in sys.stdin:
         text = line.strip()
@@ -795,6 +1308,8 @@ def main():
                 payload = _release()
             elif cmd == "predict":
                 payload = _predict(req)
+            elif cmd == "trace":
+                payload = _trace(req)
             else:
                 payload = {"ok": False, "error": "unknown command"}
         except Exception as exc:

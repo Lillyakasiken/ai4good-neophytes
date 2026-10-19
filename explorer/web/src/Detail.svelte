@@ -7,7 +7,7 @@
   import Zoom from './Zoom.svelte';
   import { paintIsolate } from './isolate.js';
 
-  let { tileId, fold, onclose } = $props();
+  let { tileId, fold, onclose, onopenmodel = null } = $props();
 
   let tile = $state(null);
   let activeId = $state(null);
@@ -311,7 +311,7 @@
     {:else if tab === 'segment'}
       <Segment tileId={tile.tile_id} mask={tile.mask} />
     {:else if tab === 'predict'}
-      <Predict tileId={tile.tile_id} thumb={tile.thumb} mask={tile.mask} bind:focusColor />
+      <Predict tileId={tile.tile_id} thumb={tile.thumb} mask={tile.mask} bind:focusColor {onopenmodel} />
     {:else}
       <div class="shot">
         <button type="button" class="stage" class:busy={switching} aria-label="Enlarge orthophoto" onclick={() => (zoomOpen = true)}>

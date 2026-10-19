@@ -587,12 +587,20 @@ class PredictIn(BaseModel):
     force: bool = False
 
 
+class TraceIn(BaseModel):
+    ckpt: str
+
+
 _wandb_cache = {"until": 0.0, "body": None}
 
 PRED_DIR = CACHE / "predictions"
 PRED_INDEX = PRED_DIR / "index.json"
 PRED_VERSION = 1
 PRED_CAP_BYTES = 2 * 1024 ** 3
+TRACE_DIR = CACHE / "traces"
+TRACE_INDEX = TRACE_DIR / "index.json"
+TRACE_VERSION = 1
+TRACE_CAP_BYTES = 1024 ** 3
 _pred_lock = threading.RLock()
 
 
@@ -715,6 +723,89 @@ def _matching_preds(index, tile_id, image, mask, ckpt):
         found.append((item.get("saved_at") or 0, key))
     found.sort()
     return found
+
+
+def _trace_key(image, mask, ckpt):
+    raw = "\n".join([
+        str(TRACE_VERSION),
+        _file_sig(image),
+        _file_sig(mask),
+        _file_sig(ckpt),
+    ])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _load_trace_index():
+    if not TRACE_INDEX.is_file():
+        return {}
+    try:
+        data = json.loads(TRACE_INDEX.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_trace_index(index):
+    TRACE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = TRACE_INDEX.with_suffix(".tmp")
+    tmp.write_text(json.dumps(index))
+    os.replace(tmp, TRACE_INDEX)
+
+
+def _drop_trace(index, key):
+    path = TRACE_DIR / f"{key}.json"
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    index.pop(key, None)
+
+
+def _prune_traces(index):
+    total = sum(int(item.get("bytes") or 0) for item in index.values())
+    if total <= TRACE_CAP_BYTES:
+        return
+    ordered = sorted(index.items(), key=lambda item: item[1].get("saved_at") or 0)
+    for key, item in ordered:
+        if total <= TRACE_CAP_BYTES:
+            break
+        _drop_trace(index, key)
+        total -= int(item.get("bytes") or 0)
+
+
+def _remember_trace(key, meta, payload):
+    TRACE_DIR.mkdir(parents=True, exist_ok=True)
+    saved_at = time.time()
+    path = TRACE_DIR / f"{key}.json"
+    tmp = TRACE_DIR / f".{key}.tmp"
+    tmp.write_text(json.dumps({"saved_at": saved_at, **meta, "payload": payload}))
+    os.replace(tmp, path)
+    with _pred_lock:
+        index = _load_trace_index()
+        index[key] = {**meta, "saved_at": saved_at, "bytes": path.stat().st_size}
+        _prune_traces(index)
+        _write_trace_index(index)
+    return saved_at
+
+
+def _read_trace(key):
+    path = TRACE_DIR / f"{key}.json"
+    try:
+        data = json.loads(path.read_text())
+        payload = data.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("bad cache")
+    except (OSError, json.JSONDecodeError, ValueError):
+        with _pred_lock:
+            index = _load_trace_index()
+            if key in index:
+                _drop_trace(index, key)
+                _write_trace_index(index)
+        return None
+    out = dict(payload)
+    out["cached"] = True
+    out["saved_at"] = data.get("saved_at")
+    return out
 
 
 def _resolve_predict(tile_id, ckpt_path):
@@ -855,6 +946,49 @@ def tile_predict(tile_id: str, body: PredictIn):
             "ckpt_sig": _file_sig(ckpt),
             "explain": body.explain,
             "target_class": body.target_class,
+        }, payload)
+        payload["cached"] = False
+        payload["saved_at"] = saved_at
+        return payload
+    finally:
+        gpu_lock.release()
+
+
+@app.post("/api/tiles/{tile_id}/trace")
+def tile_trace(tile_id: str, body: TraceIn):
+    """Pictures from one forward pass. A saved trace skips the GPU."""
+    image, mask, ckpt = _resolve_predict(tile_id, body.ckpt)
+    key = _trace_key(image, mask, ckpt)
+    hit = _read_trace(key)
+    if hit is not None:
+        return hit
+    if train_jobs.training_active():
+        raise HTTPException(status_code=409, detail="A training job is using the GPU.")
+    if not gpu_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="The GPU is busy.")
+    try:
+        if train_jobs.training_active():
+            raise HTTPException(status_code=409, detail="A training job is using the GPU.")
+        try:
+            payload = predict_client.request({
+                "cmd": "trace",
+                "ckpt": str(ckpt),
+                "image": str(image),
+                "mask": None if mask is None else str(mask),
+            }, timeout=300)
+        except TrainEnvError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except predict_client.PredictError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if not payload.get("ok"):
+            raise HTTPException(status_code=400, detail=payload.get("error") or "trace failed")
+        payload.pop("ok", None)
+        saved_at = _remember_trace(key, {
+            "tile_id": tile_id,
+            "ckpt": str(ckpt),
+            "image_sig": _file_sig(image),
+            "mask_sig": _file_sig(mask),
+            "ckpt_sig": _file_sig(ckpt),
         }, payload)
         payload["cached"] = False
         payload["saved_at"] = saved_at
