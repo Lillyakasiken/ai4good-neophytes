@@ -12,7 +12,7 @@ One figure per cluster, one column per species:
     row 1  source: the plant outlined in its own tile
     row 2  hard paste (red box = pasted plant)
     row 3  soft paste
-    row 4  label of the soft paste (black background, class colour, grey ignore ring)
+    row 4  label of the soft paste (black background, class colour, grey ignore)
 
 The first column shows the background window alone.
 
@@ -59,7 +59,7 @@ def main():
     parser.add_argument("--max-size-frac", type=float, default=0.6, help="largest plant side as fraction of the window")
     parser.add_argument("--min-bg-frac", type=float, default=0.8, help="share of the plant that must land on background")
     parser.add_argument("--sigma", type=float, default=2.0, help="soft paste: Gaussian blur of the mask edge [px]")
-    parser.add_argument("--ring", type=int, default=3, help="ignore ring around the pasted plant [px]")
+    parser.add_argument("--ring", type=int, default=0, help="ignore ring around the pasted plant [px], 0 = off")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -110,7 +110,7 @@ def main():
                                        fontsize=10)
                 soft_mask = out_mask
             axes[3, col].imshow(label_rgb(soft_mask, classes))
-            axes[3, col].set_title(f"label (ignore ring {args.ring} px)", fontsize=10)
+            axes[3, col].set_title("label" + (f" (ignore ring {args.ring} px)" if args.ring else ""), fontsize=10)
             rows.append({"cluster": c, "background_tile": w["img_path"], "bg_y0": by, "bg_x0": bx,
                          "background_flight": w["flight"], "class": name, "source_site": s_row["site_id"],
                          "source_tile": s_row["img_path"], "scale": round(scale, 3), "y": yx[0], "x": yx[1],

@@ -7,9 +7,9 @@ Methods, each a step towards a realistic composite (more follow):
     hard   binary plant mask
     soft   Gaussian-blurred mask edge (sigma in px)
 
-Label: the plant pixels get the class, an ignore ring of `ring` px around the plant
-gets IGNORE (labels at plant edges are inexact, and the soft edge mixes plant and
-background there), everything else keeps the background mask.
+Label: the plant pixels get the class, everything else keeps the background mask.
+Optionally (ring > 0, off by default) a ring of `ring` px around the plant gets
+IGNORE; kept only as an ablation, there is no evidence that it helps.
 """
 
 import numpy as np
@@ -19,7 +19,7 @@ IGNORE = -1
 METHODS = ("hard", "soft")
 
 
-def synthesize(background, bg_mask, patch, alpha, cls, y, x, method="soft", sigma=2.0, ring=3):
+def synthesize(background, bg_mask, patch, alpha, cls, y, x, method="soft", sigma=2.0, ring=0):
     """Paste `patch` (h, w, 3 uint8, already at the background GSD) with binary mask `alpha`
     (h, w) at top-left (y, x) of `background` (H, W, 3 uint8) / `bg_mask` (H, W int).
 
