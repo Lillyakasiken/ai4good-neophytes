@@ -96,7 +96,6 @@
     const value = Number(targetClass);
     return Number.isFinite(value) ? value : null;
   });
-  let classChoices = $derived(shown?.classes ?? []);
   let importanceFresh = $derived.by(() => {
     if (!shown?.importance || shown.explain !== explain || explain === 'none') return false;
     if (explain === 'entropy') return true;
@@ -400,10 +399,6 @@
   function choose(path) {
     touched = true;
     ckpt = path;
-  }
-
-  function sameClass(id) {
-    return targetClass !== '' && Number(targetClass) === Number(id);
   }
 
   function pickClass(id, color) {
@@ -828,15 +823,6 @@
       <select bind:value={explain} disabled={busy || !ckpt}>
         {#each EXPLAINS as [value, label]}
           <option {value}>{label}</option>
-        {/each}
-      </select>
-    </label>
-    <label class="field">
-      Class
-      <select bind:value={targetClass} disabled={busy || !ckpt || !wantsTarget}>
-        <option value="">All predicted species</option>
-        {#each classChoices as spec (spec.id)}
-          <option value={String(spec.id)}>{spec.name}</option>
         {/each}
       </select>
     </label>
