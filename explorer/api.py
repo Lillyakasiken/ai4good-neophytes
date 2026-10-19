@@ -13,6 +13,7 @@ import re
 import threading
 import time
 from datetime import date, datetime
+from pathlib import Path
 
 import duckdb
 import numpy as np
@@ -56,6 +57,9 @@ CLASSES, DISPLAY_ORDER, CV_FOLDS = load_names()
 SPECIES = species_columns(CLASSES, DISPLAY_ORDER)
 SPECIES_NAMES = [s["stats_name"] for s in SPECIES]
 SPECIES_BY_NAME = {s["stats_name"]: s for s in SPECIES}
+# DuckDB has no boolean XOR operator. <> on booleans is exclusive-or, and
+# nesting it is the parity of the list (odd count of selected species).
+SPECIES_OPS = ("or", "and", "xor", "nor", "nand")
 
 NODATA_BINS = (
     ("lt_1", "under 1%"),
@@ -164,10 +168,36 @@ def _m2_column(name):
     return f"{name}_m2"
 
 
+def _species_clause(species, species_op):
+    op = (species_op or "or").strip().lower()
+    if op not in SPECIES_OPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"species_op must be one of {', '.join(SPECIES_OPS)}",
+        )
+    parts = []
+    for name in species:
+        if name not in SPECIES_BY_NAME:
+            raise HTTPException(status_code=400, detail=f"unknown species {name}")
+        parts.append(f"({name}_px > 0)")
+    if not parts:
+        return None
+    if op == "xor":
+        inner = parts[0]
+        for part in parts[1:]:
+            inner = f"({inner} <> {part})"
+    else:
+        join = "AND" if op in ("and", "nand") else "OR"
+        inner = parts[0] if len(parts) == 1 else "(" + f" {join} ".join(parts) + ")"
+    if op in ("nor", "nand"):
+        return f"(NOT ({inner}))"
+    return inner if len(parts) == 1 else f"({inner})"
+
+
 def _where(
     fold, role, split, site, flight, year, month, species, labelled,
     nodata_min, nodata_max, min_m2, m2_species, include_role=True,
-    background_only=False, max_m2=None,
+    background_only=False, max_m2=None, species_op="or",
 ):
     if nodata_min is not None and nodata_max is not None and nodata_min > nodata_max:
         raise HTTPException(status_code=400, detail="empty margin min cannot be greater than max")
@@ -198,12 +228,7 @@ def _where(
         clauses.append("month = ?")
         params.append(month)
     if species:
-        parts = []
-        for name in species:
-            if name not in SPECIES_BY_NAME:
-                raise HTTPException(status_code=400, detail=f"unknown species {name}")
-            parts.append(f"{name}_px > 0")
-        clauses.append("(" + " OR ".join(parts) + ")")
+        clauses.append(_species_clause(species, species_op))
     if labelled:
         clauses.append("labelled")
     if background_only:
@@ -359,6 +384,7 @@ def tiles(
     year: int | None = None,
     month: int | None = None,
     species: list[str] = Query(default=[]),
+    species_op: str = "or",
     labelled: bool = False,
     background_only: bool = False,
     nodata_min: float | None = Query(default=None, ge=NODATA_MIN, le=NODATA_MAX),
@@ -377,7 +403,7 @@ def tiles(
     where, params = _where(
         fold, role, split, site, flight, year, month, species, labelled,
         nodata_min, nodata_max, min_m2, m2_species,
-        background_only=background_only, max_m2=max_m2,
+        background_only=background_only, max_m2=max_m2, species_op=species_op,
     )
     px_cols = ", ".join(f"{name}_px" for name in SPECIES_NAMES)
     source, source_params = "FROM read_parquet(?) t", [str(TILES_PARQUET)]
@@ -724,6 +750,27 @@ def clear_prediction_cache():
         return _pred_stats_unlocked(index)
 
 
+@app.get("/api/tiles/{tile_id}/predict/marks")
+def tile_predict_marks(tile_id: str):
+    """Checkpoints that still have a saved prediction for this tile."""
+    image, mask = _tile_paths(tile_id)
+    image_sig = _file_sig(image)
+    mask_sig = _file_sig(mask)
+    with _pred_lock:
+        index = _load_pred_index()
+    paths = set()
+    for item in index.values():
+        if item.get("tile_id") != tile_id:
+            continue
+        if item.get("image_sig") != image_sig or item.get("mask_sig") != mask_sig:
+            continue
+        ckpt = item.get("ckpt")
+        if not ckpt or item.get("ckpt_sig") != _file_sig(Path(ckpt)):
+            continue
+        paths.add(ckpt)
+    return {"checkpoints": sorted(paths)}
+
+
 @app.get("/api/tiles/{tile_id}/predict/saved")
 def tile_predict_saved(tile_id: str, ckpt: str = Query(min_length=1)):
     """Newest saved prediction for this tile and checkpoint, or 404."""
@@ -904,6 +951,7 @@ def stats(
     year: int | None = None,
     month: int | None = None,
     species: list[str] = Query(default=[]),
+    species_op: str = "or",
     labelled: bool = False,
     background_only: bool = False,
     nodata_min: float | None = Query(default=None, ge=NODATA_MIN, le=NODATA_MAX),
@@ -916,7 +964,7 @@ def stats(
     fold = _fold(fold)
     common = dict(
         fold=fold, split=split, site=site, flight=flight, year=year, month=month,
-        species=species, labelled=labelled, background_only=background_only,
+        species=species, species_op=species_op, labelled=labelled, background_only=background_only,
         nodata_min=nodata_min, nodata_max=nodata_max,
         min_m2=min_m2, max_m2=max_m2, m2_species=m2_species,
     )

@@ -279,6 +279,68 @@ label.field span { display: flex; gap: 4px; }
   background: color-mix(in srgb, var(--swatch) 28%, white);
 }
 
+.species-op {
+  position: relative;
+}
+
+.species-op > .op {
+  min-width: 58px;
+  justify-content: center;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.species-op > .op.set {
+  border-color: var(--canopy);
+  color: var(--canopy);
+}
+
+.species-op .op-menu {
+  position: absolute;
+  z-index: 8;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 248px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  box-shadow: 0 8px 24px rgba(18, 32, 36, 0.12);
+}
+
+.species-op .op-menu button {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  border-radius: 2px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  text-align: left;
+}
+
+.species-op .op-menu button.on,
+.species-op .op-menu button:hover,
+.species-op .op-menu button:focus-visible {
+  background: color-mix(in srgb, var(--canopy) 12%, white);
+}
+
+.species-op .op-menu strong {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+
+.species-op .op-menu span {
+  font-size: 11px;
+  color: var(--mist);
+}
+
 .swatch {
   width: 9px;
   height: 9px;
@@ -414,7 +476,7 @@ button.map-month { cursor: pointer; }
 
 .map-actions {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 8px 14px;
   min-height: 32px;
@@ -428,6 +490,7 @@ button.map-month { cursor: pointer; }
   background: transparent;
   border-radius: 2px;
   padding: 0 12px;
+  white-space: nowrap;
 }
 
 .map-check {
@@ -449,11 +512,11 @@ button.map-month { cursor: pointer; }
   accent-color: var(--canopy);
 }
 
-.map-meta,
-.map-hint {
+.map-meta {
   margin: 0;
   font-size: 12px;
   color: var(--mist);
+  white-space: nowrap;
 }
 
 .map-error { margin: 8px 14px; }
@@ -589,12 +652,13 @@ button.map-month { cursor: pointer; }
 
 .map-legend {
   display: inline-flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 4px 12px;
   margin: 0;
   font-size: 12px;
   color: var(--ink);
+  white-space: nowrap;
 }
 
 .map-legend span {

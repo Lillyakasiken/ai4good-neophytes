@@ -27,6 +27,7 @@
       year: '',
       month: '',
       species: [],
+      speciesOp: 'or',
       labelled: false,
       backgroundOnly: false,
       nodataMin: '',
@@ -70,6 +71,7 @@
     if (filters.year) p.set('year', filters.year);
     if (filters.month) p.set('month', filters.month);
     for (const name of filters.species) p.append('species', name);
+    if (filters.species.length) p.set('species_op', filters.speciesOp || 'or');
     if (filters.labelled) p.set('labelled', 'true');
     if (filters.backgroundOnly) p.set('background_only', 'true');
     setNumber(p, 'nodata_min', filters.nodataMin);

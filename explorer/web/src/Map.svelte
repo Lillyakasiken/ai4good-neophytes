@@ -564,7 +564,12 @@
         Image
         <input type="range" min="0" max="1" step="0.05" bind:value={imageOpacity} />
       </label>
-      <p class="map-hint">Whole flight. The grid marks tiles in this fold and role. Drag to move, scroll to zoom, click a tile.</p>
+      <button
+        type="button"
+        class="info"
+        title="Whole flight. The grid marks tiles in this fold and role. Drag to move, scroll to zoom, click a tile."
+        aria-label="How to read the map"
+      >i</button>
     </div>
   </div>
 

@@ -134,11 +134,45 @@
     filters.flight = String(row.flight);
   }
 
+  const SPECIES_OPS = [
+    ['or', 'OR', 'Any selected species'],
+    ['and', 'AND', 'Every selected species'],
+    ['xor', 'XOR', 'An odd number of the selected species'],
+    ['nor', 'NOR', 'None of the selected species'],
+    ['nand', 'NAND', 'Not every selected species'],
+  ];
+
+  let opMenu = $state(false);
+  let opEl = $state(null);
+  let speciesOp = $derived(SPECIES_OPS.find((item) => item[0] === filters.speciesOp) ?? SPECIES_OPS[0]);
+
   function toggleSpecies(name) {
     filters.species = filters.species.includes(name)
       ? filters.species.filter((item) => item !== name)
       : [...filters.species, name];
   }
+
+  function setSpeciesOp(value) {
+    filters.speciesOp = value;
+    opMenu = false;
+  }
+
+  $effect(() => {
+    if (!opMenu) return;
+    function onPointer(event) {
+      if (opEl?.contains(event.target)) return;
+      opMenu = false;
+    }
+    function onKey(event) {
+      if (event.key === 'Escape') opMenu = false;
+    }
+    window.addEventListener('pointerdown', onPointer);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('pointerdown', onPointer);
+      window.removeEventListener('keydown', onKey);
+    };
+  });
 
   function pairLimit(raw) {
     if (raw === '' || raw == null) return null;
@@ -325,6 +359,34 @@
   </label>
   <button type="button" class="reset" disabled={!changed} onclick={onreset}>Reset filters</button>
   <div class="species">
+    <div class="species-op" bind:this={opEl}>
+      <button
+        type="button"
+        class="op"
+        class:set={filters.speciesOp !== 'or'}
+        aria-haspopup="listbox"
+        aria-expanded={opMenu}
+        aria-label="Match selected species with {speciesOp[1]}: {speciesOp[2]}"
+        title={speciesOp[2]}
+        onclick={() => (opMenu = !opMenu)}
+      >{speciesOp[1]}</button>
+      {#if opMenu}
+        <div class="op-menu" role="listbox" aria-label="How selected species combine">
+          {#each SPECIES_OPS as [value, label, hint]}
+            <button
+              type="button"
+              role="option"
+              aria-selected={filters.speciesOp === value}
+              class:on={filters.speciesOp === value}
+              onclick={() => setSpeciesOp(value)}
+            >
+              <strong>{label}</strong>
+              <span>{hint}</span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
     {#each facets?.species ?? [] as spec}
       <button
         type="button"

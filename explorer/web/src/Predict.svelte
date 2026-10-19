@@ -69,9 +69,12 @@
   let training = $state(false);
   let cacheCount = $state(0);
   let cacheBytes = $state(0);
+  let savedFor = $state('');
+  let savedCkpts = $state([]);
   let gpuNote = $state('');
 
   let ranked = $derived.by(() => rankCheckpoints(checkpoints, runs, sortBy));
+  let savedSet = $derived(savedFor === tileId ? new Set(savedCkpts) : new Set());
   let visible = $derived.by(() => {
     const needle = query.trim().toLowerCase();
     if (!needle) return ranked;
@@ -124,6 +127,7 @@
     return comparePaintFor === `${comparisonUrl}|${focusColor}` ? comparePaint : '';
   });
   let wipeClip = $derived(wipeOn ? `inset(0 ${(1 - wipe) * 100}% 0 0)` : undefined);
+  let labelClip = $derived(wipeOn ? `inset(0 0 0 ${wipe * 100}%)` : undefined);
   let importanceHint = $derived.by(() => {
     const base = EXPLAIN_HINTS[explain] || '';
     if (!base || shownView !== 'importance') return '';
@@ -304,6 +308,13 @@
   });
 
   $effect(() => {
+    const id = tileId;
+    const ctrl = new AbortController();
+    refreshMarks(id, ctrl.signal);
+    return () => ctrl.abort();
+  });
+
+  $effect(() => {
     const ctrl = new AbortController();
     refreshCache(ctrl.signal);
     fetch('/api/gpu', { signal: ctrl.signal })
@@ -441,6 +452,24 @@
     seamDrag = null;
   }
 
+  async function refreshMarks(id, signal) {
+    if (!id) {
+      savedCkpts = [];
+      savedFor = '';
+      return;
+    }
+    try {
+      const res = await fetch(`/api/tiles/${id}/predict/marks`, { signal });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (signal?.aborted) return;
+      savedFor = id;
+      savedCkpts = data.checkpoints ?? [];
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+    }
+  }
+
   async function refreshCache(signal) {
     try {
       const res = await fetch('/api/predictions/cache', { signal });
@@ -451,6 +480,7 @@
     } catch (err) {
       if (err.name === 'AbortError') return;
     }
+    refreshMarks(tileId, signal);
   }
 
   function applyStats(data) {
@@ -612,7 +642,7 @@
 {#snippet layers(alt)}
   <img class="photo" class:dim={dimPhoto} src={imageUrl} alt={alt} draggable="false" />
   {#if labelShown && (shownView === 'labels' || wipeOn)}
-    <img class="mask" src={labelShown} alt="" style:opacity={layerOpacity} draggable="false" />
+    <img class="mask" src={labelShown} alt="" style:opacity={layerOpacity} style:clip-path={labelClip} draggable="false" />
   {/if}
   {#if predShown && (shownView === 'prediction' || wipeOn)}
     <img class="mask pred" src={predShown} alt="" style:opacity={layerOpacity} style:clip-path={wipeClip} draggable="false" />
@@ -662,10 +692,10 @@
             Split
             <input type="range" min="0" max="1" step="0.01" bind:value={wipe} aria-label="Comparison split" />
           </label>
-        {:else if shownView === 'compare'}
+        {:else if shownView !== 'photo'}
           <label class="zoom-slider">
-            Agreement
-            <input type="range" min="0" max="1" step="0.05" bind:value={strength} aria-label="Agreement opacity" />
+            {sliderLabel}
+            <input type="range" min="0" max="1" step="0.05" bind:value={strength} aria-label="{sliderLabel} opacity" />
           </label>
           {#if agreementOn}
             {@render agreementKey(true)}
@@ -759,11 +789,14 @@
               class:on={item.path === ckpt}
               aria-selected={item.path === ckpt}
               disabled={busy}
-              title={item.exp_name}
+              title={savedSet.has(item.path) ? `${item.exp_name}. Saved prediction for this tile.` : item.exp_name}
               onclick={() => choose(item.path)}
             >
               <span class="id">
-                <span class="name">{titleOf(item)}</span>
+                <span class="name-row">
+                  <span class="name">{titleOf(item)}</span>
+                  {#if savedSet.has(item.path)}<span class="kept">Saved</span>{/if}
+                </span>
                 <span class="sub">{item.kind}{item.ds2 ? ' · half res' : ''} · {item.file}</span>
               </span>
               <span class="scores">
@@ -937,11 +970,35 @@
 
   .id { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 
+  .name-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
   .name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: 13px;
+  }
+
+  .kept {
+    flex: none;
+    padding: 1px 5px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--canopy) 16%, white);
+    color: var(--canopy);
+    font-size: 10px;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .models button.on .kept {
+    background: color-mix(in srgb, var(--sheet) 24%, transparent);
+    color: var(--sheet);
   }
 
   .sub {
