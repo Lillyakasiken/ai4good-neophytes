@@ -1,5 +1,6 @@
 <script>
   import CopyButton from './CopyButton.svelte';
+  import Zoom from './Zoom.svelte';
 
   let { tileId, thumb, mask } = $props();
 
@@ -43,6 +44,7 @@
   let error = $state('');
   let result = $state(null);
   let resultFor = $state('');
+  let zoomOpen = $state(false);
 
   let ranked = $derived.by(() => rankCheckpoints(checkpoints, runs, sortBy));
   let visible = $derived.by(() => {
@@ -99,6 +101,7 @@
     error = '';
     spotUrl = '';
     spotFor = '';
+    zoomOpen = false;
   });
 
   $effect(() => {
@@ -298,26 +301,43 @@
   }
 </script>
 
+{#snippet layers(alt)}
+  <img src={imageUrl} alt={alt} draggable="false" />
+  {#if labelUrl}
+    <img class="mask" src={labelUrl} alt="" style:opacity={labelOpacity} draggable="false" />
+  {/if}
+  {#if overlayUrl}
+    <img class="mask pred" src={overlayUrl} alt="" style:opacity={predOpacity} draggable="false" />
+  {/if}
+  {#if importanceUrl}
+    <img class="mask importance" src={importanceUrl} alt="" style:opacity={importanceOpacity} draggable="false" />
+  {/if}
+{/snippet}
+
 <div class="lab">
   <div class="preview">
     <div class="shot">
-      <div class="stage" aria-busy={busy}>
-        <img src={imageUrl} alt="" draggable="false" />
-        {#if labelUrl}
-          <img class="mask" src={labelUrl} alt="" style:opacity={labelOpacity} draggable="false" />
-        {/if}
-        {#if overlayUrl}
-          <img class="mask pred" src={overlayUrl} alt="" style:opacity={predOpacity} draggable="false" />
-        {/if}
-        {#if importanceUrl}
-          <img class="mask importance" src={importanceUrl} alt="" style:opacity={importanceOpacity} draggable="false" />
-        {/if}
+      <button type="button" class="stage" aria-busy={busy} aria-label="Enlarge prediction" onclick={() => (zoomOpen = true)}>
+        {@render layers('')}
         {#if busy}
           <div class="predicting" role="status">Running prediction</div>
         {/if}
-      </div>
+      </button>
       <CopyButton overlay />
     </div>
+    <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Prediction" bind:opacity={labelOpacity}>
+      {#snippet toolbar()}
+        <label class="zoom-slider">
+          Prediction
+          <input type="range" min="0" max="1" step="0.05" bind:value={predOpacity} disabled={!overlayUrl} aria-label="Prediction opacity" />
+        </label>
+        <label class="zoom-slider">
+          Importance
+          <input type="range" min="0" max="1" step="0.05" bind:value={importanceOpacity} disabled={!importanceUrl} aria-label="Importance opacity" />
+        </label>
+      {/snippet}
+      {@render layers('Prediction')}
+    </Zoom>
     <label class="slider">
       Labels
       <input type="range" min="0" max="1" step="0.05" bind:value={labelOpacity} />

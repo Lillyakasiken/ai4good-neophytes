@@ -1,7 +1,7 @@
 <script>
   import CopyButton from './CopyButton.svelte';
 
-  let { open = false, onclose, label = 'Image', note = '', opacity = $bindable(undefined), children } = $props();
+  let { open = false, onclose, label = 'Image', note = '', opacity = $bindable(undefined), toolbar, children } = $props();
 
   const MIN_SCALE = 1;
   const MAX_SCALE = 8;
@@ -153,6 +153,9 @@
             <input type="range" min="0" max="1" step="0.05" bind:value={opacity} aria-label="Label opacity" />
           </label>
         {/if}
+        {#if toolbar}
+          {@render toolbar()}
+        {/if}
         <CopyButton root={frameEl} />
         <button type="button" class="done" onclick={onclose}>Close</button>
       </span>
@@ -198,6 +201,7 @@
 
   .bar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     padding: 10px 14px;
@@ -252,11 +256,22 @@
     line-height: 1;
   }
 
-  .slider input {
+  .slider input,
+  .trail :global(.zoom-slider input) {
     flex: none;
     width: 9rem;
     margin: 0;
     accent-color: var(--haze);
+  }
+
+  .trail :global(.zoom-slider) {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    color: rgba(244, 248, 249, 0.85);
+    font-size: 12px;
+    line-height: 1;
   }
 
   .viewport {

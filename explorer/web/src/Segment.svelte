@@ -1,5 +1,6 @@
 <script>
   import CopyButton from './CopyButton.svelte';
+  import Zoom from './Zoom.svelte';
 
   let { tileId, mask } = $props();
 
@@ -30,6 +31,7 @@
   let predError = $state('');
   let labelOpacity = $state(0.55);
   let predOpacity = $state(0.75);
+  let zoomOpen = $state(false);
 
   let models = $derived(catalog?.models ?? []);
   let current = $derived(models.find((item) => item.id === modelId) ?? models[0] ?? null);
@@ -223,6 +225,7 @@
     predFor = '';
     predError = '';
     base = null;
+    zoomOpen = false;
     void id;
   });
 
@@ -413,6 +416,15 @@
   {/if}
 {/snippet}
 
+{#snippet status()}
+  {#if predBusy}
+    <div class="predicting" role="status" aria-live="polite">
+      <span class="spin" aria-hidden="true"></span>
+      Running prediction
+    </div>
+  {/if}
+{/snippet}
+
 <div class="lab">
   <div class="preview">
     <label class="field">
@@ -424,9 +436,9 @@
       </select>
     </label>
     <div class="shot">
-      <div class="stage" aria-busy={busy}>
-        {#if baseUrl}
-          {#if promptKind === 'points'}
+      {#if promptKind === 'points'}
+        <div class="stage" aria-busy={busy}>
+          {#if baseUrl}
             <button
               type="button"
               class="frame aim"
@@ -440,25 +452,57 @@
             >
               {@render frameBody()}
             </button>
-          {:else}
+          {:else if !problem}
+            <p class="wait">Rendering preview…</p>
+          {/if}
+          {@render status()}
+        </div>
+        {#if baseUrl}
+          <button type="button" class="enlarge" onclick={() => (zoomOpen = true)}>Enlarge</button>
+        {/if}
+      {:else}
+        <button
+          type="button"
+          class="stage"
+          aria-busy={busy}
+          aria-label="Enlarge preview"
+          disabled={!baseUrl}
+          onclick={() => (zoomOpen = true)}
+        >
+          {#if baseUrl}
             <div class="frame" style:aspect-ratio={`${base.width} / ${base.height}`}>
               {@render frameBody()}
             </div>
+          {:else if !problem}
+            <p class="wait">Rendering preview…</p>
           {/if}
-        {:else if !problem}
-          <p class="wait">Rendering preview…</p>
-        {/if}
-        {#if predBusy}
-          <div class="predicting" role="status" aria-live="polite">
-            <span class="spin" aria-hidden="true"></span>
-            Running prediction
-          </div>
-        {/if}
-      </div>
+          {@render status()}
+        </button>
+      {/if}
       {#if baseUrl}
         <CopyButton overlay />
       {/if}
     </div>
+    {#if baseUrl}
+      <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Segmentation" bind:opacity={labelOpacity}>
+        {#snippet toolbar()}
+          <label class="zoom-slider">
+            Prediction
+            <input type="range" min="0" max="1" step="0.05" bind:value={predOpacity} disabled={!overlayUrl} aria-label="Prediction opacity" />
+          </label>
+        {/snippet}
+        <div class="zoom-fit">
+          <div
+            class="fitted"
+            style:aspect-ratio={`${base.width} / ${base.height}`}
+            style:width={base.width >= base.height ? '100%' : 'auto'}
+            style:height={base.height >= base.width ? '100%' : 'auto'}
+          >
+            {@render frameBody()}
+          </div>
+        </div>
+      </Zoom>
+    {/if}
     <label class="slider">
       Labels
       <input type="range" min="0" max="1" step="0.05" bind:value={labelOpacity} />
@@ -602,6 +646,37 @@
   }
 
   .stage { display: flex; align-items: center; justify-content: center; }
+
+  button.stage:disabled { opacity: 1; }
+
+  .enlarge {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 6;
+    border: 1px solid rgba(244, 248, 249, 0.45);
+    background: rgba(18, 32, 36, 0.78);
+    color: var(--sheet);
+    border-radius: 2px;
+    padding: 3px 8px;
+    font-size: 12px;
+    line-height: 1.2;
+  }
+
+  .zoom-fit {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .fitted {
+    position: relative;
+    flex: none;
+    max-width: 100%;
+    max-height: 100%;
+  }
 
   .frame {
     position: relative;
