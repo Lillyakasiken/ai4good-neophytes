@@ -80,13 +80,9 @@ class SyntheticDataset(Dataset):
         return mask
 
     # %% drawing
-    def _draw_plant(self, exclude_site, bg_gsd):
-        """A random instance of a uniform species from a uniform source site != exclude_site,
-        scaled to bg_gsd and rotated/flipped. Returns (cls, patch, alpha, source site) or None."""
-        cls = int(self.rng.choice(list(self.plants)))
-        sites = [s for s in self.plants[cls] if s != exclude_site]
-        if not sites:
-            return None
+    def _draw_plant(self, cls, sites, bg_gsd):
+        """A random instance of species `cls` from a uniform site of `sites`, scaled to bg_gsd
+        and rotated/flipped. Returns (patch, alpha), or None if it is too large for the window."""
         site = sites[self.rng.integers(len(sites))]
         r = self.plants[cls][site].iloc[self.rng.integers(len(self.plants[cls][site]))]
         scale = r["gsd_mm"] / bg_gsd * self.rng.uniform(*self.scale_jitter)
@@ -105,7 +101,7 @@ class SyntheticDataset(Dataset):
         patch, alpha = np.rot90(patch, k), np.rot90(alpha, k)
         if self.rng.random() < 0.5:
             patch, alpha = patch[:, ::-1], alpha[:, ::-1]
-        return cls, np.ascontiguousarray(patch), np.ascontiguousarray(alpha), site
+        return np.ascontiguousarray(patch), np.ascontiguousarray(alpha)
 
     def _draw_background(self):
         """A usable window of a uniform site and a uniform type present there."""
@@ -125,20 +121,20 @@ class SyntheticDataset(Dataset):
             mask = self._map_mask(self._read(bg["mask_path"], win, mask=True), bg["mask_path"])
             placed = 0
             for _ in range(int(self.rng.integers(self.n_plants[0], self.n_plants[1] + 1))):
-                plant = None
+                # # species uniform among those with a source site other than the background site;
+                # # an instance that is too large or finds no free spot is replaced by another
+                # # instance of the SAME species, so large-plant species are not pasted less often
+                species = [c for c in self.plants if any(s != bg["site"] for s in self.plants[c])]
+                cls = int(self.rng.choice(species))
+                sites = [s for s in self.plants[cls] if s != bg["site"]]
                 for _ in range(self.max_tries):
-                    plant = self._draw_plant(bg["site"], bg_gsd)
-                    if plant is not None:
+                    plant = self._draw_plant(cls, sites, bg_gsd)
+                    yx = None if plant is None else place(mask, plant[1], self.min_bg_frac, self.rng)
+                    if yx is not None:
+                        image, mask = synthesize(image, mask, *plant, cls, *yx, method=self.method,
+                                                 sigma=self.sigma, ring=self.ring)
+                        placed += 1
                         break
-                if plant is None:
-                    continue
-                cls, patch, alpha, _ = plant
-                yx = place(mask, alpha, self.min_bg_frac, self.rng)
-                if yx is None:
-                    continue
-                image, mask = synthesize(image, mask, patch, alpha, cls, *yx, method=self.method,
-                                         sigma=self.sigma, ring=self.ring)
-                placed += 1
             if placed:
                 break
 
