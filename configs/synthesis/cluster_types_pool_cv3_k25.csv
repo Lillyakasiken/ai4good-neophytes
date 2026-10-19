@@ -1,17 +1,17 @@
 cluster,description,type,usable
 0,trees,trees,1
-1,concrete with little stones,concrete,1
+1,concrete with little stones,concrete,0
 2,small-medium sized stones with one curb,stones,1
 3,short-medium tall grass/scrub (Gestrüpp),tall grass/scrub,1
-4,concrete/street,concrete,1
+4,concrete/street,concrete,0
 5,grey/sky-like colour,grey/sky-like,0
 6,bushes,bushes,1
 7,small-medium sized stones in between a train track,stones,1
 8,random/unusable,unusable,0
 9,roofs/solar panels,roofs,0
 10,small-medium sized grass; less scrub than 3; solely grass,grass,1
-11,concrete with a crack in it,concrete,1
-12,concrete/street with some checker pattern in the image,concrete,1
+11,concrete with a crack in it,concrete,0
+12,concrete/street with some checker pattern in the image,concrete,0
 13,half small grass; half concrete,mixed grass/concrete,1
 14,a car in the image,car,0
 15,bushes; leaves all look the same (small),bushes,1
@@ -19,8 +19,8 @@ cluster,description,type,usable
 17,a specific type of plant/bush,bushes,1
 18,roofs,roofs,0
 19,small-medium sized stones (only these stones),stones,1
-20,a bit mixed; some grassy; some concrete,mixed grass/concrete,1
-21,street (concrete with one middle line from the street),concrete,1
+20,a bit mixed; some grassy; some concrete,mixed grass/concrete,0
+21,street (concrete with one middle line from the street),concrete,0
 22,short grass,grass,1
 23,water,water,0
 24,trees,trees,1
