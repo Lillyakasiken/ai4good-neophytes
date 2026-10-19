@@ -144,4 +144,4 @@ class SyntheticDataset(Dataset):
             set_tile_context(self.transform, gsd=bg_gsd, month=_tile_month(bg["img_path"]))
             augmented = self.transform(image=image, mask=mask)
             image, mask = augmented["image"], augmented["mask"]
-        return {"image": image, "mask": mask.long(), "meta": {}, "name": "synthetic:" + bg["img_path"]}
+        return {"image": image, "mask": torch.as_tensor(mask).long(), "meta": {}, "name": "synthetic:" + bg["img_path"]}
