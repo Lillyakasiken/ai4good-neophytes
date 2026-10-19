@@ -1,5 +1,6 @@
 import os
-from torch.utils.data import DataLoader, WeightedRandomSampler
+import torch
+from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 import pytorch_lightning as pl
 
 from datasets.neophyte_dataset import NeophyteDataset
@@ -18,7 +19,7 @@ def _has_elevation(image_dirs):
     return False
 
 class NeophyteDataModule(pl.LightningDataModule):
-    def __init__(self, image_dirs, classes, transform_train, transform_val, transform_test, dsm_transform=False, ndsm_transform=False, dataset_stats=None, weighted_sampling=False, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, val_few_shot_k=None, val_few_shot_mode='all', val_few_shot_bg_k=0, pick_few_shot_k=10, pick_few_shot_mode='max_px_site_pheno', pick_few_shot_bg_k=0, load_into_ram=False, batch_size_train=16, batch_size_val=16, batch_size_test=16, num_workers=4):
+    def __init__(self, image_dirs, classes, transform_train, transform_val, transform_test, dsm_transform=False, ndsm_transform=False, dataset_stats=None, weighted_sampling=False, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, val_few_shot_k=None, val_few_shot_mode='all', val_few_shot_bg_k=0, pick_few_shot_k=10, pick_few_shot_mode='max_px_site_pheno', pick_few_shot_bg_k=0, load_into_ram=False, batch_size_train=16, batch_size_val=16, batch_size_test=16, num_workers=4, synthesis=None, transform_synthetic=None):
         super().__init__()
         self.image_dirs = ensure_list_values(image_dirs)
         self.classes = classes
@@ -54,6 +55,9 @@ class NeophyteDataModule(pl.LightningDataModule):
         self.batch_size_test = batch_size_test
         self.num_workers = num_workers
         self.load_into_ram = load_into_ram
+        # # copy-paste synthesis (datasets/synthetic_dataset.py); None = real data only
+        self.synthesis = synthesis
+        self.transform_synthetic = transform_synthetic
 
     def setup(self, stage=None):
         # Initialize Datasets
@@ -68,6 +72,17 @@ class NeophyteDataModule(pl.LightningDataModule):
             # Initialize WeightedRandomSampler (only for train dataset)
             if self.weighted_sampling:
                 self.sampler = WeightedRandomSampler(self.train_dataset.sample_weights, num_samples=len(self.train_dataset), replacement=True)
+            # # Synthesis: a share p of the draws comes from synthetic composites, the rest from the
+            # # real tiles with their usual relative weights. The epoch length stays len(train_dataset).
+            if self.synthesis:
+                from datasets.synthetic_dataset import SyntheticDataset
+                assert self.weighted_sampling, "synthesis mixes into the weighted sampler, set weighted_sampling"
+                syn = self.synthesis
+                self.synthetic_dataset = SyntheticDataset(syn.plants_csv, syn.backgrounds_csv, self.transform_synthetic, len(self.train_dataset), value_mapping=self.value_mapping, size=syn.size, n_plants=syn.n_plants, method=syn.method, sigma=syn.sigma, ring=syn.ring, max_size_frac=syn.max_size_frac, min_bg_frac=syn.min_bg_frac, scale_jitter=syn.scale_jitter)
+                real_w = torch.as_tensor(self.train_dataset.sample_weights, dtype=torch.double)
+                weights = torch.cat([real_w / real_w.sum() * (1 - syn.p), torch.full((len(self.synthetic_dataset),), syn.p / len(self.synthetic_dataset), dtype=torch.double)])
+                self.train_pool = ConcatDataset([self.train_dataset, self.synthetic_dataset])
+                self.sampler = WeightedRandomSampler(weights, num_samples=len(self.train_dataset), replacement=True)
         if stage == "test" or stage is None:
             # Initialize Datasets
             self.test_dataset = NeophyteDataset(self.image_dirs.test, self.classes, transform=self.transform_test, dsm_transform=self.dsm_transform, ndsm_transform=self.ndsm_transform, dataset_stats=self.dataset_stats, value_mapping=self.value_mapping, ignore_index=self.ignore_index, load_auxiliary=self.load_auxiliary, load_dsm=self.load_dsm, load_dtm=self.load_dtm, load_ndsm=self.load_ndsm, return_dsm_dtm=True)
@@ -94,6 +109,8 @@ class NeophyteDataModule(pl.LightningDataModule):
         return dict(persistent_workers=True, prefetch_factor=4, pin_memory=True)
 
     def train_dataloader(self):
+        if self.synthesis:
+            return DataLoader(self.train_pool, sampler=self.sampler, batch_size=self.batch_size_train, num_workers=self.num_workers, **self._loader_kwargs())
         if self.weighted_sampling:
             return DataLoader(self.train_dataset, sampler=self.sampler, batch_size=self.batch_size_train, num_workers=self.num_workers, **self._loader_kwargs()) # shuffling automatically in sampler
         else:

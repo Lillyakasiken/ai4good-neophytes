@@ -67,3 +67,7 @@ few_shot_bg_k: 1000  # additional background-only images (0 = none)
 val_few_shot_k: null
 val_few_shot_mode: 'all'
 val_few_shot_bg_k: 0
+
+# # Copy-paste synthesis (datasets/synthetic_dataset.py). null = real data only (the
+# # baseline). A data config that enables it sets a block like neophytes_split_cv3_train_512_synth.
+synthesis: null

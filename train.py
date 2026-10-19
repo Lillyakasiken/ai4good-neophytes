@@ -58,6 +58,9 @@ def main(cfg: DictConfig) -> None:
     test_transforms = get_transforms(cfg.data.test_transforms, cfg.data.transforms_additional_targets)
     dsm_transforms = get_transforms(cfg.data.dsm_transforms, toTensor=False)
     ndsm_transforms = get_transforms(cfg.data.ndsm_transforms, toTensor=False)
+    # # synthetic samples are already crop-sized windows: train augmentations without the crop
+    synthetic_transforms = (get_transforms([t for t in cfg.data.train_transforms if t.type != 'TargetedRandomResizedCrop'],
+                                           cfg.data.transforms_additional_targets) if cfg.data.synthesis else None)
 
     dataModule = NeophyteDataModule(cfg.data.image_dir,
                                     cfg.data.classes,
@@ -89,7 +92,9 @@ def main(cfg: DictConfig) -> None:
                                     batch_size_train=cfg.data.batch_size_train,
                                     batch_size_val=cfg.data.batch_size_val,
                                     batch_size_test=cfg.data.batch_size_test,
-                                    num_workers=cfg.data.num_workers)
+                                    num_workers=cfg.data.num_workers,
+                                    synthesis=cfg.data.synthesis,
+                                    transform_synthetic=synthetic_transforms)
 
     dataModule.prepare_data()
     dataModule.setup()

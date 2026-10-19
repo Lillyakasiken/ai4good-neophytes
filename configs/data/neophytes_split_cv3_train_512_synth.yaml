@@ -1,0 +1,30 @@
+# Fold 3, 512 crops as neophytes_split_cv3_train_512, plus copy-paste synthesis: half of
+# the draws per epoch are synthetic composites (datasets/synthetic_dataset.py), drawn
+# balanced over species x background site x background type; the other half are the
+# real tiles with their usual weights. The epoch length and everything else stay as in
+# the 512 baseline, so the run is compared with it at equal steps.
+#
+# Inputs (on the node, built in this order):
+#   python build_plant_pool.py --fold cv3                                   -> plants_csv
+#   python background_pool.py && python background_clusters.py --pool results/background_pool --fold cv3,
+#   types from configs/synthesis/cluster_types_pool_cv3_k25.csv              -> backgrounds_csv
+#
+# data_name keeps the np_cv3 prefix, so test.py picks neophytes_split_cv3_test as for the baseline.
+defaults:
+  - neophytes_split_cv3_train_512
+  - _self_
+
+data_name: 'np_cv3_synth'
+
+synthesis:
+  p: 0.5                    # share of synthetic samples per epoch
+  plants_csv: results/plant_pool/cv3/plants.csv
+  backgrounds_csv: results/background_clusters/pool_cv3_k25/pool_cv3_typed.csv
+  size: ${data.crop_size_train}
+  n_plants: [1, 3]          # plants per composite, uniform
+  method: soft              # synthesis.synthesize: hard | soft
+  sigma: 2.0                # soft paste: blur of the mask edge [px]
+  ring: 0                   # ignore ring around the plant [px], 0 = off
+  max_size_frac: 0.6        # largest plant side as a fraction of the window
+  min_bg_frac: 0.8          # share of the plant that must land on background
+  scale_jitter: [0.9, 1.1]  # on top of the GSD matching
