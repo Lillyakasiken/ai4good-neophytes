@@ -15,13 +15,20 @@ fraction and pos-thr); the asserts check this against the cache.
     python background_clusters.py --emb ../ai4good-neophytes/results/plantclef_probe/emb_train.npz
     python background_clusters.py ... --size 1024 --k 20
 
+With --pool, the windows come from background_pool.py instead (every label-free window
+of every site, with positions); only the training sites of --fold are clustered:
+
+    python background_clusters.py --pool results/background_pool --fold cv3
+
 Outputs (``--out-dir``/<backbone>_<size>_k<k>/):
 
     tsne.png             one dot per window: left coloured by cluster (number at its centre),
                          right by site. A cluster in many colours = type, in one colour = site.
     clusters.md          per cluster: windows, number of sites, largest site and its share
     montages/cluster_XX.png   20 windows per cluster (12 nearest the centre + 8 random)
-    clusters.csv         per window: cluster, tile, site, flight (for the synthesis loader)
+    clusters.csv         per window: cluster, tile, site, flight
+                         (--pool: pool_<fold>.csv = the pool rows of the fold's training sites
+                         + cluster + dist; input of the synthesis loader)
 
 The montages show confidential data: view them on the node, keep them inside the course.
 """
@@ -34,6 +41,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 import yaml
+from rasterio.windows import Window
 
 from preview_paste import IGNORE, read_tile
 
@@ -84,6 +92,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--emb", default="../ai4good-neophytes/results/plantclef_probe/emb_train.npz",
                         help="train cache of plantclef_probe.py")
+    parser.add_argument("--pool", default=None, help="output dir of background_pool.py (replaces --emb)")
+    parser.add_argument("--fold", default="cv3", help="--pool: cluster only the training sites of this fold")
+    parser.add_argument("--classes-yaml", default="configs/data/neophytes_names_colors.yaml")
     parser.add_argument("--stats-csv", default="../data/Neophytes/stats_imagewise.csv")
     parser.add_argument("--split-yaml", default="configs/data/split_cv3.yaml")
     parser.add_argument("--out-dir", default="results/background_clusters")
@@ -100,13 +111,67 @@ def main():
 
     from sklearn.cluster import KMeans
     from sklearn.decomposition import PCA
-    from sklearn.manifold import TSNE
 
-    out = os.path.join(args.out_dir, f"{args.backbone}_{args.size}_k{args.k}")
+    name = f"pool_{args.fold}_k{args.k}" if args.pool else f"{args.backbone}_{args.size}_k{args.k}"
+    out = os.path.join(args.out_dir, name)
     os.makedirs(os.path.join(out, "montages"), exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
-    # %% background windows of the cache + their tile, site and flight
+    if args.pool:
+        # %% pool windows of the fold's training sites
+        with open(args.classes_yaml) as f:
+            held_out = set(yaml.safe_load(f)["cv_folds"][args.fold])
+        pool = pd.read_csv(os.path.join(args.pool, "pool.csv"))
+        keep = ~pool["site"].isin(held_out).to_numpy()
+        win = pool[keep].reset_index(drop=True)
+        x = np.load(os.path.join(args.pool, "emb.npz"))["emb"][keep].astype(np.float32)
+        args.size = int(win["size"].iloc[0])
+        print(f"{args.fold}: {len(win)} pool windows from {win['img_path'].nunique()} tiles, "
+              f"{win['site'].nunique()} sites, {win['flight'].nunique()} flights (held out: {', '.join(held_out)})")
+    else:
+        win, x, tiles, emb = cache_windows(args, rng)
+
+    # %% k-means on L2-normalised CLS embeddings (cosine geometry), PCA to 50 dims against noise
+    x /= np.linalg.norm(x, axis=1, keepdims=True)
+    x = PCA(50, random_state=args.seed).fit_transform(x)
+    km = KMeans(args.k, n_init=10, random_state=args.seed).fit(x)
+    win["cluster"] = km.labels_
+    win["dist"] = np.linalg.norm(x - km.cluster_centers_[km.labels_], axis=1)
+    if args.pool:
+        win.to_csv(os.path.join(out, f"pool_{args.fold}.csv"), index=False)
+    else:
+        win[["cluster", "tile", "rank", "site", "flight"]].assign(img_path=tiles["img_path"].to_numpy()[win["tile"]]) \
+            .to_csv(os.path.join(out, "clusters.csv"), index=False)
+    clusters_md(win, args, out)
+    tsne_plot(win, x, args, rng, out)
+
+    # %% montages: n-show windows per cluster, 60% nearest the centre + 40% random
+    n_near = round(0.6 * args.n_show)
+    picks = {}
+    for c, g in win.groupby("cluster"):
+        near = g.nsmallest(n_near, "dist")
+        rest = g.drop(near.index)
+        picks[c] = pd.concat([near, rest.sample(min(args.n_show - n_near, len(rest)), random_state=args.seed)])
+    step = max(1, args.size // 256)
+    crops = {}
+    if args.pool:
+        for i, r in pd.concat(picks.values()).iterrows():
+            with rasterio.open(r["img_path"]) as src:
+                img = src.read([1, 2, 3], window=Window(int(r["x0"]), int(r["y0"]), args.size, args.size))
+            crops[i] = img.transpose(1, 2, 0)[::step, ::step]
+    else:
+        for t, g in pd.concat(picks.values()).groupby("tile"):
+            image, pos = kept_windows(tiles.iloc[t], args.size, args.pos_thr)
+            assert len(pos) == (emb["tile"][emb["size"] == args.size] == t).sum(), f"window order differs on tile {t}"
+            for i, r in g.iterrows():
+                y0, x0 = pos[int(r["rank"])]
+                crops[i] = image[y0:y0 + args.size:step, x0:x0 + args.size:step]
+    montages(picks, crops, win, n_near, out)
+    print(f"written to {out}")
+
+
+def cache_windows(args, rng):
+    """Background windows of the plantclef_probe.py train cache + their tile, site and flight."""
     tiles = split_tiles(args.stats_csv, args.split_yaml, args.bg_fraction, rng)
     emb = dict(np.load(args.emb))
     assert emb["tile"].max() < len(tiles), "tile table does not match the cache (different split/seed?)"
@@ -119,31 +184,29 @@ def main():
     win["site"] = win["flight"].str.rsplit("_", n=1).str[0]
     print(f"{len(tiles)} train tiles; {len(win)} background windows of {args.size} px from {win['tile'].nunique()} tiles, "
           f"{win['site'].nunique()} sites, {win['flight'].nunique()} flights")
+    return win, emb[args.backbone][sel].astype(np.float32), tiles, emb
 
-    # %% k-means on L2-normalised CLS embeddings (cosine geometry), PCA to 50 dims against noise
-    x = emb[args.backbone][sel].astype(np.float32)
-    x /= np.linalg.norm(x, axis=1, keepdims=True)
-    x = PCA(50, random_state=args.seed).fit_transform(x)
-    km = KMeans(args.k, n_init=10, random_state=args.seed).fit(x)
-    win["cluster"] = km.labels_
-    win["dist"] = np.linalg.norm(x - km.cluster_centers_[km.labels_], axis=1)
-    win[["cluster", "tile", "rank", "site", "flight"]].assign(img_path=tiles["img_path"].to_numpy()[win["tile"]]) \
-        .to_csv(os.path.join(out, "clusters.csv"), index=False)
 
-    # %% clusters.md: is a cluster spread over sites (type) or concentrated on one (site)?
+def clusters_md(win, args, out):
+    """clusters.md: is a cluster spread over sites (type) or concentrated on one (site)?"""
     rows = []
     for c, g in win.groupby("cluster"):
         top = g["site"].value_counts()
         rows.append({"cluster": c, "windows": len(g), "sites": len(top),
                      "largest site": top.index[0], "share": f"{top.iloc[0] / len(g):.0%}"})
     table = pd.DataFrame(rows).to_markdown(index=False)
+    source = f"pool, {args.fold} training sites" if args.pool else args.backbone
     with open(os.path.join(out, "clusters.md"), "w") as f:
-        f.write(f"# Background clusters ({args.backbone}, {args.size} px, k={args.k})\n\n"
+        f.write(f"# Background clusters ({source}, {args.size} px, k={args.k})\n\n"
                 f"{len(win)} windows, {win['site'].nunique()} sites. Many sites and a low share = surface type; "
                 f"few sites and a high share = site/lighting cluster.\n\n{table}\n")
     print(table)
 
-    # %% tsne.png: same dots, coloured by cluster (left) and by site (right)
+
+def tsne_plot(win, x, args, rng, out):
+    """tsne.png: same dots, coloured by cluster (left) and by site (right)."""
+    from sklearn.manifold import TSNE
+
     show = rng.choice(len(win), min(args.max_tsne, len(win)), replace=False)
     xy = TSNE(2, init="pca", perplexity=30, random_state=args.seed).fit_transform(x[show])
     fig, axes = plt.subplots(1, 2, figsize=(22, 10))
@@ -168,21 +231,9 @@ def main():
     fig.savefig(os.path.join(out, "tsne.png"), dpi=120)
     plt.close(fig)
 
-    # %% montages: n-show windows per cluster, 60% nearest the centre + 40% random
-    n_near = round(0.6 * args.n_show)
-    picks = {}
-    for c, g in win.groupby("cluster"):
-        near = g.nsmallest(n_near, "dist")
-        rest = g.drop(near.index)
-        picks[c] = pd.concat([near, rest.sample(min(args.n_show - n_near, len(rest)), random_state=args.seed)])
-    crops = {}
-    for t, g in pd.concat(picks.values()).groupby("tile"):
-        image, pos = kept_windows(tiles.iloc[t], args.size, args.pos_thr)
-        assert len(pos) == (emb["tile"][emb["size"] == args.size] == t).sum(), f"window order differs on tile {t}"
-        for i, r in g.iterrows():
-            y0, x0 = pos[int(r["rank"])]
-            step = max(1, args.size // 256)
-            crops[i] = image[y0:y0 + args.size:step, x0:x0 + args.size:step]
+
+def montages(picks, crops, win, n_near, out):
+    """One image per cluster: its picked windows, captioned centre/random + flight."""
     ncol = 5
     for c, g in picks.items():
         nrow = int(np.ceil(len(g) / ncol))
@@ -197,7 +248,6 @@ def main():
         fig.tight_layout()
         fig.savefig(os.path.join(out, "montages", f"cluster_{c:02d}.png"), dpi=100)
         plt.close(fig)
-    print(f"written to {out}")
 
 
 if __name__ == "__main__":
