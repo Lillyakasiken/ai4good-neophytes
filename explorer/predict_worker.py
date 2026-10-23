@@ -1055,6 +1055,530 @@ def _predict(req):
     }
 
 
+def _split_encoded(encoded):
+    """Encoder outputs are a list of maps, except DPT which also returns prefix tokens."""
+    if (
+        isinstance(encoded, tuple)
+        and len(encoded) == 2
+        and isinstance(encoded[0], (list, tuple))
+        and not _is_spatial(encoded[0])
+    ):
+        return list(encoded[0]), encoded[1]
+    if isinstance(encoded, (list, tuple)) and not _is_spatial(encoded):
+        return list(encoded), None
+    return [encoded], None
+
+
+def _scale_label(stride):
+    stride = int(stride or 1)
+    if stride <= 1:
+        return "full size"
+    return f"1/{stride}"
+
+
+def _encoder_caption(index, total, stride):
+    if total <= 1:
+        return "Features"
+    if index == 0:
+        return "Fine detail"
+    if index == total - 1:
+        return "Wide view"
+    if index == 1:
+        return "Neighborhood"
+    return _scale_label(stride)
+
+
+def _decoder_caption(name):
+    if name == "center":
+        return "Bottleneck"
+    if name.startswith("mlp_stage"):
+        return "Align scale"
+    if name in ("fuse_stage", "fusion_block"):
+        return "Fuse scales"
+    if name == "aspp":
+        return "Wide context"
+    if name == "block1":
+        return "Fine shortcut"
+    if name == "block2":
+        return "Merged map"
+    if name == "up":
+        return "Upsample"
+    if name in ("psp", "fpa"):
+        return "Scene context"
+    if name.startswith("gau"):
+        return "Attention merge"
+    if name.startswith("fpn_lateral"):
+        return "Add detail"
+    if name.startswith("reassemble"):
+        return "Reshape"
+    if name.startswith("fusion_blocks"):
+        return "Fuse and grow"
+    if ".x_" in name or name.startswith("x_"):
+        return "Dense mix"
+    if name.startswith("blocks"):
+        return "Grow and mix"
+    return "Decoder step"
+
+
+def _decoder_targets(decoder):
+    """High-level blocks worth drawing. Skips normalizations and other bookkeeping."""
+    import torch.nn as nn
+
+    names = {name for name, _child in decoder.named_children()}
+
+    def expand(name):
+        module = getattr(decoder, name)
+        if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+            return [(f"{name}.{key}", child) for key, child in module.named_children()]
+        return [(name, module)]
+
+    if {"mlp_stage", "fuse_stage"} <= names:
+        chosen = ["mlp_stage", "fuse_stage"]
+    elif "aspp" in names:
+        chosen = [name for name in ("aspp", "up", "block1", "block2") if name in names]
+    elif {"psp", "fusion_block"} <= names:
+        chosen = [name for name in ("psp", "fpn_lateral_blocks", "fusion_block") if name in names]
+    elif "fpa" in names:
+        chosen = [name for name in ("fpa", "gau3", "gau2", "gau1") if name in names]
+    elif {"reassemble_blocks", "fusion_blocks"} <= names:
+        chosen = ["reassemble_blocks", "fusion_blocks"]
+    elif "blocks" in names:
+        chosen = [name for name in ("center", "blocks") if name in names]
+    else:
+        chosen = [name for name, _child in decoder.named_children()]
+
+    targets = []
+    for name in chosen:
+        targets.extend(expand(name))
+    return targets
+
+
+def _best_channel_subset(target, nodes):
+    """Parents of a concatenated tensor: earlier maps whose channels add up to ``target``."""
+    import itertools
+
+    pool = [node for node in nodes if node.get("channels")][-12:]
+    best = None
+    for size in range(2, min(6, len(pool)) + 1):
+        for combo in itertools.combinations(range(len(pool)), size):
+            if sum(pool[index]["channels"] for index in combo) != target:
+                continue
+            decoders = sum(1 for index in combo if pool[index]["kind"] == "decoder")
+            score = (decoders, size, sum(combo))
+            if best is None or score > best[0]:
+                best = (score, [pool[index]["id"] for index in combo])
+    if best is None:
+        return []
+    return best[1]
+
+
+def _resolve_tensor(tensor, nodes, by_id, role, consumed):
+    if not _is_spatial(tensor):
+        return []
+    known = by_id.get(id(tensor))
+    if known:
+        return [(known, role)]
+    channels = int(tensor.shape[1])
+    height = int(tensor.shape[-2])
+    width = int(tensor.shape[-1])
+    exact = [
+        node for node in nodes
+        if node["channels"] == channels and node["height"] == height and node["width"] == width
+    ]
+    if len(exact) == 1:
+        return [(exact[0]["id"], role)]
+    if len(exact) > 1:
+        decoders = [node for node in exact if node["kind"] == "decoder"]
+        if decoders:
+            return [(decoders[-1]["id"], role)]
+        unused = [node for node in exact if node["id"] not in consumed]
+        chosen = (unused or exact)[0]
+        consumed.add(chosen["id"])
+        return [(chosen["id"], role)]
+    combo = _best_channel_subset(channels, nodes)
+    if combo:
+        return [(node_id, "fuse") for node_id in combo]
+    same_place = [
+        node for node in nodes
+        if node["kind"] == "encoder" and node["height"] == height and node["width"] == width
+    ]
+    if len(same_place) == 1:
+        return [(same_place[0]["id"], role)]
+    same_channels = [node for node in nodes if node["channels"] == channels]
+    if len(same_channels) == 1:
+        return [(same_channels[0]["id"], role)]
+    return []
+
+
+def _prefer_stream(pairs, by_node):
+    """When a block sees both a decoder map and an encoder map, the encoder is the skip."""
+    kinds = [by_node.get(node_id, {}).get("kind") for node_id, _role in pairs]
+    if "decoder" not in kinds or "encoder" not in kinds:
+        return pairs
+    ordered = []
+    for (node_id, role), kind in zip(pairs, kinds):
+        if kind == "encoder":
+            ordered.append((node_id, "extra"))
+        elif role == "fuse":
+            ordered.append((node_id, role))
+        else:
+            ordered.append((node_id, "main"))
+    return ordered
+
+
+def _dense_parents(name, inputs, made, encoder_ids):
+    """Unet++ block x_i_j: previous nest, same-column nests, and one encoder scale."""
+    import re
+
+    match = re.search(r"x_(\d+)_(\d+)$", name)
+    if not match or len(inputs) < 2:
+        return None
+    depth_i, layer_i = int(match.group(1)), int(match.group(2))
+    if depth_i == layer_i:
+        return None
+    previous = made.get(f"blocks.x_{depth_i}_{layer_i - 1}")
+    if previous is None:
+        return None
+    pairs = [(previous, "main")]
+    for idx in range(depth_i + 1, layer_i + 1):
+        nested = made.get(f"blocks.x_{idx}_{layer_i}")
+        if nested:
+            pairs.append((nested, "fuse"))
+    coarse_to_fine = list(reversed(encoder_ids))
+    if layer_i + 1 < len(coarse_to_fine):
+        pairs.append((coarse_to_fine[layer_i + 1], "extra"))
+    return pairs
+
+
+def _edge_kind(parent_kind, role):
+    if parent_kind == "ndsm":
+        return "aux"
+    if role == "fuse":
+        return "fuse"
+    if role == "extra":
+        return "skip" if parent_kind == "encoder" else "fuse"
+    return "forward"
+
+
+def _place_columns(nodes, edges):
+    encoders = [node for node in nodes if node["kind"] == "encoder"]
+    for index, node in enumerate(encoders):
+        node["column"] = 1 + index
+    decoders = {node["id"]: node for node in nodes if node["kind"] == "decoder"}
+    parents = {node_id: [] for node_id in decoders}
+    for edge in edges:
+        if edge["to"] in parents and edge["from"] in decoders:
+            parents[edge["to"]].append(edge["from"])
+    memo = {}
+
+    def depth(node_id, stack):
+        if node_id in memo:
+            return memo[node_id]
+        if node_id in stack:
+            return 0
+        stack.add(node_id)
+        preds = parents[node_id]
+        value = 0 if not preds else 1 + max(depth(pred, stack) for pred in preds)
+        stack.remove(node_id)
+        memo[node_id] = value
+        return value
+
+    base = 1 + len(encoders)
+    for node_id, node in decoders.items():
+        node["column"] = base + depth(node_id, set())
+    for node in nodes:
+        if node["kind"] in ("input", "ndsm"):
+            node["column"] = 0
+
+
+def _trace_graph(decoder, features, prefix, height, width, alpha, fusion, scales, input_channels, has_ndsm=False):
+    """Run one decoder forward and record the blocks that actually ran.
+
+    Works for any segmentation-models-pytorch decoder: sequential skip decoders,
+    parallel multi-scale fusion, atrous shortcuts, or an unseen stack of blocks.
+    """
+    import torch
+
+    nodes = []
+    edges = []
+    seen_edges = set()
+    by_id = {}
+    by_node = {}
+
+    def add_edge(source, target, role):
+        if not source or source == target or source not in by_node or target not in by_node:
+            return
+        kind = _edge_kind(by_node[source]["kind"], role)
+        key = (source, target, kind)
+        if key in seen_edges:
+            return
+        seen_edges.add(key)
+        edges.append({"from": source, "to": target, "kind": kind})
+
+    def add_node(node, tensor=None):
+        nodes.append(node)
+        by_node[node["id"]] = node
+        if tensor is not None and torch.is_tensor(tensor):
+            by_id[id(tensor)] = node["id"]
+        return node
+
+    add_node({
+        "id": "input",
+        "kind": "input",
+        "kicker": "Input",
+        "label": "Photo",
+        "scale": "full size",
+        "module": "",
+        "stride": 1,
+        "column": 0,
+        "slot": 0,
+        "height": int(height),
+        "width": int(width),
+        "channels": 3,
+        "elev_scale": None,
+        "shape": [1, 3, int(height), int(width)],
+    })
+    if has_ndsm:
+        add_node({
+            "id": "ndsm",
+            "kind": "ndsm",
+            "kicker": "Input",
+            "label": "Canopy height",
+            "scale": "full size",
+            "module": "ndsm",
+            "stride": 1,
+            "column": 0,
+            "slot": 1,
+            "height": int(height),
+            "width": int(width),
+            "channels": 1,
+            "elev_scale": None,
+            "shape": [1, 1, int(height), int(width)],
+        })
+
+    spatial = []
+    for index, feat in enumerate(features):
+        if not _is_spatial(feat):
+            continue
+        native_h, native_w = int(feat.shape[-2]), int(feat.shape[-1])
+        native_c = int(feat.shape[1])
+        if native_h == height and native_w == width and native_c <= int(input_channels):
+            by_id[id(feat)] = "input"
+            continue
+        spatial.append((index, feat))
+
+    total = len(spatial)
+    for order, (index, feat) in enumerate(spatial):
+        native_h, native_w = int(feat.shape[-2]), int(feat.shape[-1])
+        stride = max(1, int(round(height / float(native_h)))) if native_h else 1
+        pictures = _feature_pictures(feat, alpha)
+        node = add_node({
+            "id": f"enc-{index}",
+            "kind": "encoder",
+            "kicker": "Encoder",
+            "label": _encoder_caption(order, total, stride),
+            "scale": _scale_label(stride),
+            "module": f"encoder.stage{index}",
+            "stride": stride,
+            "column": 0,
+            "slot": 0,
+            "height": pictures["height"],
+            "width": pictures["width"],
+            "channels": pictures["channels"],
+            "elev_scale": scales.get(index),
+            "shape": [1, pictures["channels"], pictures["height"], pictures["width"]],
+            "energy": pictures["energy"],
+            "pca": pictures["pca"],
+            "samples": pictures["samples"],
+        }, feat)
+        del pictures
+
+    if spatial:
+        add_edge("input", f"enc-{spatial[0][0]}", "main")
+        for previous, current in zip(spatial, spatial[1:]):
+            add_edge(f"enc-{previous[0]}", f"enc-{current[0]}", "main")
+    if has_ndsm and spatial:
+        if fusion == "stem":
+            hooked = [f"enc-{index}" for index, _feat in spatial if scales.get(index) is not None]
+            targets = hooked or [f"enc-{index}" for index, _feat in spatial]
+            for target in targets:
+                add_edge("ndsm", target, "main")
+        else:
+            add_edge("ndsm", f"enc-{spatial[0][0]}", "main")
+
+    steps = []
+
+    def hook(name):
+        def _hook(_module, args, kwargs, output):
+            incoming = []
+            for value in list(args) + list(kwargs.values()):
+                if _is_spatial(value):
+                    incoming.append(value)
+            out = output
+            if isinstance(output, (list, tuple)):
+                spatial_out = [item for item in output if _is_spatial(item)]
+                out = spatial_out[-1] if spatial_out else None
+            if not _is_spatial(out):
+                return
+            if len(incoming) == 1 and id(incoming[0]) == id(out):
+                return
+            steps.append({"name": name, "inputs": incoming, "output": out})
+        return _hook
+
+    handles = []
+    try:
+        for name, module in _decoder_targets(decoder):
+            try:
+                handles.append(module.register_forward_hook(hook(name), with_kwargs=True))
+            except TypeError:
+                handles.append(module.register_forward_hook(
+                    lambda mod, args, out, name=name: hook(name)(mod, args, {}, out)
+                ))
+        if prefix is None:
+            decoded = decoder(features)
+        else:
+            decoded = decoder(features, prefix)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    head_in = decoded
+    if isinstance(decoded, (list, tuple)):
+        spatial_out = [item for item in decoded if _is_spatial(item)]
+        head_in = spatial_out[-1] if spatial_out else None
+
+    consumed = set()
+    made = {}
+    encoder_ids = [f"enc-{index}" for index, _feat in spatial]
+    rank = {"main": 0, "extra": 1, "fuse": 2}
+    for step_index, step in enumerate(steps):
+        out = step["output"]
+        if id(out) in by_id:
+            continue
+        native_h, native_w = int(out.shape[-2]), int(out.shape[-1])
+        stride = max(1, int(round(height / float(native_h)))) if native_h else 1
+        pictures = _feature_pictures(out, alpha)
+        node_id = f"dec-{step_index}"
+        made[step["name"]] = node_id
+        node = add_node({
+            "id": node_id,
+            "kind": "decoder",
+            "kicker": "Decoder",
+            "label": _decoder_caption(step["name"]),
+            "scale": _scale_label(stride),
+            "module": step["name"],
+            "stride": stride,
+            "column": 0,
+            "slot": 0,
+            "height": pictures["height"],
+            "width": pictures["width"],
+            "channels": pictures["channels"],
+            "elev_scale": None,
+            "shape": [1, pictures["channels"], pictures["height"], pictures["width"]],
+            "energy": pictures["energy"],
+            "pca": pictures["pca"],
+            "samples": pictures["samples"],
+        }, out)
+        del pictures
+        override = _dense_parents(step["name"], step["inputs"], made, encoder_ids)
+        if override is not None:
+            pairs = override
+        else:
+            pairs = []
+            for input_index, tensor in enumerate(step["inputs"]):
+                role = "main" if input_index == 0 else "extra"
+                pairs.extend(_resolve_tensor(tensor, nodes[:-1], by_id, role, consumed))
+            pairs = _prefer_stream(pairs, by_node)
+        pairs = sorted(pairs, key=lambda item: rank.get(item[1], 9))
+        for source, source_role in pairs:
+            add_edge(source, node["id"], source_role)
+
+    if head_in is not None and _is_spatial(head_in) and id(head_in) not in by_id:
+        pictures = _feature_pictures(head_in, alpha)
+        native_h = pictures["height"]
+        stride = max(1, int(round(height / float(native_h)))) if native_h else 1
+        add_node({
+            "id": "dec-out",
+            "kind": "decoder",
+            "kicker": "Decoder",
+            "label": "Decoder output",
+            "scale": _scale_label(stride),
+            "module": "decoder",
+            "stride": stride,
+            "column": 0,
+            "slot": 0,
+            "height": pictures["height"],
+            "width": pictures["width"],
+            "channels": pictures["channels"],
+            "elev_scale": None,
+            "shape": [1, pictures["channels"], pictures["height"], pictures["width"]],
+            "energy": pictures["energy"],
+            "pca": pictures["pca"],
+            "samples": pictures["samples"],
+        }, head_in)
+        if spatial:
+            add_edge(f"enc-{spatial[-1][0]}", "dec-out", "main")
+
+    source = by_id.get(id(head_in)) if head_in is not None and _is_spatial(head_in) else None
+    if source is None:
+        decoders = [node for node in nodes if node["kind"] == "decoder"]
+        source = decoders[-1]["id"] if decoders else (f"enc-{spatial[-1][0]}" if spatial else "input")
+
+    _place_columns(nodes, edges)
+    for node in nodes:
+        parents = []
+        for edge in edges:
+            if edge["to"] == node["id"] and edge["from"] not in parents:
+                parents.append(edge["from"])
+        node["parents"] = parents
+
+    steps.clear()
+    return {"nodes": nodes, "edges": edges, "source": source}, head_in
+
+
+def _append_readout(graph, num_classes, height, width):
+    """Segmentation scores and the per-pixel winner, after the decoder."""
+    columns = [int(node.get("column") or 0) for node in graph["nodes"]] or [0]
+    score_col = max(columns) + 1
+    source = graph.get("source") or "input"
+    graph["nodes"].append({
+        "id": "scores",
+        "kind": "scores",
+        "kicker": "Segmentation",
+        "label": "Species scores",
+        "scale": "full size",
+        "module": "segmentation_head",
+        "stride": 1,
+        "column": score_col,
+        "slot": 0,
+        "height": int(height),
+        "width": int(width),
+        "channels": int(num_classes),
+        "elev_scale": None,
+        "shape": [1, int(num_classes), int(height), int(width)],
+        "parents": [source],
+    })
+    graph["edges"].append({"from": source, "to": "scores", "kind": "forward"})
+    graph["nodes"].append({
+        "id": "decision",
+        "kind": "decision",
+        "kicker": "Classification",
+        "label": "Winning species",
+        "scale": "full size",
+        "module": "argmax",
+        "stride": 1,
+        "column": score_col + 1,
+        "slot": 0,
+        "height": int(height),
+        "width": int(width),
+        "channels": 1,
+        "elev_scale": None,
+        "shape": [1, int(height), int(width)],
+        "parents": ["scores"],
+    })
+    graph["edges"].append({"from": "scores", "to": "decision", "kind": "forward"})
+
+
 def _trace(req):
     """Snapshots of one forward pass, as pictures rather than tensors.
 
@@ -1095,49 +1619,55 @@ def _trace(req):
 
     try:
         with torch.inference_mode():
-            raw = list(_encode_features(model, batch_x, aux, fusion))
-            decoded = model.model.decoder(raw)
-            head_in = decoded
-            if isinstance(decoded, (list, tuple)):
-                spatial = [feat for feat in decoded if _is_spatial(feat)]
-                if not spatial:
-                    raise ValueError("This checkpoint's decoder did not return a picture.")
-                head_in = spatial[-1]
+            encoded = _encode_features(model, batch_x, aux, fusion)
+            raw, prefix = _split_encoded(encoded)
+            has_ndsm = prepared["ndsm"] is not None
+            graph, head_in = _trace_graph(
+                model.model.decoder,
+                raw,
+                prefix,
+                height,
+                width,
+                alpha,
+                fusion,
+                scales,
+                int(batch_x.shape[1]),
+                has_ndsm=has_ndsm,
+            )
+            if not _is_spatial(head_in):
+                raise ValueError("This checkpoint's decoder did not return a picture.")
             logits = model.model.segmentation_head(head_in)
             if not _is_spatial(logits):
                 raise ValueError("This checkpoint did not return a class score for every pixel.")
+            _append_readout(graph, int(logits.shape[1]), height, width)
 
             encoder_stages = []
-            input_channels = int(batch_x.shape[1])
-            for index, feat in enumerate(raw):
-                if not _is_spatial(feat):
+            for node in graph["nodes"]:
+                if node["kind"] != "encoder":
                     continue
-                native_h, native_w = int(feat.shape[-2]), int(feat.shape[-1])
-                native_c = int(feat.shape[1])
-                if native_h == height and native_w == width and native_c <= input_channels:
-                    continue
-                pictures = _feature_pictures(feat, alpha)
-                stride = max(1, int(round(height / float(native_h)))) if native_h else 1
                 encoder_stages.append({
-                    "index": int(index),
-                    "height": pictures["height"],
-                    "width": pictures["width"],
-                    "channels": pictures["channels"],
-                    "stride": stride,
-                    "elev_scale": scales.get(index),
-                    "shape": [1, pictures["channels"], pictures["height"], pictures["width"]],
-                    "energy": pictures["energy"],
-                    "pca": pictures["pca"],
-                    "samples": pictures["samples"],
+                    "index": int(node["id"].split("-", 1)[1]),
+                    "height": node["height"],
+                    "width": node["width"],
+                    "channels": node["channels"],
+                    "stride": node["stride"],
+                    "elev_scale": node.get("elev_scale"),
+                    "shape": node["shape"],
+                    "energy": node.get("energy"),
+                    "pca": node.get("pca"),
+                    "samples": node.get("samples") or [],
                 })
-
-            decoder_view = _feature_pictures(head_in, alpha)
+            source = next((node for node in graph["nodes"] if node["id"] == graph.get("source")), None)
+            if source is None or "pca" not in source:
+                decoder_view = _feature_pictures(head_in, alpha)
+            else:
+                decoder_view = source
             head = _head_facts(model, head_in, logits)
             pred = logits.argmax(dim=1)[0].detach().to(torch.uint8).cpu().numpy()
             logit_min = float(logits.detach().min())
             logit_max = float(logits.detach().max())
             probs = torch.softmax(logits.float(), dim=1)
-            del raw, decoded, head_in, logits
+            del raw, head_in, logits
 
             view_h, view_w = _fit_hw(height, width, TRACE_EDGE)
             preview = F.interpolate(probs, size=(view_h, view_w), mode="bilinear", align_corners=False)
@@ -1261,6 +1791,7 @@ def _trace(req):
         "normalized": _jpeg_b64(norm_vis),
         "ndsm": ndsm_image,
         "ndsm_stats": ndsm_stats,
+        "graph": {"nodes": graph["nodes"], "edges": graph["edges"]},
         "encoder_stages": encoder_stages,
         "decoder": {
             "height": decoder_view["height"],

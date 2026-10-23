@@ -24,6 +24,7 @@
   let attempt = $state(0);
 
   let stageId = $state('input');
+  let hoverId = $state('');
   let featView = $state('pca');
   let channelAt = $state(0);
   let gridOn = $state(false);
@@ -31,19 +32,25 @@
   let mapMode = $state('prediction');
   let probe = $state(null);
   let pinned = $state(false);
+  let pickerOpen = $state(false);
+  let browse = $state([]);
+  let browseLoading = $state(false);
+  let siteFilter = $state('');
+  let roleFilter = $state('all');
+  let speciesFilter = $state('');
 
   let speciesColor = $derived(Object.fromEntries((facets?.species ?? []).map((row) => [row.stats_name, row.color])));
   let ranked = $derived(rankCheckpoints(checkpoints, runs));
   let shown = $derived(trace && traceFor === `${tileId}:${ckpt}` ? trace : null);
   let photoUrl = $derived(shown?.image ? `data:image/jpeg;base64,${shown.image}` : '');
-  let stages = $derived(shown ? buildStages(shown) : []);
-  let stageKind = $derived(kindOf(stageId));
-  let feature = $derived.by(() => {
-    if (!shown) return null;
-    if (stageId === 'decoder') return shown.decoder;
-    if (!stageId.startsWith('enc-')) return null;
-    const index = Number(stageId.slice(4));
-    return shown.encoder_stages?.find((stage) => stage.index === index) ?? null;
+  let layout = $derived(shown ? layoutGraph(shown) : blankLayout());
+  let node = $derived(layout.nodes.find((item) => item.id === stageId) ?? null);
+  let stageKind = $derived(node?.kind || '');
+  let feature = $derived(node && (node.kind === 'encoder' || node.kind === 'decoder') ? node : null);
+  let mixParents = $derived.by(() => {
+    if (!node || node.kind !== 'decoder') return [];
+    const byId = new Map(layout.nodes.map((item) => [item.id, item]));
+    return (node.parents || []).map((id) => byId.get(id)).filter(Boolean);
   });
   let featureUrl = $derived.by(() => {
     if (!feature) return '';
@@ -65,18 +72,6 @@
     return Math.max(1, Math.round(shown.width / feature.width));
   });
   let gridFine = $derived((feature?.width ?? 0) > 96);
-  let strip = $derived.by(() => {
-    const rows = picks.slice();
-    if (tileId && !rows.some((row) => row.tile_id === tileId)) {
-      rows.unshift({
-        tile_id: tileId,
-        thumb: tile?.thumb || `/thumbs/${tileId}.webp`,
-        site_name: tile?.site_name || '',
-        flight: tile?.flight || '',
-      });
-    }
-    return rows;
-  });
 
   function storedTech() {
     try {
@@ -90,83 +85,149 @@
     return data ? `data:image/png;base64,${data}` : '';
   }
 
-  function kindOf(id) {
-    if (id === 'input' || id === 'decoder' || id === 'scores' || id === 'decision') return id;
-    if (id.startsWith('enc-')) return 'encoder';
-    return '';
-  }
-
   function shapeOf(list) {
     if (!list?.length) return '';
     return `(${list.join(', ')})`;
   }
 
-  function scaleTitle(index, total) {
-    if (total <= 1) return 'Features';
-    if (index === 0) return 'Fine detail';
-    if (index === total - 1) return 'Wide view';
-    if (index === 1) return 'Neighborhood';
-    return 'Patches';
+  function blankLayout() {
+    return { nodes: [], edges: [], width: 0, height: 0 };
   }
 
-  function buildStages(data) {
-    const encoders = data.encoder_stages ?? [];
-    const list = [{
-      id: 'input',
-      step: '1',
-      kicker: 'Input',
-      title: 'The photo',
-      w: data.width,
-      h: data.height,
-      thumb: data.image ? `data:image/jpeg;base64,${data.image}` : '',
-      shape: shapeOf(data.input_shape),
-    }];
-    encoders.forEach((stage, index) => {
-      list.push({
-        id: `enc-${stage.index}`,
-        step: `2.${index + 1}`,
-        kicker: 'Encoder',
-        title: scaleTitle(index, encoders.length),
-        w: stage.width,
-        h: stage.height,
-        thumb: png(stage.pca),
-        shape: shapeOf(stage.shape),
-      });
-    });
-    if (data.decoder) {
-      list.push({
-        id: 'decoder',
-        step: '3',
-        kicker: 'Decoder',
-        title: 'Combined',
-        w: data.decoder.width,
-        h: data.decoder.height,
-        thumb: png(data.decoder.pca),
-        shape: shapeOf(data.decoder.shape),
+  function wirePath(x1, y1, x2, y2, kind) {
+    const mid = (x1 + x2) / 2;
+    if (kind === 'skip' || kind === 'aux' || kind === 'fuse') {
+      const bow = Math.min(48, Math.max(18, Math.abs(x2 - x1) * 0.2));
+      const lift = kind === 'aux' ? bow : Math.min(y1, y2) - bow * 0.35;
+      const y = kind === 'aux' ? Math.max(y1, y2) + 28 : lift;
+      return `M ${x1} ${y1} Q ${mid} ${y} ${x2} ${y2}`;
+    }
+    const dx = Math.max(24, Math.abs(x2 - x1) * 0.45);
+    return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+  }
+
+  function layoutGraph(data) {
+    const rawNodes = data.graph?.nodes ?? [];
+    const rawEdges = data.graph?.edges ?? [];
+    if (!rawNodes.length) return blankLayout();
+    const strides = [...new Set(rawNodes.map((item) => item.stride || 1))].sort((a, b) => a - b);
+    const colW = 156;
+    const rowH = 150;
+    const padX = 8;
+    const padY = 56;
+    const groups = new Map();
+    for (const item of rawNodes) {
+      const col = item.column || 0;
+      const row = Math.max(0, strides.indexOf(item.stride || 1));
+      const key = `${col}:${row}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(item);
+    }
+    const maxCol = Math.max(...rawNodes.map((item) => item.column || 0));
+    const width = padX * 2 + (maxCol + 1) * colW;
+    const height = padY * 2 + strides.length * rowH;
+    const placed = new Map();
+    for (const [key, group] of groups) {
+      const [col, row] = key.split(':').map(Number);
+      group.sort((a, b) => (a.slot || 0) - (b.slot || 0));
+      group.forEach((item, index) => {
+        const share = group.length;
+        const thumb = share > 1
+          ? 44
+          : Math.round(Math.min(76, Math.max(42, 84 / Math.sqrt(item.stride || 1))));
+        const boxW = colW - 16;
+        const boxH = (rowH - 10) / share;
+        const x = padX + col * colW + 6;
+        const y = padY + row * rowH + index * boxH;
+        placed.set(item.id, {
+          ...item,
+          x,
+          y,
+          boxW,
+          boxH,
+          thumb,
+          cx: x + boxW / 2,
+          cy: y + thumb / 2 + 2,
+        });
       });
     }
-    const scored = topProb(data);
-    list.push({
-      id: 'scores',
-      step: '4',
-      kicker: 'Scores',
-      title: 'Species scores',
-      w: data.width,
-      h: data.height,
-      thumb: png(scored?.image) || png(data.overlay),
-      shape: `(1, ${data.num_classes}, ${data.height}, ${data.width})`,
+    const edges = rawEdges.map((edge) => {
+      const from = placed.get(edge.from);
+      const to = placed.get(edge.to);
+      if (!from || !to) return null;
+      const x1 = from.x + from.boxW - 4;
+      const y1 = from.cy;
+      const x2 = to.x + 4;
+      const y2 = to.cy;
+      return { ...edge, d: wirePath(x1, y1, x2, y2, edge.kind) };
+    }).filter(Boolean);
+    return { nodes: [...placed.values()], edges, width, height };
+  }
+
+  function nodeThumb(item, data) {
+    if (!item || !data) return '';
+    if (item.kind === 'input') return data.image ? `data:image/jpeg;base64,${data.image}` : '';
+    if (item.kind === 'ndsm') return png(data.ndsm);
+    if (item.kind === 'scores') return png(topProb(data)?.image) || png(data.overlay);
+    if (item.kind === 'decision') return png(data.overlay) || (data.image ? `data:image/jpeg;base64,${data.image}` : '');
+    return png(item.pca);
+  }
+
+  function edgeHot(edge) {
+    const id = hoverId || stageId;
+    return edge.from === id || edge.to === id;
+  }
+
+  function diversify(tiles) {
+    const rank = { test: 0, val: 1, train: 2, unused: 3 };
+    const sorted = tiles.slice().sort((a, b) => {
+      const byRole = (rank[a.cv_role] ?? 9) - (rank[b.cv_role] ?? 9);
+      if (byRole) return byRole;
+      return (b.label_m2 || 0) - (a.label_m2 || 0);
     });
-    list.push({
-      id: 'decision',
-      step: '5',
-      kicker: 'Choice',
-      title: 'Final map',
-      w: data.width,
-      h: data.height,
-      thumb: png(data.overlay) || (data.image ? `data:image/jpeg;base64,${data.image}` : ''),
-      shape: `(1, ${data.height}, ${data.width})`,
-    });
-    return list;
+    const picked = [];
+    const sites = new Set();
+    const seen = new Set();
+    for (const row of sorted) {
+      const names = Array.isArray(row.species) ? row.species.filter((name) => typeof name === 'string') : [];
+      const fresh = names.some((name) => !seen.has(name));
+      if (!fresh || sites.has(row.site_name)) continue;
+      picked.push(row);
+      sites.add(row.site_name);
+      names.forEach((name) => seen.add(name));
+      if (picked.length >= 6) break;
+    }
+    if (picked.length < 4) {
+      for (const row of sorted) {
+        if (picked.some((item) => item.tile_id === row.tile_id)) continue;
+        picked.push(row);
+        if (picked.length >= 6) break;
+      }
+    }
+    return picked;
+  }
+
+  function presentSpecies(row) {
+    const items = row?.species ?? [];
+    return items.filter((spec) => {
+      if (typeof spec === 'string') return true;
+      return (spec?.px || 0) > 0 || (spec?.m2 || 0) > 0;
+    }).slice(0, 6);
+  }
+
+  function speciesKey(spec) {
+    return typeof spec === 'string' ? spec : spec.stats_name || spec.name;
+  }
+
+  function speciesSwatch(spec) {
+    if (typeof spec === 'string') return speciesColor[spec] || '#5d6e74';
+    return spec.color || speciesColor[spec.stats_name] || '#5d6e74';
+  }
+
+  function inputMode(data) {
+    if (!data?.in_channels?.ndsm) return 'Color only';
+    if (data.fusion === 'stem') return 'Color, height at each scale';
+    return 'Color and height together';
   }
 
   function topProb(data) {
@@ -279,29 +340,29 @@
   function featureSummary(stage, data) {
     if (!stage || !data) return '';
     const cover = Math.max(1, Math.round(data.width / stage.width));
-    if (stageId === 'decoder') {
-      return 'The wide view is brought back up to the photo, and the finer scales are mixed back in, so the map can follow plant edges.';
+    const cellText = `Each cell covers ${cover} × ${cover} pixels of the photo.`;
+    if (stage.kind === 'decoder') {
+      const incoming = stage.parents?.length || 0;
+      if (incoming > 1) {
+        return `This block mixes ${incoming} earlier maps into one. ${cellText}`;
+      }
+      return `This block reshapes what the model has learned so far. ${cellText}`;
     }
-    const encoders = data.encoder_stages ?? [];
-    const index = encoders.findIndex((item) => item.index === stage.index);
-    if (index === 0) {
-      return `Fine detail is still here. Each cell of this grid covers ${cover} × ${cover} pixels of the photo.`;
+    if (stage.stride <= 2) {
+      return `Fine detail is still here. ${cellText}`;
     }
-    if (index === encoders.length - 1) {
-      return `Only the broad layout of the tile remains. Each cell covers ${cover} × ${cover} pixels of the photo.`;
+    if (stage.stride >= 16) {
+      return `Only the broad layout of the tile remains. ${cellText}`;
     }
-    return `Plants start to group together. Each cell covers ${cover} × ${cover} pixels of the photo.`;
+    return `Plants start to group together. ${cellText}`;
   }
 
   function featureTech(stage, data) {
     if (!stage || !data) return '';
     const lines = [];
-    if (stageId !== 'decoder') {
-      lines.push(`${data.encoder || 'The encoder'} at 1/${stage.stride || 1} of the photo.`);
-    } else {
-      lines.push(`${data.architecture || 'The'} decoder mixes the earlier scales through skip connections.`);
-    }
-    lines.push(`Tensor ${shapeOf(stage.shape)}.`);
+    if (stage.module) lines.push(stage.module);
+    lines.push(`${stage.kicker || 'Stage'} at ${stage.scale || 'this scale'}.`);
+    if (stage.shape) lines.push(`Tensor ${shapeOf(stage.shape)}.`);
     if (stage.elev_scale != null) {
       lines.push(`Height adjustment at this scale: ${stage.elev_scale}. A larger number means this scale leans more on height.`);
     }
@@ -356,7 +417,10 @@
     if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
     const tag = event.target?.tagName;
     if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
-    const ids = stages.map((stage) => stage.id);
+    const ids = layout.nodes
+      .slice()
+      .sort((a, b) => (a.column - b.column) || ((a.stride || 1) - (b.stride || 1)) || ((a.slot || 0) - (b.slot || 0)))
+      .map((item) => item.id);
     const index = ids.indexOf(stageId);
     const next = index + (event.key === 'ArrowRight' ? 1 : -1);
     if (!ids.length || next < 0 || next >= ids.length) return;
@@ -365,8 +429,18 @@
   }
 
   function chooseTile(id) {
-    if (!id || id === tileId) return;
+    if (!id || id === tileId) {
+      pickerOpen = false;
+      return;
+    }
     tileId = id;
+    pickerOpen = false;
+  }
+
+  function onWindowClick(event) {
+    if (!pickerOpen) return;
+    if (event.target?.closest?.('.sample')) return;
+    pickerOpen = false;
   }
 
   function retry() {
@@ -393,6 +467,12 @@
     const value = item.metrics?.test_f1_species;
     if (value == null || Number.isNaN(Number(value))) return '—';
     return Number(value).toFixed(3);
+  }
+
+  function optionLabel(item) {
+    const val = item.metrics?.val_f1_species;
+    const valText = val == null || Number.isNaN(Number(val)) ? '' : ` · val ${Number(val).toFixed(3)}`;
+    return `${titleOf(item)}${item.ds2 ? ' · half res' : ''} · test ${f1(item)}${valText}`;
   }
 
   function rankCheckpoints(rows, wandbRuns) {
@@ -452,7 +532,7 @@
       role: 'all',
       labelled: 'true',
       sort: 'label_m2',
-      limit: '12',
+      limit: '240',
     });
     fetch('/api/tiles?' + params.toString(), { signal: ctrl.signal })
       .then(async (res) => {
@@ -460,7 +540,7 @@
         return res.json();
       })
       .then((data) => {
-        picks = data.tiles ?? [];
+        picks = diversify(data.tiles ?? []);
         if (!tileId && picks.length) tileId = picks[0].tile_id;
       })
       .catch((err) => {
@@ -471,6 +551,69 @@
       });
     return () => ctrl.abort();
   });
+
+  $effect(() => {
+    if (!pickerOpen) return;
+    const foldName = fold || 'cv3';
+    const site = siteFilter;
+    const role = roleFilter || 'all';
+    const species = speciesFilter;
+    const ctrl = new AbortController();
+    browseLoading = true;
+    const params = new URLSearchParams({
+      fold: foldName,
+      role,
+      labelled: 'true',
+      sort: 'label_m2',
+      limit: '24',
+    });
+    if (site) params.set('site', site);
+    if (species) params.append('species', species);
+    fetch('/api/tiles?' + params.toString(), { signal: ctrl.signal })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await readError(res));
+        return res.json();
+      })
+      .then((data) => {
+        browse = data.tiles ?? [];
+      })
+      .catch((err) => {
+        if (err.name === 'AbortError') return;
+        browse = [];
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) browseLoading = false;
+      });
+    return () => ctrl.abort();
+  });
+
+  async function surprise() {
+    const foldName = fold || 'cv3';
+    const params = new URLSearchParams({
+      fold: foldName,
+      role: roleFilter || 'all',
+      labelled: 'true',
+      sort: 'label_m2',
+      limit: '1',
+      offset: '0',
+    });
+    if (siteFilter) params.set('site', siteFilter);
+    if (speciesFilter) params.append('species', speciesFilter);
+    try {
+      const head = await fetch('/api/tiles?' + params.toString());
+      if (!head.ok) return;
+      const first = await head.json();
+      const total = Math.max(1, Number(first.total) || 1);
+      params.set('offset', String(Math.floor(Math.random() * total)));
+      const res = await fetch('/api/tiles?' + params.toString());
+      if (!res.ok) return;
+      const data = await res.json();
+      const id = data.tiles?.[0]?.tile_id;
+      if (id) chooseTile(id);
+    } catch {
+      /* leave the current tile */
+    }
+  }
 
   $effect(() => {
     const id = tileId;
@@ -562,8 +705,8 @@
         if (dead) return;
         trace = data;
         traceFor = `${id}:${path}`;
-        const ids = buildStages(data).map((stage) => stage.id);
-        if (!ids.includes(stageId)) stageId = 'input';
+        const ids = (data.graph?.nodes ?? []).map((item) => item.id);
+        if (ids.length && !ids.includes(stageId)) stageId = ids[0];
         const top = (data.counts ?? []).slice().sort((a, b) => (b.px || 0) - (a.px || 0))[0];
         if (top) classId = top.id;
         probe = null;
@@ -585,46 +728,12 @@
   });
 </script>
 
-<svelte:window onkeydown={onRailKey} />
+<svelte:window onkeydown={onRailKey} onclick={onWindowClick} />
 
 <div class="model-page">
   <div class="toolbar">
-    <div class="pick">
-      <div class="pick-head">
-        <h2>Tile</h2>
-        {#if tile}
-          <p>{tile.site_name}_{tile.flight} · {tile.acq_date ?? 'date unknown'}</p>
-        {:else if picksLoading}
-          <p>Loading labelled tiles…</p>
-        {:else}
-          <p>Choose a tile to run through the model.</p>
-        {/if}
-      </div>
-      <div class="strip" role="listbox" aria-label="Tiles">
-        {#each strip as item (item.tile_id)}
-          <button
-            type="button"
-            role="option"
-            aria-selected={item.tile_id === tileId}
-            class:on={item.tile_id === tileId}
-            title={[item.site_name, item.flight].filter(Boolean).join(' ') || item.tile_id}
-            onclick={() => chooseTile(item.tile_id)}
-          >
-            <img src={item.thumb} alt="" />
-            {#if item.species?.length && typeof item.species[0] === 'string'}
-              <span class="dots" aria-hidden="true">
-                {#each item.species.slice(0, 4) as name (name)}
-                  <i style:background={speciesColor[name] || '#5d6e74'}></i>
-                {/each}
-              </span>
-            {/if}
-          </button>
-        {/each}
-      </div>
-    </div>
-
     <label class="field">
-      Checkpoint
+      <span class="field-label">Model</span>
       {#if checkpointsLoading || !scoresReady}
         <span class="wait">Loading checkpoints…</span>
       {:else if ranked.length}
@@ -634,13 +743,103 @@
           onchange={() => (touched = true)}
         >
           {#each ranked as item (item.path)}
-            <option value={item.path}>{titleOf(item)}{item.ds2 ? ' · half res' : ''} · test {f1(item)}</option>
+            <option value={item.path}>{optionLabel(item)}</option>
           {/each}
         </select>
       {:else}
         <span class="wait">No checkpoints yet</span>
       {/if}
+      {#if shown}
+        <span class="badge">{shown.architecture || 'Model'} · {shown.encoder || 'encoder'} · {inputMode(shown)}</span>
+      {/if}
     </label>
+
+    <div class="sample">
+      <div class="sample-card">
+        {#if tile}
+          <img src={tile.thumb || `/thumbs/${tile.tile_id}.webp`} alt="" />
+          <span>
+            <strong>{tile.site_name}_{tile.flight}</strong>
+            <em>{tile.acq_date ?? 'date unknown'}</em>
+            {#if presentSpecies(tile).length}
+              <span class="dots" aria-hidden="true">
+                {#each presentSpecies(tile) as spec (speciesKey(spec))}
+                  <i style:background={speciesSwatch(spec)}></i>
+                {/each}
+              </span>
+            {/if}
+          </span>
+        {:else if picksLoading}
+          <span class="wait">Loading a sample tile…</span>
+        {:else}
+          <span class="wait">Choose a tile to run through the model.</span>
+        {/if}
+      </div>
+      <div class="sample-actions">
+        <button type="button" class="text-btn" aria-expanded={pickerOpen} onclick={() => (pickerOpen = !pickerOpen)}>
+          {pickerOpen ? 'Close tiles' : 'Change tile…'}
+        </button>
+        <button type="button" class="text-btn" onclick={surprise}>Random tile</button>
+      </div>
+      {#if pickerOpen}
+        <div class="popover" role="dialog" aria-label="Choose a tile">
+          {#if picks.length}
+            <p class="pop-label">Different sites and species</p>
+            <div class="pop-row">
+              {#each picks as item (item.tile_id)}
+                <button type="button" class="mini-tile" class:on={item.tile_id === tileId} onclick={() => chooseTile(item.tile_id)}>
+                  <img src={item.thumb} alt="" />
+                  <span>{item.site_name}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+          <div class="filters">
+            <label>
+              Site
+              <select bind:value={siteFilter}>
+                <option value="">All sites</option>
+                {#each facets?.sites ?? [] as site}
+                  <option value={site}>{site}</option>
+                {/each}
+              </select>
+            </label>
+            <label>
+              Role
+              <select bind:value={roleFilter}>
+                <option value="all">All</option>
+                <option value="test">Test</option>
+                <option value="val">Val</option>
+                <option value="train">Train</option>
+              </select>
+            </label>
+            <label>
+              Species
+              <select bind:value={speciesFilter}>
+                <option value="">Any</option>
+                {#each facets?.species ?? [] as spec}
+                  <option value={spec.stats_name}>{spec.name}</option>
+                {/each}
+              </select>
+            </label>
+          </div>
+          {#if browseLoading}
+            <p class="hint">Loading tiles…</p>
+          {:else if browse.length}
+            <div class="browse">
+              {#each browse as item (item.tile_id)}
+                <button type="button" class="mini-tile" class:on={item.tile_id === tileId} onclick={() => chooseTile(item.tile_id)}>
+                  <img src={item.thumb} alt="" />
+                  <span>{item.site_name}</span>
+                </button>
+              {/each}
+            </div>
+          {:else}
+            <p class="hint">No labelled tiles match these filters.</p>
+          {/if}
+        </div>
+      {/if}
+    </div>
 
     <button
       type="button"
@@ -667,7 +866,7 @@
   {#if shown}
     <div class:dimmed={busy}>
       <p class="lede">
-        A photo goes in. The model looks at it at several scales, gives every pixel a score for each species, then keeps the winner.
+        This is the model itself, drawn left to right. Blocks sit lower when they look at less detail. Open one to see what it did to this tile.
       </p>
       {#if tech}
         <p class="tech-line">
@@ -679,26 +878,50 @@
         <p class="hint">Loaded from a saved trace.</p>
       {/if}
 
-      <div class="rail" role="tablist" aria-label="Steps inside the model">
-        {#each stages as stage, index (stage.id)}
-          {#if index}<span class="chev" aria-hidden="true"></span>{/if}
-          <button
-            type="button"
-            role="tab"
-            class="card"
-            class:on={stageId === stage.id}
-            aria-selected={stageId === stage.id}
-            onclick={() => (stageId = stage.id)}
-          >
-            <span class="step">{stage.step}</span>
-            <span class="thumb"><img src={stage.thumb} alt="" /></span>
-            <span class="kicker">{stage.kicker}</span>
-            <strong>{stage.title}</strong>
-            <span class="size">{stage.w.toLocaleString()} × {stage.h.toLocaleString()} px</span>
-            {#if tech && stage.shape}<span class="shape">{stage.shape}</span>{/if}
-          </button>
-        {/each}
+      <div class="arch-scroll">
+        <div
+          class="arch"
+          style:width="{layout.width}px"
+          style:height="{layout.height}px"
+          role="tablist"
+          aria-label="Model architecture"
+        >
+          <svg class="wires" width={layout.width} height={layout.height} aria-hidden="true">
+            {#each layout.edges as edge (`${edge.from}-${edge.to}-${edge.kind}`)}
+              <path d={edge.d} class="wire {edge.kind}" class:hot={edgeHot(edge)} />
+            {/each}
+          </svg>
+          {#each layout.nodes as item (item.id)}
+            <button
+              type="button"
+              role="tab"
+              class="node"
+              class:on={stageId === item.id}
+              aria-selected={stageId === item.id}
+              style:left="{item.x}px"
+              style:top="{item.y}px"
+              style:width="{item.boxW}px"
+              style:height="{item.boxH}px"
+              onclick={() => (stageId = item.id)}
+              onpointerenter={() => (hoverId = item.id)}
+              onpointerleave={() => (hoverId = '')}
+            >
+              <span class="thumb" style:width="{item.thumb}px" style:height="{item.thumb}px">
+                <img src={nodeThumb(item, shown)} alt="" />
+              </span>
+              <span class="kicker">{item.kicker}</span>
+              <strong>{item.label}</strong>
+              <span class="size">{item.scale}{#if tech && item.channels} · {item.channels} ch{/if}</span>
+            </button>
+          {/each}
+        </div>
       </div>
+      <p class="legend">
+        <i class="key forward"></i> main path
+        <i class="key skip"></i> detail carried across
+        <i class="key fuse"></i> scales mixed together
+        {#if shown.ndsm}<i class="key aux"></i> canopy height{/if}
+      </p>
 
       <section class="inspect" aria-live="polite">
         {#if stageKind === 'input'}
@@ -751,9 +974,39 @@
               {/if}
             </dl>
           {/if}
+        {:else if stageKind === 'ndsm'}
+          <h2>Canopy height</h2>
+          <p>{heightSummary(shown)}</p>
+          {#if shown.ndsm}
+            <figure class="solo">
+              <div class="frame" style:aspect-ratio={`${shown.width} / ${shown.height}`}>
+                <img class="photo" src={png(shown.ndsm)} alt="Canopy height" />
+              </div>
+              <figcaption>Brighter means the canopy stands taller above the ground.</figcaption>
+            </figure>
+          {/if}
+          {#if tech}
+            <p class="tech-copy">{fusionDetail(shown)}</p>
+          {/if}
         {:else if feature}
-          <h2>{stages.find((stage) => stage.id === stageId)?.title}</h2>
+          <h2>{feature.label}</h2>
           <p>{featureSummary(feature, shown)}</p>
+          {#if mixParents.length > 1}
+            <div class="mix" aria-label="What this block combines">
+              {#each mixParents as parent, index (parent.id)}
+                {#if index}<span class="plus" aria-hidden="true">+</span>{/if}
+                <figure>
+                  <img src={nodeThumb(parent, shown)} alt="" />
+                  <figcaption>{parent.label} · {parent.scale}</figcaption>
+                </figure>
+              {/each}
+              <span class="plus" aria-hidden="true">→</span>
+              <figure>
+                <img src={featureUrl} alt="" />
+                <figcaption>{feature.label} · {feature.scale}</figcaption>
+              </figure>
+            </div>
+          {/if}
           <div class="views" role="group" aria-label="Feature picture">
             <button type="button" class:on={featView === 'pca'} aria-pressed={featView === 'pca'} onclick={() => (featView = 'pca')}>Grouping</button>
             <button type="button" class:on={featView === 'energy'} aria-pressed={featView === 'energy'} onclick={() => (featView = 'energy')}>Activity</button>
@@ -972,17 +1225,159 @@
 
   .toolbar {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(220px, 340px) auto;
-    gap: 14px 16px;
-    align-items: end;
+    grid-template-columns: minmax(240px, 1.15fr) minmax(260px, 1fr) auto;
+    gap: 14px 18px;
+    align-items: start;
     margin-bottom: 14px;
   }
 
-  .pick-head {
+  .field { margin: 0; }
+
+  .field-label {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--mist);
+  }
+
+  .badge {
+    display: block;
+    margin-top: 6px;
+    color: var(--mist);
+    font-size: 13px;
+  }
+
+  .sample { position: relative; }
+
+  .sample-card {
     display: flex;
-    align-items: baseline;
     gap: 10px;
-    margin-bottom: 6px;
+    align-items: center;
+    min-height: 56px;
+  }
+
+  .sample-card img {
+    width: 56px;
+    height: 56px;
+    object-fit: cover;
+    background: #8ea09a;
+    flex: none;
+  }
+
+  .sample-card strong, .sample-card em {
+    display: block;
+    font-style: normal;
+  }
+
+  .sample-card em, .sample-card .wait { color: var(--mist); font-size: 13px; }
+
+  .sample-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+  }
+
+  .dots {
+    display: flex;
+    gap: 3px;
+    margin-top: 4px;
+  }
+
+  .dots i {
+    width: 7px;
+    height: 7px;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7);
+  }
+
+  .text-btn, .tech-btn, .retry, .views button, .grid-row button, .channels button, .class-grid button {
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--ink);
+  }
+
+  .text-btn {
+    height: 28px;
+    padding: 0 10px;
+    font-size: 13px;
+  }
+
+  .popover {
+    position: absolute;
+    z-index: 5;
+    top: calc(100% + 6px);
+    left: 0;
+    width: min(520px, 80vw);
+    padding: 12px;
+    background: var(--sheet);
+    border: 1px solid var(--line);
+    box-shadow: 0 12px 32px rgba(18, 32, 36, 0.12);
+  }
+
+  .pop-label {
+    margin: 0 0 6px;
+    font-size: 12px;
+    color: var(--mist);
+  }
+
+  .pop-row, .browse {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .browse { margin-top: 10px; max-height: 280px; overflow: auto; }
+
+  .mini-tile {
+    width: 76px;
+    padding: 0;
+    border: 1px solid var(--line);
+    background: #8ea09a;
+    color: var(--ink);
+    text-align: left;
+  }
+
+  .mini-tile.on { border-color: var(--canopy); }
+
+  .mini-tile img {
+    display: block;
+    width: 100%;
+    height: 56px;
+    object-fit: cover;
+  }
+
+  .mini-tile span {
+    display: block;
+    padding: 3px 4px 4px;
+    font-size: 10px;
+    background: var(--sheet);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .filters {
+    display: grid;
+    grid-template-columns: 1.3fr 0.7fr 1fr;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .filters label {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 11px;
+    color: var(--mist);
+  }
+
+  .wait {
+    display: flex;
+    align-items: center;
+    min-height: 32px;
+    color: var(--mist);
+    font-size: 13px;
   }
 
   h2 {
@@ -993,70 +1388,8 @@
     letter-spacing: -0.03em;
   }
 
-  .pick-head p, .lede, .hint, .tech-line, .tech-copy, figcaption {
+  .lede, .hint, .tech-line, .tech-copy, figcaption, .legend {
     color: var(--mist);
-  }
-
-  .pick-head p { margin: 0; font-size: 13px; }
-
-  .strip {
-    display: flex;
-    gap: 6px;
-    overflow-x: auto;
-    padding-bottom: 2px;
-  }
-
-  .strip button {
-    position: relative;
-    flex: none;
-    width: 64px;
-    height: 64px;
-    padding: 0;
-    border: 1px solid var(--line);
-    background: #8ea09a;
-  }
-
-  .strip button.on {
-    border-color: var(--canopy);
-    box-shadow: inset 0 0 0 1px var(--canopy);
-  }
-
-  .dots {
-    position: absolute;
-    left: 3px;
-    right: 3px;
-    bottom: 3px;
-    display: flex;
-    gap: 2px;
-  }
-
-  .dots i {
-    width: 6px;
-    height: 6px;
-    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7);
-  }
-
-  .strip img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
-  }
-
-  .field { margin: 0; }
-
-  .wait {
-    display: flex;
-    align-items: center;
-    min-height: 32px;
-    color: var(--mist);
-    font-size: 13px;
-  }
-
-  .tech-btn, .retry, .views button, .grid-row button, .channels button, .class-grid button {
-    border: 1px solid var(--line);
-    background: transparent;
-    color: var(--ink);
   }
 
   .tech-btn {
@@ -1108,80 +1441,137 @@
 
   .dimmed { opacity: 0.55; }
 
-  .rail {
-    display: flex;
-    align-items: center;
-    gap: 0;
+  .arch-scroll {
     overflow-x: auto;
-    padding: 2px 0 14px;
+    padding-bottom: 8px;
   }
 
-  .chev {
-    flex: none;
-    width: 14px;
-    height: 14px;
-    margin: 0 4px 36px;
-    border-top: 1.5px solid var(--quiet);
-    border-right: 1.5px solid var(--quiet);
-    transform: rotate(45deg);
+  .arch {
+    position: relative;
+    min-width: 100%;
   }
 
-  .card {
-    flex: none;
-    width: 132px;
+  .wires {
+    position: absolute;
+    inset: 0;
+    overflow: visible;
+    pointer-events: none;
+  }
+
+  .wire {
+    fill: none;
+    stroke: color-mix(in srgb, var(--quiet) 80%, var(--ink));
+    stroke-width: 1.4;
+    opacity: 0.45;
+  }
+
+  .wire.skip, .wire.fuse {
+    stroke-dasharray: 4 4;
+  }
+
+  .wire.aux { stroke: #2f6f62; }
+
+  .wire.hot {
+    opacity: 1;
+    stroke: var(--canopy);
+    stroke-width: 2;
+  }
+
+  .node {
+    position: absolute;
     display: flex;
     flex-direction: column;
-    gap: 3px;
-    padding: 6px;
-    border: 1px solid var(--line);
-    background: var(--sheet);
+    align-items: center;
+    gap: 2px;
+    padding: 4px 4px 0;
+    border: 1px solid transparent;
+    background: transparent;
     color: var(--ink);
-    text-align: left;
+    text-align: center;
+    overflow: hidden;
   }
 
-  .card.on {
-    border-color: var(--canopy);
-    background: color-mix(in srgb, var(--canopy) 8%, white);
+  .node.on .thumb {
+    box-shadow: 0 0 0 2px var(--canopy);
   }
 
-  .step {
-    font-size: 11px;
-    letter-spacing: 0.04em;
-    color: var(--mist);
-  }
-
-  .thumb {
+  .node .thumb {
     display: block;
-    aspect-ratio: 1;
     overflow: hidden;
     background: #8ea09a;
+    border: 1px solid var(--line);
+    box-shadow: 2px 2px 0 color-mix(in srgb, var(--ink) 12%, transparent);
   }
 
-  .thumb img, .channels img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
-  }
-
-  .card .kicker {
-    margin-top: 4px;
-    font-size: 11px;
+  .node .kicker {
+    font-size: 10px;
     letter-spacing: 0.04em;
     text-transform: uppercase;
     color: var(--mist);
   }
 
-  .card strong {
-    font-size: 13px;
-    font-weight: 600;
+  .node strong {
+    font-size: 12px;
+    font-weight: 620;
     letter-spacing: -0.01em;
+    line-height: 1.15;
   }
 
-  .size, .shape {
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
+  .node .size {
+    font-size: 10px;
     color: var(--mist);
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    align-items: center;
+    margin: 0 0 14px;
+    font-size: 12px;
+  }
+
+  .key {
+    width: 22px;
+    height: 0;
+    border-top: 2px solid var(--quiet);
+  }
+
+  .key.skip, .key.fuse { border-top-style: dashed; }
+  .key.aux { border-top-color: #2f6f62; }
+  .key.forward { border-top-color: var(--ink); }
+
+  .mix {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: flex-end;
+    margin-top: 12px;
+  }
+
+  .mix figure { width: 92px; }
+
+  .mix img {
+    width: 92px;
+    height: 92px;
+    object-fit: cover;
+    background: #8ea09a;
+    image-rendering: pixelated;
+  }
+
+  .plus {
+    align-self: center;
+    color: var(--mist);
+    font-size: 18px;
+  }
+
+  .solo { max-width: 520px; margin-top: 12px; }
+
+  .thumb img, .channels img, .node img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
   }
 
   .shape { font-family: ui-monospace, monospace; }
@@ -1389,7 +1779,6 @@
   }
 
   @media (max-width: 860px) {
-    .toolbar, .pair, .split, dl div { grid-template-columns: 1fr; }
-    .chev { margin-bottom: 0; }
+    .toolbar, .pair, .split, .filters, dl div { grid-template-columns: 1fr; }
   }
 </style>

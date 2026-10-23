@@ -599,7 +599,7 @@ PRED_VERSION = 1
 PRED_CAP_BYTES = 2 * 1024 ** 3
 TRACE_DIR = CACHE / "traces"
 TRACE_INDEX = TRACE_DIR / "index.json"
-TRACE_VERSION = 1
+TRACE_VERSION = 2
 TRACE_CAP_BYTES = 1024 ** 3
 _pred_lock = threading.RLock()
 
