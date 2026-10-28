@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "explorer"))
 
-from common import IGNORE_COLORS, load_names  # noqa: E402
+from common import IGNORE_COLORS, THUMB_PX, load_names  # noqa: E402
 
 warnings.filterwarnings("ignore")
 
@@ -39,6 +39,11 @@ SALIENCY_EDGE = 1024
 _model = None
 _model_path = None
 _device = None
+# Activation bytes per tile, and the smallest stack that did not fit, by
+# (checkpoint, height, width). The next forward is sized from free VRAM.
+_batch_cost = {}
+_batch_fail = {}
+_MAX_STACK = 32
 
 
 def _reply(payload):
@@ -232,6 +237,61 @@ def _jpeg_b64(rgb):
     buf = io.BytesIO()
     Image.fromarray(rgb, mode="RGB").save(buf, format="JPEG", quality=90)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _webp_b64(rgba, edge=None):
+    """Square thumbnail of an RGBA overlay. Nearest keeps class edges crisp."""
+    edge = THUMB_PX if edge is None else int(edge)
+    image = Image.fromarray(np.ascontiguousarray(rgba), mode="RGBA")
+    if image.size != (edge, edge):
+        image = image.resize((edge, edge), Image.Resampling.NEAREST)
+    buf = io.BytesIO()
+    image.save(buf, format="WEBP", quality=80, method=0)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _score_f1(tp, fp, fn):
+    denom = 2 * tp + fp + fn
+    if denom <= 0:
+        return None
+    return 2.0 * tp / denom
+
+
+def _score_iou(tp, fp, fn):
+    denom = tp + fp + fn
+    if denom <= 0:
+        return None
+    return tp / denom
+
+
+def _score_precision(tp, fp):
+    denom = tp + fp
+    if denom <= 0:
+        return None
+    return tp / denom
+
+
+def _score_recall(tp, fn):
+    denom = tp + fn
+    if denom <= 0:
+        return None
+    return tp / denom
+
+
+def _mean_defined(values):
+    nums = [value for value in values if value is not None]
+    if not nums:
+        return None
+    return sum(nums) / len(nums)
+
+
+def _round_metric(value):
+    if value is None:
+        return None
+    value = float(value)
+    if math.isnan(value) or math.isinf(value):
+        return None
+    return round(value, 6)
 
 
 def _explain_request(req, num_classes):
@@ -849,7 +909,7 @@ def _head_facts(model, decoded, logits):
     }
 
 
-def _inputs(req):
+def _inputs(req, on_device=True):
     """Tile tensors for one checkpoint, prepared the same way as test.py."""
     import cv2
     import torch
@@ -928,9 +988,10 @@ def _inputs(req):
         batch_x = torch.cat(parts, dim=1)
         aux = None
 
-    batch_x = batch_x.to(device)
-    if aux is not None:
-        aux = aux.to(device)
+    if on_device:
+        batch_x = batch_x.to(device)
+        if aux is not None:
+            aux = aux.to(device)
     return {
         "model": model,
         "batch_x": batch_x,
@@ -951,6 +1012,128 @@ def _inputs(req):
         "std": std,
         "ndsm_mean": ndsm_mean,
         "ndsm_std": ndsm_std,
+    }
+
+
+def _tile_metrics(pred, label, alpha, classes):
+    """Per-tile scores from the prediction and, when present, the label.
+
+    Valid pixels sit inside the photo and are not marked unlabelled (254) or
+    uncertain (255). Species averages skip a class that is absent from both
+    the label and the prediction, matching ``metrics_from_confusion``.
+    """
+    visible = alpha > 0
+    by_id = {spec["id"]: spec for spec in classes}
+    pred_px = int(((pred > 0) & visible).sum())
+
+    def _row(class_id, spec, px, scored=None):
+        row = {
+            "id": int(class_id),
+            "stats_name": spec.get("stats_name") or "",
+            "name": spec["name"],
+            "color": spec["color"],
+            "px": int(px),
+        }
+        if scored is None:
+            return row
+        tp, fp, fn = scored
+        row.update({
+            "tp": int(tp),
+            "fp": int(fp),
+            "fn": int(fn),
+            "f1": _round_metric(_score_f1(tp, fp, fn)),
+            "iou": _round_metric(_score_iou(tp, fp, fn)),
+            "precision": _round_metric(_score_precision(tp, fp)),
+            "recall": _round_metric(_score_recall(tp, fn)),
+        })
+        return row
+
+    if label is None:
+        counts = []
+        for class_id, spec in by_id.items():
+            if class_id == 0:
+                continue
+            px = int(((pred == class_id) & visible).sum())
+            if px <= 0:
+                continue
+            counts.append(_row(class_id, spec, px))
+        return {
+            "agreement": None,
+            "agreement_species": None,
+            "f1_species": None,
+            "iou_species": None,
+            "precision_species": None,
+            "recall_species": None,
+            "binary_f1": None,
+            "binary_iou": None,
+            "pred_px": pred_px,
+            "label_px": None,
+            "tp_px": None,
+            "fp_px": None,
+            "fn_px": None,
+            "wrong_species_px": None,
+            "valid_px": int(visible.sum()),
+            "correct_px": None,
+            "bin_tp": None,
+            "bin_fp": None,
+            "bin_fn": None,
+            "counts": counts,
+        }
+
+    valid = visible & (label != 254) & (label != 255)
+    valid_px = int(valid.sum())
+    correct_px = int((valid & (pred == label)).sum()) if valid_px else 0
+    species_ref = valid & (label > 0)
+    label_px = int(species_ref.sum())
+    tp_px = int((species_ref & (pred == label)).sum())
+    fp_px = int((valid & (pred > 0) & (label == 0)).sum())
+    fn_px = int((valid & (label > 0) & (pred == 0)).sum())
+    wrong_species_px = int((valid & (pred > 0) & (label > 0) & (pred != label)).sum())
+    bin_tp = int((valid & (pred > 0) & (label > 0)).sum())
+    bin_fp = fp_px
+    bin_fn = fn_px
+
+    f1s, ious, precs, recs = [], [], [], []
+    counts = []
+    for class_id, spec in by_id.items():
+        if class_id == 0:
+            continue
+        tp = int(((pred == class_id) & (label == class_id) & valid).sum())
+        fp = int(((pred == class_id) & (label != class_id) & valid).sum())
+        fn = int(((label == class_id) & (pred != class_id) & valid).sum())
+        px = int(((pred == class_id) & visible).sum())
+        if tp + fp + fn > 0:
+            f1s.append(_score_f1(tp, fp, fn))
+            ious.append(_score_iou(tp, fp, fn))
+        if tp + fp > 0:
+            precs.append(_score_precision(tp, fp))
+        if tp + fn > 0:
+            recs.append(_score_recall(tp, fn))
+        if px <= 0 and tp + fp + fn <= 0:
+            continue
+        counts.append(_row(class_id, spec, px, (tp, fp, fn)))
+
+    return {
+        "agreement": _round_metric((correct_px / valid_px) if valid_px else None),
+        "agreement_species": _round_metric((tp_px / label_px) if label_px else None),
+        "f1_species": _round_metric(_mean_defined(f1s)),
+        "iou_species": _round_metric(_mean_defined(ious)),
+        "precision_species": _round_metric(_mean_defined(precs)),
+        "recall_species": _round_metric(_mean_defined(recs)),
+        "binary_f1": _round_metric(_score_f1(bin_tp, bin_fp, bin_fn)),
+        "binary_iou": _round_metric(_score_iou(bin_tp, bin_fp, bin_fn)),
+        "pred_px": pred_px,
+        "label_px": label_px,
+        "tp_px": tp_px,
+        "fp_px": fp_px,
+        "fn_px": fn_px,
+        "wrong_species_px": wrong_species_px,
+        "valid_px": valid_px,
+        "correct_px": correct_px,
+        "bin_tp": bin_tp,
+        "bin_fp": bin_fp,
+        "bin_fn": bin_fn,
+        "counts": counts,
     }
 
 
@@ -995,54 +1178,42 @@ def _predict(req):
     overlay = lut[pred]
     overlay[alpha == 0, 3] = 0
     label_overlay = None
-    agreement = None
-    agreement_species = None
     if label is not None:
         shown = label.copy()
         shown[alpha == 0] = 0
         label_overlay = lut[shown]
         label_overlay[alpha == 0, 3] = 0
-        valid = (alpha > 0) & (label != 254) & (label != 255)
-        if int(valid.sum()) > 0:
-            agreement = float((pred[valid] == label[valid]).mean())
-        species = valid & (label > 0)
-        if int(species.sum()) > 0:
-            agreement_species = float((pred[species] == label[species]).mean())
+    metrics = _tile_metrics(pred, label, alpha, classes)
 
-    by_id = {spec["id"]: spec for spec in classes}
-    counts = []
-    visible = alpha > 0
-    scored = None if label is None else (alpha > 0) & (label != 254) & (label != 255)
-    for class_id, spec in by_id.items():
-        if class_id == 0:
-            continue
-        px = int(((pred == class_id) & visible).sum())
-        row = {
-            "id": class_id,
-            "name": spec["name"],
-            "color": spec["color"],
-            "px": px,
-        }
-        if scored is not None:
-            row["tp"] = int(((pred == class_id) & (label == class_id) & scored).sum())
-            row["fp"] = int(((pred == class_id) & (label != class_id) & scored).sum())
-            row["fn"] = int(((label == class_id) & (pred != class_id) & scored).sum())
-        if px <= 0 and not (row.get("tp") or row.get("fp") or row.get("fn")):
-            continue
-        counts.append(row)
-
-    comparison = None
+    comparison_rgba = None
     if label is not None:
-        comparison = _png_b64(_comparison(pred, label, alpha, lut))
+        comparison_rgba = _comparison(pred, label, alpha, lut)
 
     return {
         "ok": True,
         "width": width,
         "height": height,
         "ds2": ds2,
-        "agreement": agreement,
-        "agreement_species": agreement_species,
-        "counts": counts,
+        "agreement": metrics["agreement"],
+        "agreement_species": metrics["agreement_species"],
+        "f1_species": metrics["f1_species"],
+        "iou_species": metrics["iou_species"],
+        "precision_species": metrics["precision_species"],
+        "recall_species": metrics["recall_species"],
+        "binary_f1": metrics["binary_f1"],
+        "binary_iou": metrics["binary_iou"],
+        "pred_px": metrics["pred_px"],
+        "label_px": metrics["label_px"],
+        "tp_px": metrics["tp_px"],
+        "fp_px": metrics["fp_px"],
+        "fn_px": metrics["fn_px"],
+        "wrong_species_px": metrics["wrong_species_px"],
+        "valid_px": metrics["valid_px"],
+        "correct_px": metrics["correct_px"],
+        "bin_tp": metrics["bin_tp"],
+        "bin_fp": metrics["bin_fp"],
+        "bin_fn": metrics["bin_fn"],
+        "counts": metrics["counts"],
         "classes": _class_rows(classes, display_order),
         "explain": explain,
         "target_class": target_class,
@@ -1051,8 +1222,218 @@ def _predict(req):
         "image": _jpeg_b64(rgb),
         "overlay": _png_b64(overlay),
         "label": None if label_overlay is None else _png_b64(label_overlay),
-        "comparison": comparison,
+        "comparison": None if comparison_rgba is None else _png_b64(comparison_rgba),
     }
+
+
+def _batch_tile_payload(prepared, pred):
+    """Scores and 256 px overlays for one class map."""
+    import cv2
+
+    height = prepared["height"]
+    width = prepared["width"]
+    alpha = prepared["alpha"]
+    label = prepared["label"]
+    if pred.shape != (height, width):
+        pred = cv2.resize(pred, (width, height), interpolation=cv2.INTER_NEAREST)
+    pred = np.array(pred, copy=True)
+    pred[alpha == 0] = 0
+    lut, classes, _display_order = _lut()
+    overlay = lut[pred]
+    overlay[alpha == 0, 3] = 0
+    comparison = None
+    if label is not None:
+        comparison = _comparison(pred, label, alpha, lut)
+    return {
+        "ok": True,
+        "width": width,
+        "height": height,
+        "ds2": prepared["ds2"],
+        "metrics": _tile_metrics(pred, label, alpha, classes),
+        "pred_webp": _webp_b64(overlay),
+        "comp_webp": None if comparison is None else _webp_b64(comparison),
+    }
+
+
+def _start_batch(height, width):
+    """CPU fallback. A 2048 px tile is much heavier than a half-res one."""
+    return 4 if max(int(height), int(width)) > 1024 else 8
+
+
+def _vram_budget():
+    """Bytes the next forward may spend, leaving room for fragmentation."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    torch.cuda.synchronize()
+    free, _total = torch.cuda.mem_get_info()
+    reusable = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    return max(0, int((free + max(0, reusable)) * 0.85))
+
+
+def _fit_stack(cap_key, height, width, available):
+    """Largest stack that should fit in the memory free right now.
+
+    The first call for a checkpoint is one tile, so its measured cost can size
+    the rest. A size that ran out of memory is not tried again.
+    """
+    available = max(1, min(int(available), _MAX_STACK))
+    budget = _vram_budget()
+    if budget is None:
+        return min(available, _start_batch(height, width))
+    cost = _batch_cost.get(cap_key)
+    if not cost:
+        return 1
+    fitted = max(1, budget // int(cost))
+    failed = _batch_fail.get(cap_key)
+    if failed:
+        fitted = min(fitted, max(1, int(failed) - 1))
+    return max(1, min(available, fitted, _MAX_STACK))
+
+
+def _class_maps(model, prepared_rows):
+    """Class ids for one stack. Skips softmax: argmax is unchanged by it.
+
+    Raises torch.cuda.OutOfMemoryError when the stack does not fit.
+    """
+    import torch
+
+    batch_x = torch.cat([row["batch_x"] for row in prepared_rows], dim=0)
+    aux = None
+    if prepared_rows[0]["aux"] is not None:
+        aux = torch.cat([row["aux"] for row in prepared_rows], dim=0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch_x = batch_x.to(device)
+    if aux is not None:
+        aux = aux.to(device)
+    logits = None
+    try:
+        with torch.inference_mode():
+            if device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = model._forward(batch_x, aux)
+            else:
+                logits = model._forward(batch_x, aux)
+            return logits.argmax(dim=1).to(dtype=torch.uint8).cpu().numpy()
+    finally:
+        del logits, batch_x, aux
+
+
+def _remember_cost(cap_key, count, delta):
+    if delta is None or count <= 0:
+        return
+    _batch_cost[cap_key] = max(1, int(delta) // int(count))
+
+
+def _run_chunk(model, chunk):
+    """Class maps, plus the activation bytes this stack peaked at."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return _class_maps(model, chunk), None
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    maps = _class_maps(model, chunk)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+    return maps, max(1, int(peak) - int(before))
+
+
+def _score_prepared(model, prepared, cap_key):
+    """Stack as many tiles as free VRAM allows. Halve that stack after an OOM."""
+    import torch
+
+    height = prepared[0]["height"]
+    width = prepared[0]["width"]
+    maps_out = [None] * len(prepared)
+    index = 0
+    noted = None
+    while index < len(prepared):
+        size = _fit_stack(cap_key, height, width, len(prepared) - index)
+        while True:
+            chunk = prepared[index:index + size]
+            try:
+                maps, delta = _run_chunk(model, chunk)
+                break
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if size == 1:
+                    raise ValueError("The GPU ran out of memory.")
+                failed = _batch_fail.get(cap_key)
+                _batch_fail[cap_key] = size if failed is None else min(failed, size)
+                budget = _vram_budget()
+                half = max(1, size // 2)
+                if budget:
+                    _batch_cost[cap_key] = max(int(_batch_cost.get(cap_key) or 1), budget // half)
+                size = half
+        _remember_cost(cap_key, len(chunk), delta)
+        if noted != size:
+            budget = _vram_budget()
+            if budget is None:
+                room = "cpu"
+            else:
+                room = f"{budget / (1024 ** 3):.1f} GB free"
+            print(
+                f"batch stack {size} for {height}x{width} ({room})",
+                file=sys.stderr,
+                flush=True,
+            )
+            noted = size
+        for offset, plane in enumerate(maps):
+            maps_out[index + offset] = plane
+        index += len(maps)
+    return maps_out
+
+
+def _predict_batch(req):
+    """Class masks and scores for one tile, or for a list of tiles.
+
+    Tiles that share a size share one forward pass. A single-tile request
+    keeps the old response shape. Skips importance maps.
+    """
+    listed = req.get("tiles")
+    single = listed is None
+    tiles = [{"image": req.get("image"), "mask": req.get("mask")}] if single else list(listed)
+    ckpt = req["ckpt"]
+    ready = []
+    errors = {}
+    for index, tile in enumerate(tiles):
+        one = {"ckpt": ckpt, "image": tile.get("image"), "mask": tile.get("mask")}
+        try:
+            ready.append((index, _inputs(one, on_device=False)))
+        except (OSError, ValueError, rasterio.errors.RasterioIOError) as exc:
+            errors[index] = str(exc)
+    groups = {}
+    for index, row in ready:
+        key = (
+            int(row["height"]),
+            int(row["width"]),
+            int(row["batch_x"].shape[1]),
+            row["aux"] is not None,
+        )
+        groups.setdefault(key, []).append((index, row))
+    results = [None] * len(tiles)
+    ckpt_path = str(Path(ckpt).resolve())
+    for key, rows in groups.items():
+        model = rows[0][1]["model"]
+        cap_key = (ckpt_path, key[0], key[1])
+        try:
+            maps = _score_prepared(model, [row for _index, row in rows], cap_key)
+        except ValueError as exc:
+            for index, _row in rows:
+                errors[index] = str(exc)
+            continue
+        for (index, row), plane in zip(rows, maps):
+            results[index] = _batch_tile_payload(row, plane)
+            row["batch_x"] = None
+            row["aux"] = None
+    for index, message in errors.items():
+        results[index] = {"ok": False, "error": message}
+    if single:
+        return results[0]
+    return {"ok": True, "results": results}
 
 
 def _split_encoded(encoded):
@@ -1839,6 +2220,8 @@ def main():
                 payload = _release()
             elif cmd == "predict":
                 payload = _predict(req)
+            elif cmd == "predict_batch":
+                payload = _predict_batch(req)
             elif cmd == "trace":
                 payload = _trace(req)
             else:

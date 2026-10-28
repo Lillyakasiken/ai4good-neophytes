@@ -3,7 +3,7 @@
   import Zoom from './Zoom.svelte';
   import { paintImportance, paintIsolate } from './isolate.js';
 
-  let { tileId, thumb, mask, focusColor = $bindable(''), onopenmodel = null } = $props();
+  let { tileId, thumb, mask, focusColor = $bindable(''), onopenmodel = null, initialCkpt = '' } = $props();
 
   let checkpoints = $state([]);
   let checkpointsLoading = $state(true);
@@ -160,6 +160,12 @@
   });
 
   $effect(() => {
+    if (!initialCkpt) return;
+    touched = true;
+    ckpt = initialCkpt;
+  });
+
+  $effect(() => {
     const id = tileId;
     const path = ckpt;
     const key = `${id}:${path}`;
@@ -272,7 +278,7 @@
       .then((data) => {
         checkpoints = data.checkpoints ?? [];
         listError = '';
-        if (!touched) ckpt = bestPath(rankCheckpoints(checkpoints, runs));
+        if (!touched && !initialCkpt) ckpt = bestPath(rankCheckpoints(checkpoints, runs));
       })
       .catch((err) => {
         if (err.name === 'AbortError') return;
@@ -294,7 +300,7 @@
       .then((data) => {
         runs = data.runs ?? [];
         scoresNote = data.available ? '' : (data.detail || 'Scores are unavailable.');
-        if (!touched) ckpt = bestPath(rankCheckpoints(checkpoints, runs));
+        if (!touched && !initialCkpt) ckpt = bestPath(rankCheckpoints(checkpoints, runs));
       })
       .catch((err) => {
         if (err.name === 'AbortError') return;
@@ -563,6 +569,11 @@
     }
   }
 
+  function metric(value) {
+    if (value == null || Number.isNaN(Number(value))) return '—';
+    return Number(value).toFixed(3);
+  }
+
   function percent(value) {
     if (value == null || Number.isNaN(value)) return '';
     return `${Math.round(value * 1000) / 10}%`;
@@ -743,6 +754,16 @@
         {/if}
         {#if shown?.agreement_species != null}
           <span>Agrees on {percent(shown.agreement_species)} of labelled species pixels.</span>
+        {/if}
+      </p>
+    {/if}
+    {#if shown?.f1_species != null || shown?.binary_f1 != null}
+      <p class="agree">
+        {#if shown?.f1_species != null}
+          <span>Species F1 {metric(shown.f1_species)}, IoU {metric(shown.iou_species)}, precision {metric(shown.precision_species)}, recall {metric(shown.recall_species)}.</span>
+        {/if}
+        {#if shown?.binary_f1 != null}
+          <span>Plant versus background F1 {metric(shown.binary_f1)}.</span>
         {/if}
       </p>
     {/if}

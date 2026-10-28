@@ -7,14 +7,16 @@
   import Zoom from './Zoom.svelte';
   import { paintIsolate } from './isolate.js';
 
-  let { tileId, fold, onclose, onopenmodel = null } = $props();
+  let { tileId, fold, onclose, onopenmodel = null, initialTab = 'tile', initialCkpt = '' } = $props();
 
   let tile = $state(null);
   let activeId = $state(null);
   let error = $state('');
   let loading = $state(false);
   let opacity = $state(0.8);
-  let tab = $state('tile');
+  // Remounted with the tab to open. Later switches stay on this drawer.
+  // svelte-ignore state_referenced_locally
+  let tab = $state(initialTab || 'tile');
   let legendOpen = $state(false);
   let focusColor = $state('');
   let isolatedMask = $state('');
@@ -311,7 +313,7 @@
     {:else if tab === 'segment'}
       <Segment tileId={tile.tile_id} mask={tile.mask} />
     {:else if tab === 'predict'}
-      <Predict tileId={tile.tile_id} thumb={tile.thumb} mask={tile.mask} bind:focusColor {onopenmodel} />
+      <Predict tileId={tile.tile_id} thumb={tile.thumb} mask={tile.mask} bind:focusColor {onopenmodel} {initialCkpt} />
     {:else}
       <div class="shot">
         <button type="button" class="stage" class:busy={switching} aria-label="Enlarge orthophoto" onclick={() => (zoomOpen = true)}>

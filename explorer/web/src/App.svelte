@@ -7,12 +7,16 @@
   import Detail from './Detail.svelte';
   import Runs from './Runs.svelte';
   import Model from './Model.svelte';
+  import Batch from './Batch.svelte';
 
   let facets = $state(null);
   let stats = $state(null);
   let error = $state('');
   let showLabels = $state(true);
   let openId = $state(null);
+  let detailTab = $state('tile');
+  let detailCkpt = $state('');
+  let detailKey = $state(0);
   let infoOpen = $state(false);
   let view = $state('tiles');
   let modelTileId = $state(null);
@@ -62,6 +66,20 @@
     if (id) modelTileId = id;
     openId = null;
     view = 'model';
+  }
+
+  function openTile(id) {
+    detailTab = 'tile';
+    detailCkpt = '';
+    openId = id;
+    detailKey += 1;
+  }
+
+  function openBatchTile(id, ckpt) {
+    detailTab = 'predict';
+    detailCkpt = ckpt || '';
+    openId = id;
+    detailKey += 1;
   }
 
   function setNumber(params, key, value) {
@@ -194,7 +212,7 @@
   });
 </script>
 
-<div class="app" class:map-mode={view === 'map'} class:runs-mode={view === 'runs'} class:model-mode={view === 'model'}>
+<div class="app" class:map-mode={view === 'map'} class:runs-mode={view === 'runs'} class:model-mode={view === 'model'} class:batch-mode={view === 'batch'}>
   <header>
     <div class="title-wrap">
       <div class="title-row">
@@ -203,11 +221,13 @@
             Runs
           {:else if view === 'model'}
             Model
+          {:else if view === 'batch'}
+            Batch
           {:else}
             {filters.fold}<span class="role-name">{ROLE[filters.role] ?? filters.role}</span>
           {/if}
         </h1>
-        {#if view !== 'runs' && view !== 'model'}
+        {#if view !== 'runs' && view !== 'model' && view !== 'batch'}
           <button
             type="button"
             class="info"
@@ -218,7 +238,7 @@
           >i</button>
         {/if}
       </div>
-      {#if infoOpen && view !== 'runs' && view !== 'model'}
+      {#if infoOpen && view !== 'runs' && view !== 'model' && view !== 'batch'}
         <div class="note" id="fold-note" role="dialog" aria-label="How this fold is split">
           <p>
             The default baseline is a U-Net with a MiT-b2 encoder. It trains on the {filters.fold} split below.
@@ -270,6 +290,13 @@
         </svg>
         Model
       </button>
+      <button type="button" role="tab" aria-selected={view === 'batch'} class:on={view === 'batch'} onclick={() => (view = 'batch')}>
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="1.4" y="1.4" width="8.2" height="8.2" />
+          <rect x="6.4" y="6.4" width="8.2" height="8.2" />
+        </svg>
+        Batch
+      </button>
       <button type="button" role="tab" aria-selected={view === 'runs'} class:on={view === 'runs'} onclick={() => (view = 'runs')}>
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M2 12.5 5.2 8.4l2.4 2.2 3-4.2L14 11" />
@@ -285,13 +312,15 @@
     <Filters {facets} bind:filters bind:showLabels changed={filtersChanged} onreset={resetFilters} />
   {/if}
 
-  <div class="workspace" class:map-mode={view === 'map'} class:runs-mode={view === 'runs'} class:model-mode={view === 'model'}>
+  <div class="workspace" class:map-mode={view === 'map'} class:runs-mode={view === 'runs'} class:model-mode={view === 'model'} class:batch-mode={view === 'batch'}>
     {#if view === 'model'}
       <Model {facets} initialTileId={modelTileId} fold={filters.fold} />
+    {:else if view === 'batch'}
+      <Batch {facets} fold={filters.fold} onopen={openBatchTile} />
     {:else if view === 'runs'}
       <Runs {watchGpu} {gpu} />
     {:else if view === 'map'}
-      <Map {facets} bind:filters bind:showLabels onopen={(id) => (openId = id)} />
+      <Map {facets} bind:filters bind:showLabels onopen={openTile} />
     {:else}
       {#if error}
         <p class="error">{error}</p>
@@ -299,12 +328,14 @@
         <Stats {stats} bind:filters />
       {/if}
       <div class="grid-wrap">
-        <Grid {query} {showLabels} {colors} onopen={(id) => (openId = id)} />
+        <Grid {query} {showLabels} {colors} onopen={openTile} />
       </div>
     {/if}
   </div>
 </div>
 
 {#if openId}
-  <Detail tileId={openId} fold={filters.fold} onclose={() => (openId = null)} onopenmodel={openModel} />
+  {#key detailKey}
+    <Detail tileId={openId} fold={filters.fold} initialTab={detailTab} initialCkpt={detailCkpt} onclose={() => (openId = null)} onopenmodel={openModel} />
+  {/key}
 {/if}

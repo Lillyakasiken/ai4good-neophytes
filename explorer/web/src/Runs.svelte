@@ -16,7 +16,7 @@
   let precision = $state('bf16-mixed');
   let logger = $state('wandb');
   let nameStamp = $state(stampNow());
-  let expName = $state(`${nameStamp}_neophytes_split_cv3_train_1024_model_neophytes_mit_b2_s42`);
+  let expName = $state(untrack(() => `${nameStamp}_neophytes_split_cv3_train_1024_model_neophytes_mit_b2_s42`));
   let expNameCustom = $state(false);
   let subsetOn = $state(false);
   let fewShotK = $state(null);

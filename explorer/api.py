@@ -5,11 +5,14 @@ Run from this directory, with its virtualenv:
     uvicorn api:app --port 8000
 """
 
+import base64
 import hashlib
+import io
 import json
 import math
 import os
 import re
+import shutil
 import threading
 import time
 from datetime import date, datetime
@@ -864,16 +867,22 @@ def tile_predict_marks(tile_id: str):
 
 @app.get("/api/tiles/{tile_id}/predict/saved")
 def tile_predict_saved(tile_id: str, ckpt: str = Query(min_length=1)):
-    """Newest saved prediction for this tile and checkpoint, or 404."""
+    """Newest saved prediction for this tile and checkpoint, or 404.
+
+    A batch run stores a thumbnail instead of a full prediction. That thumbnail
+    is returned here so opening the tile still shows the mask.
+    """
     image, mask, resolved = _resolve_predict(tile_id, ckpt)
     with _pred_lock:
         found = _matching_preds(_load_pred_index(), tile_id, image, mask, resolved)
-    if not found:
+    if found:
+        payload = _read_pred(found[-1][1])
+        if payload is not None:
+            return payload
+    batch = _saved_from_batch(tile_id, image, mask, resolved)
+    if batch is None:
         raise HTTPException(status_code=404, detail="no saved prediction")
-    payload = _read_pred(found[-1][1])
-    if payload is None:
-        raise HTTPException(status_code=404, detail="no saved prediction")
-    return payload
+    return batch
 
 
 @app.delete("/api/tiles/{tile_id}/predict/saved")
@@ -995,6 +1004,610 @@ def tile_trace(tile_id: str, body: TraceIn):
         return payload
     finally:
         gpu_lock.release()
+
+
+BATCH_DIR = CACHE / "batch_preds"
+_batch_lock = threading.RLock()
+BATCH_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/batch-masks", StaticFiles(directory=BATCH_DIR), name="batch-masks")
+
+BATCH_METRIC_KEYS = (
+    "agreement",
+    "agreement_species",
+    "f1_species",
+    "iou_species",
+    "precision_species",
+    "recall_species",
+    "binary_f1",
+    "binary_iou",
+    "pred_px",
+    "label_px",
+    "tp_px",
+    "fp_px",
+    "fn_px",
+    "wrong_species_px",
+    "valid_px",
+    "correct_px",
+    "bin_tp",
+    "bin_fp",
+    "bin_fn",
+)
+
+
+class BatchPredictIn(BaseModel):
+    ckpt: str
+    tile_id: str | None = None
+    tile_ids: list[str] = Field(default_factory=list)
+    force: bool = False
+
+
+def _batch_ids(body):
+    """Tile ids from a one-tile call or a chunk, in request order."""
+    ids = []
+    seen = set()
+    raw = list(body.tile_ids)
+    if body.tile_id:
+        raw.append(body.tile_id)
+    for tile_id in raw:
+        if tile_id in seen:
+            continue
+        if len(tile_id) != 16 or any(c not in "0123456789abcdef" for c in tile_id):
+            raise HTTPException(status_code=400, detail="tile_id must be 16 hex characters")
+        seen.add(tile_id)
+        ids.append(tile_id)
+    if not ids:
+        raise HTTPException(status_code=400, detail="tile_id or tile_ids is required")
+    if len(ids) > 32:
+        raise HTTPException(status_code=400, detail="at most 32 tiles per request")
+    return ids
+
+
+def _batch_hash(ckpt):
+    return hashlib.sha256(_file_sig(ckpt).encode()).hexdigest()[:16]
+
+
+def _batch_folder(ckpt):
+    return BATCH_DIR / _batch_hash(ckpt)
+
+
+def _load_batch_index(folder):
+    path = folder / "index.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_batch_index(folder, index):
+    folder.mkdir(parents=True, exist_ok=True)
+    tmp = folder / "index.tmp"
+    tmp.write_text(json.dumps(index))
+    os.replace(tmp, folder / "index.json")
+
+
+def _batch_fresh(item, image, mask, ckpt):
+    if not item or not isinstance(item.get("metrics"), dict):
+        return False
+    if item.get("image_sig") != _file_sig(image):
+        return False
+    if item.get("mask_sig") != _file_sig(mask):
+        return False
+    if item.get("ckpt_sig") != _file_sig(ckpt):
+        return False
+    folder = _batch_folder(ckpt)
+    tile_id = item.get("tile_id")
+    if not tile_id or not (folder / f"{tile_id}_pred.webp").is_file():
+        return False
+    if item.get("has_comp") and not (folder / f"{tile_id}_comp.webp").is_file():
+        return False
+    return True
+
+
+def _batch_urls(tile_id, digest, has_comp):
+    pred = f"/batch-masks/{digest}/{tile_id}_pred.webp"
+    comp = f"/batch-masks/{digest}/{tile_id}_comp.webp" if has_comp else None
+    return pred, comp
+
+
+def _png_b64_file(path):
+    with Image.open(path) as im:
+        buf = io.BytesIO()
+        im.convert("RGBA").save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _saved_from_batch(tile_id, image, mask, ckpt):
+    """Single-tile preview payload from a saved batch thumbnail, or None."""
+    folder = _batch_folder(ckpt)
+    with _batch_lock:
+        item = _load_batch_index(folder).get(tile_id)
+    if not item or not _batch_fresh({**item, "tile_id": tile_id}, image, mask, ckpt):
+        return None
+    metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+    payload = {key: metrics.get(key) for key in BATCH_METRIC_KEYS}
+    counts = metrics.get("counts")
+    payload["counts"] = counts if isinstance(counts, list) else []
+    payload["overlay"] = _png_b64_file(folder / f"{tile_id}_pred.webp")
+    comp = folder / f"{tile_id}_comp.webp"
+    payload["comparison"] = _png_b64_file(comp) if item.get("has_comp") and comp.is_file() else None
+    payload["cached"] = True
+    payload["saved_at"] = item.get("saved_at")
+    payload["batch_preview"] = True
+    return payload
+
+
+def _score_ratio(num, den):
+    if den is None or den <= 0 or num is None:
+        return None
+    return num / den
+
+
+def _mean_defined(values):
+    nums = [value for value in values if value is not None]
+    if not nums:
+        return None
+    return sum(nums) / len(nums)
+
+
+def _f1_of(tp, fp, fn):
+    denom = 2 * tp + fp + fn
+    if denom <= 0:
+        return None
+    return 2.0 * tp / denom
+
+
+def _iou_of(tp, fp, fn):
+    denom = tp + fp + fn
+    if denom <= 0:
+        return None
+    return tp / denom
+
+
+def _precision_of(tp, fp):
+    denom = tp + fp
+    if denom <= 0:
+        return None
+    return tp / denom
+
+
+def _recall_of(tp, fn):
+    denom = tp + fn
+    if denom <= 0:
+        return None
+    return tp / denom
+
+
+def _round_metric(value):
+    if value is None:
+        return None
+    value = float(value)
+    if math.isnan(value) or math.isinf(value):
+        return None
+    return round(value, 6)
+
+
+def _aggregate_metrics(metrics_rows):
+    """Dataset scores from summed per-tile counts, not the mean of tile scores."""
+    totals = {
+        "valid_px": 0,
+        "correct_px": 0,
+        "pred_px": 0,
+        "label_px": 0,
+        "tp_px": 0,
+        "fp_px": 0,
+        "fn_px": 0,
+        "wrong_species_px": 0,
+        "bin_tp": 0,
+        "bin_fp": 0,
+        "bin_fn": 0,
+    }
+    scored = 0
+    by_class = {}
+    for metrics in metrics_rows:
+        if not isinstance(metrics, dict):
+            continue
+        if metrics.get("correct_px") is not None and metrics.get("valid_px") is not None:
+            scored += 1
+            for key in totals:
+                value = metrics.get(key)
+                if value is not None:
+                    totals[key] += int(value)
+        elif metrics.get("pred_px") is not None:
+            totals["pred_px"] += int(metrics.get("pred_px") or 0)
+        for row in metrics.get("counts") or []:
+            if not isinstance(row, dict) or row.get("tp") is None:
+                continue
+            slot = by_class.setdefault(int(row["id"]), {
+                "id": int(row["id"]),
+                "stats_name": row.get("stats_name") or "",
+                "name": row.get("name") or "",
+                "color": row.get("color") or "#5d6e74",
+                "tp": 0,
+                "fp": 0,
+                "fn": 0,
+            })
+            slot["tp"] += int(row.get("tp") or 0)
+            slot["fp"] += int(row.get("fp") or 0)
+            slot["fn"] += int(row.get("fn") or 0)
+    f1s, ious, precs, recs = [], [], [], []
+    species = []
+    for row in sorted(by_class.values(), key=lambda item: item["id"]):
+        f1 = _f1_of(row["tp"], row["fp"], row["fn"])
+        iou = _iou_of(row["tp"], row["fp"], row["fn"])
+        precision = _precision_of(row["tp"], row["fp"])
+        recall = _recall_of(row["tp"], row["fn"])
+        if f1 is not None:
+            f1s.append(f1)
+            ious.append(iou)
+        if precision is not None:
+            precs.append(precision)
+        if recall is not None:
+            recs.append(recall)
+        species.append({
+            **row,
+            "f1": _round_metric(f1),
+            "iou": _round_metric(iou),
+            "precision": _round_metric(precision),
+            "recall": _round_metric(recall),
+        })
+    return {
+        "tiles": len(metrics_rows),
+        "scored": scored,
+        "f1_species": _round_metric(_mean_defined(f1s)),
+        "iou_species": _round_metric(_mean_defined(ious)),
+        "precision_species": _round_metric(_mean_defined(precs)),
+        "recall_species": _round_metric(_mean_defined(recs)),
+        "binary_f1": _round_metric(_f1_of(totals["bin_tp"], totals["bin_fp"], totals["bin_fn"])),
+        "binary_iou": _round_metric(_iou_of(totals["bin_tp"], totals["bin_fp"], totals["bin_fn"])),
+        "agreement": _round_metric(_score_ratio(totals["correct_px"], totals["valid_px"])),
+        "agreement_species": _round_metric(_score_ratio(totals["tp_px"], totals["label_px"])),
+        **totals,
+        "species": species,
+    }
+
+
+def _metrics_from_saved(payload):
+    """Full scores stored on a single-tile prediction, when this build wrote them."""
+    if not isinstance(payload, dict) or "pred_px" not in payload or not payload.get("overlay"):
+        return None
+    metrics = {key: payload.get(key) for key in BATCH_METRIC_KEYS}
+    counts = payload.get("counts")
+    metrics["counts"] = counts if isinstance(counts, list) else []
+    return metrics
+
+
+def _write_webp_bytes(raw, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".part")
+    tmp.write_bytes(raw)
+    os.replace(tmp, dest)
+
+
+def _write_png_thumb(b64, dest):
+    raw = base64.b64decode(b64)
+    with Image.open(io.BytesIO(raw)) as im:
+        chip = im.convert("RGBA")
+        if chip.size != (THUMB_PX, THUMB_PX):
+            chip = chip.resize((THUMB_PX, THUMB_PX), Image.Resampling.NEAREST)
+        tmp = dest.with_suffix(".part")
+        chip.save(tmp, "WEBP", quality=80, method=0)
+        os.replace(tmp, dest)
+
+
+def _batch_item(tile_id, image, mask, ckpt, metrics, has_comp, saved_at):
+    return {
+        "tile_id": tile_id,
+        "ckpt": str(ckpt),
+        "image_sig": _file_sig(image),
+        "mask_sig": _file_sig(mask),
+        "ckpt_sig": _file_sig(ckpt),
+        "saved_at": saved_at,
+        "has_comp": has_comp,
+        "metrics": metrics,
+    }
+
+
+def _store_batch_files(folder, tile_id, pred_webp, comp_webp):
+    _write_webp_bytes(base64.b64decode(pred_webp), folder / f"{tile_id}_pred.webp")
+    has_comp = bool(comp_webp)
+    comp_path = folder / f"{tile_id}_comp.webp"
+    if has_comp:
+        _write_webp_bytes(base64.b64decode(comp_webp), comp_path)
+    else:
+        try:
+            comp_path.unlink()
+        except OSError:
+            pass
+    return has_comp
+
+
+def _remember_batch(tile_id, image, mask, ckpt, metrics, pred_webp, comp_webp):
+    saved = _remember_batch_many(ckpt, [(tile_id, image, mask, metrics, pred_webp, comp_webp)])
+    return saved[0]
+
+
+def _remember_batch_many(ckpt, rows):
+    """Write thumbnails, then the index once for the whole chunk."""
+    if not rows:
+        return []
+    folder = _batch_folder(ckpt)
+    folder.mkdir(parents=True, exist_ok=True)
+    saved_at = time.time()
+    items = []
+    for tile_id, image, mask, metrics, pred_webp, comp_webp in rows:
+        has_comp = _store_batch_files(folder, tile_id, pred_webp, comp_webp)
+        items.append(_batch_item(tile_id, image, mask, ckpt, metrics, has_comp, saved_at))
+    with _batch_lock:
+        index = _load_batch_index(folder)
+        for item in items:
+            index[item["tile_id"]] = item
+        _write_batch_index(folder, index)
+    return items
+
+
+def _reuse_saved_prediction(tile_id, image, mask, ckpt):
+    """Turn a saved single-tile prediction into batch thumbnails, without the GPU.
+
+    Older cache entries have no per-pixel error split, so they are left to be re-run.
+    """
+    with _pred_lock:
+        found = _matching_preds(_load_pred_index(), tile_id, image, mask, ckpt)
+    payload = None
+    for _saved_at, key in reversed(found):
+        candidate = _read_pred(key)
+        metrics = _metrics_from_saved(candidate)
+        if metrics is not None:
+            payload = candidate
+            break
+    if payload is None:
+        return None
+    metrics = _metrics_from_saved(payload)
+    folder = _batch_folder(ckpt)
+    folder.mkdir(parents=True, exist_ok=True)
+    _write_png_thumb(payload["overlay"], folder / f"{tile_id}_pred.webp")
+    has_comp = bool(payload.get("comparison"))
+    comp_path = folder / f"{tile_id}_comp.webp"
+    if has_comp:
+        _write_png_thumb(payload["comparison"], comp_path)
+    else:
+        try:
+            comp_path.unlink()
+        except OSError:
+            pass
+    saved_at = time.time()
+    item = {
+        "tile_id": tile_id,
+        "ckpt": str(ckpt),
+        "image_sig": _file_sig(image),
+        "mask_sig": _file_sig(mask),
+        "ckpt_sig": _file_sig(ckpt),
+        "saved_at": saved_at,
+        "has_comp": has_comp,
+        "metrics": metrics,
+    }
+    with _batch_lock:
+        index = _load_batch_index(folder)
+        index[tile_id] = item
+        _write_batch_index(folder, index)
+    return item
+
+
+def _batch_public(tile_id, ckpt, item, cached):
+    digest = _batch_hash(ckpt)
+    pred, comp = _batch_urls(tile_id, digest, bool(item.get("has_comp")))
+    return {
+        "tile_id": tile_id,
+        "cached": cached,
+        "saved_at": item.get("saved_at"),
+        "metrics": item.get("metrics"),
+        "pred": pred,
+        "comp": comp,
+    }
+
+
+@app.get("/api/batch/tiles")
+def batch_tiles(
+    ckpt: str = Query(min_length=1),
+    fold: str = "cv3",
+    role: str = "test",
+    split: str | None = None,
+    site: str | None = None,
+    flight: str | None = None,
+    year: int | None = None,
+    month: int | None = None,
+    species: list[str] = Query(default=[]),
+    species_op: str = "or",
+    labelled: bool = True,
+    background_only: bool = False,
+    nodata_min: float | None = Query(default=None, ge=NODATA_MIN, le=NODATA_MAX),
+    nodata_max: float | None = Query(default=None, ge=NODATA_MIN, le=NODATA_MAX),
+    min_m2: float | None = Query(default=None, ge=M2_MIN, le=M2_MAX),
+    max_m2: float | None = Query(default=None, ge=M2_MIN, le=M2_MAX),
+    m2_species: str | None = None,
+    limit: int | None = Query(default=None, ge=1),
+    offset: int = Query(default=0, ge=0),
+):
+    """Tiles in a catalog filter, joined with saved batch scores for one checkpoint."""
+    _require_catalog()
+    fold = _fold(fold)
+    resolved = _resolve_predict_ckpt(ckpt)
+    where, params = _where(
+        fold, role, split, site, flight, year, month, species, labelled,
+        nodata_min, nodata_max, min_m2, m2_species,
+        background_only=background_only, max_m2=max_m2, species_op=species_op,
+    )
+    px_cols = ", ".join(f"{name}_px" for name in SPECIES_NAMES)
+    source, source_params = "FROM read_parquet(?) t", [str(TILES_PARQUET)]
+    total = _fetch(f"SELECT COUNT(*)::BIGINT AS total {source} {where}", source_params + params)[0]["total"]
+    page = ""
+    page_params = []
+    if limit is not None:
+        page = " LIMIT ? OFFSET ?"
+        page_params = [limit, offset]
+    elif offset:
+        page = " OFFSET ?"
+        page_params = [offset]
+    rows = _fetch(
+        f"""
+        SELECT tile_id, site_name, flight, site, year, month, acq_date, split,
+               {fold}_role AS cv_role, labelled, label_m2, nodata_frac, n_species,
+               img_path, mask_path, {px_cols}
+        {source}
+        {where}
+        ORDER BY tile_id
+        {page}
+        """,
+        source_params + params + page_params,
+    )
+    digest = _batch_hash(resolved)
+    folder = _batch_folder(resolved)
+    with _batch_lock:
+        index = _load_batch_index(folder)
+    tiles_out = []
+    fresh_metrics = []
+    for row in rows:
+        brief = _tile_brief(row)
+        item = index.get(row["tile_id"])
+        image = resolve_data_path(row["img_path"])
+        mask = resolve_data_path(row["mask_path"]) if row.get("mask_path") else None
+        if item and _batch_fresh({**item, "tile_id": row["tile_id"]}, image, mask, resolved):
+            pred, comp = _batch_urls(row["tile_id"], digest, bool(item.get("has_comp")))
+            brief["metrics"] = item.get("metrics")
+            brief["pred"] = pred
+            brief["comp"] = comp
+            brief["saved_at"] = item.get("saved_at")
+            fresh_metrics.append(item.get("metrics"))
+        else:
+            brief["metrics"] = None
+            brief["pred"] = None
+            brief["comp"] = None
+            brief["saved_at"] = None
+        tiles_out.append(brief)
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "truncated": limit is not None and offset + len(rows) < total,
+        "predicted": len(fresh_metrics),
+        "ckpt": str(resolved),
+        "digest": digest,
+        "summary": _aggregate_metrics(fresh_metrics),
+        "tiles": tiles_out,
+    }
+
+
+def _resolve_predict_ckpt(ckpt_path):
+    try:
+        return predict_client.resolve_checkpoint(ckpt_path)
+    except predict_client.PredictError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/batch/predict")
+def batch_predict(body: BatchPredictIn):
+    """Score a chunk of tiles. Saved results skip the GPU. One forward covers the rest."""
+    ids = _batch_ids(body)
+    resolved_rows = []
+    ckpt = None
+    for tile_id in ids:
+        image, mask, resolved = _resolve_predict(tile_id, body.ckpt)
+        ckpt = resolved
+        resolved_rows.append((tile_id, image, mask))
+    folder = _batch_folder(ckpt)
+    cached = {}
+    misses = []
+    if not body.force:
+        with _batch_lock:
+            index = _load_batch_index(folder)
+        for tile_id, image, mask in resolved_rows:
+            item = index.get(tile_id)
+            if item and _batch_fresh({**item, "tile_id": tile_id}, image, mask, ckpt):
+                cached[tile_id] = _batch_public(tile_id, ckpt, item, cached=True)
+                continue
+            reused = _reuse_saved_prediction(tile_id, image, mask, ckpt)
+            if reused is not None:
+                cached[tile_id] = _batch_public(tile_id, ckpt, reused, cached=True)
+                continue
+            misses.append((tile_id, image, mask))
+    else:
+        misses = list(resolved_rows)
+    fresh = {}
+    if misses:
+        if train_jobs.training_active():
+            raise HTTPException(status_code=409, detail="A training job is using the GPU.")
+        if not gpu_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="The GPU is busy.")
+        try:
+            if train_jobs.training_active():
+                raise HTTPException(status_code=409, detail="A training job is using the GPU.")
+            try:
+                payload = predict_client.request({
+                    "cmd": "predict_batch",
+                    "ckpt": str(ckpt),
+                    "tiles": [
+                        {"image": str(image), "mask": None if mask is None else str(mask)}
+                        for _tile_id, image, mask in misses
+                    ],
+                }, timeout=600)
+            except TrainEnvError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            except predict_client.PredictError as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            if not payload.get("ok"):
+                raise HTTPException(status_code=400, detail=payload.get("error") or "prediction failed")
+            results = payload.get("results")
+            if not isinstance(results, list) or len(results) != len(misses):
+                raise HTTPException(status_code=500, detail="prediction returned no scores")
+            to_save = []
+            for (tile_id, image, mask), result in zip(misses, results):
+                if not isinstance(result, dict) or not result.get("ok"):
+                    message = "prediction failed"
+                    if isinstance(result, dict) and result.get("error"):
+                        message = str(result["error"])
+                    fresh[tile_id] = {"tile_id": tile_id, "error": message}
+                    continue
+                metrics = result.get("metrics")
+                pred_webp = result.get("pred_webp")
+                if not isinstance(metrics, dict) or not pred_webp:
+                    fresh[tile_id] = {"tile_id": tile_id, "error": "prediction returned no scores"}
+                    continue
+                to_save.append((tile_id, image, mask, metrics, pred_webp, result.get("comp_webp")))
+            for item in _remember_batch_many(ckpt, to_save):
+                fresh[item["tile_id"]] = _batch_public(item["tile_id"], ckpt, item, cached=False)
+        finally:
+            gpu_lock.release()
+    ordered = []
+    for tile_id, _image, _mask in resolved_rows:
+        ordered.append(
+            cached.get(tile_id)
+            or fresh.get(tile_id)
+            or {"tile_id": tile_id, "error": "prediction failed"}
+        )
+    single = body.tile_id and not body.tile_ids
+    if single:
+        one = ordered[0]
+        if one.get("error"):
+            raise HTTPException(status_code=400, detail=one["error"])
+        return one
+    return {"tiles": ordered}
+
+
+@app.delete("/api/batch/cache")
+def clear_batch_cache(ckpt: str | None = None):
+    """Delete saved batch predictions for one checkpoint, or for every checkpoint."""
+    if ckpt:
+        resolved = _resolve_predict_ckpt(ckpt)
+        folder = _batch_folder(resolved)
+        with _batch_lock:
+            shutil.rmtree(folder, ignore_errors=True)
+        return {"ok": True, "ckpt": str(resolved)}
+    with _batch_lock:
+        shutil.rmtree(BATCH_DIR, ignore_errors=True)
+        BATCH_DIR.mkdir(parents=True, exist_ok=True)
+    return {"ok": True, "ckpt": None}
 
 
 @app.get("/api/gpu")
