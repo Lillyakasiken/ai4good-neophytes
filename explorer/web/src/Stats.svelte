@@ -43,12 +43,23 @@
       </p>
       <p class="hint">share of labelled area (total: {area(totalM2)} m²)</p>
       {#each stats.species as spec}
-        <div class="bar-row">
-          <span class="binomial">{spec.name}</span>
-          <div class="bar" data-pct={pct(spec.m2, totalM2)}>
-            <div class="track"><span style:width="{(100 * spec.m2) / totalM2}%" style:--swatch={spec.color}></span></div>
+        <div class="species-group">
+          <div class="bar-row">
+            <span class="binomial">{spec.name}</span>
+            <div class="bar" data-pct={pct(spec.m2, totalM2)}>
+              <div class="track"><span style:width="{(100 * spec.m2) / totalM2}%" style:--swatch={spec.color}></span></div>
+            </div>
+            <span class="num">{area(spec.m2)} m²</span>
           </div>
-          <span class="num">{area(spec.m2)} m²</span>
+          {#each (spec.phases ?? []).filter((phase) => phase.phase !== 'unknown') as phase}
+            <div class="bar-row phase-row">
+              <span class="phase">{phase.label}</span>
+              <div class="bar" data-pct={pct(phase.m2, totalM2)}>
+                <div class="track"><span style:width="{(100 * phase.m2) / totalM2}%" style:--swatch={spec.color}></span></div>
+              </div>
+              <span class="num">{area(phase.m2)} m²</span>
+            </div>
+          {/each}
         </div>
       {/each}
     </div>

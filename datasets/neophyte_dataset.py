@@ -33,6 +33,22 @@ def _tile_month(path):
     return int(m.group(2)) if m else None
 
 
+def _compact_mask(mask):
+    """int8 view of a mask. uint8 cannot hold ignore_index -1 (it would become 255)."""
+    if torch.is_tensor(mask):
+        return mask.to(dtype=torch.int8)
+    return torch.as_tensor(np.ascontiguousarray(mask), dtype=torch.int8)
+
+
+def _compact_uint8(value):
+    """uint8 view of canopy or phenology. Both are small non-negative integers."""
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return value.to(dtype=torch.uint8)
+    return torch.as_tensor(np.ascontiguousarray(value), dtype=torch.uint8)
+
+
 def _tile_gsd_mm(src):
     """Ground sampling distance of an open rasterio dataset, in mm/px."""
     try:
@@ -650,14 +666,18 @@ class NeophyteDataset(Dataset):
                     dtm = augmented['dtm']
 
         # # Create sample =====================================================
+        # int8/uint8 keeps a 2048 px tile at 1 byte per label channel instead of 8.
+        # restore_compact_labels() casts these back to long/float on the GPU before
+        # any loss or metric sees them, so the values the metrics receive are the
+        # same ones mask.long() / canopy.float() used to hand over.
         sample = {'image': image,
-                  'mask': mask.long(),
+                  'mask': _compact_mask(mask),
                   'meta': meta,
                   'name': self.image_files[idx],
                   }
         if self.load_auxiliary:
-            sample['phenology'] = phenology
-            sample['canopy'] = canopy.float()
+            sample['phenology'] = _compact_uint8(phenology)
+            sample['canopy'] = _compact_uint8(canopy)
 
         if self.load_ndsm:
             sample['ndsm'] = ndsm.unsqueeze(0)

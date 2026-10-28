@@ -44,6 +44,77 @@ def _auto_data_config(exp_name: str) -> str | None:
     return None
 
 
+def _log_phenology_wandb(cfg, breakdown, heatmap_path, bars_path):
+    """Attach the stage table and figures to the training run on W&B.
+
+    The training run is the one whose name is ``exp_name``. If it cannot be
+    found, a new run is created in the same project and grouped under that name.
+    ``logger: csv`` skips this. A W&B failure is reported and does not fail the test.
+    """
+    if cfg.logger != "wandb":
+        print(f"[test.py] logger={cfg.logger}: phenology table and figures stay on disk.")
+        return
+
+    import os
+
+    import wandb
+
+    def _num(value):
+        return float("nan") if value is None else float(value)
+
+    entity, project = cfg.wandb_entity, cfg.log_name
+    run_id = None
+    try:
+        api = wandb.Api()
+        matches = api.runs(f"{entity}/{project}", filters={"display_name": cfg.exp_name},
+                           order="-created_at", per_page=5)
+        for run in matches:
+            if run.name == cfg.exp_name or getattr(run, "display_name", None) == cfg.exp_name:
+                run_id = run.id
+                break
+    except Exception as exc:
+        print(f"[test.py] W&B run lookup failed ({exc}). Starting a new run.")
+
+    # keep the W&B files next to the run, not in the working directory
+    log_dir = cfg.log_path if "log_path" in cfg else None
+    init_kwargs = dict(entity=entity, project=project, job_type="phenology_test")
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        init_kwargs["dir"] = log_dir
+    try:
+        if run_id:
+            print(f"[test.py] Logging phenology figures to W&B run {run_id} ({cfg.exp_name}).")
+            wandb.init(id=run_id, resume="allow", **init_kwargs)
+        else:
+            print(f"[test.py] No W&B run named {cfg.exp_name}. Creating a new one.")
+            wandb.init(name=f"{cfg.exp_name}__phenology", group=cfg.exp_name, **init_kwargs)
+
+        species = list(breakdown["species"])
+        columns = ["species", "stage", "recall", "miss_to_background", "confused",
+                   "support_px", "below_min_px"] + [f"confused_with_{name}" for name in species]
+        table = wandb.Table(columns=columns)
+        for name, stages in breakdown["cells"].items():
+            for stage, cell in stages.items():
+                confused_with = cell["confused_with"]
+                table.add_data(
+                    name, stage, _num(cell["recall"]), _num(cell["miss_to_background"]),
+                    _num(cell["confused"]), int(cell["support_px"]), bool(cell["below_min_px"]),
+                    *[float(confused_with.get(other, 0.0)) for other in species],
+                )
+        wandb.log({
+            "phenology/breakdown": table,
+            "phenology/recall_heatmap": wandb.Image(heatmap_path),
+            "phenology/failure_bars": wandb.Image(bars_path),
+        })
+        wandb.finish()
+    except Exception as exc:
+        print(f"[test.py] W&B logging failed ({exc}). The files on disk are unaffected.")
+        try:
+            wandb.finish()
+        except Exception:
+            pass
+
+
 def _require_exp_name(argv, script):
     """Fail early with a readable message instead of a Hydra interpolation error."""
     if not any(a.startswith("exp_name=") for a in argv):
@@ -66,7 +137,9 @@ def main(cfg: DictConfig) -> None:
 
     from datasets.neophyte_datamodule import NeophyteDataModule
     from models.semseg_plm import SegmentationModel
-    from utils.eval_utils import (evaluate_model, save_model_predictions, visualize_f1_per_month,
+    from utils.eval_utils import (class_stats_names, evaluate_model, format_worst_stages,
+                                  save_model_predictions, visualize_f1_per_month,
+                                  visualize_phenology_failure_bars, visualize_phenology_recall_heatmap,
                                   visualize_save_confusions, visualize_scores_per_auxiliary,
                                   visualize_scores_per_class, visualize_scores_per_class_cv)
     from utils.transform_utils import get_transforms
@@ -74,6 +147,7 @@ def main(cfg: DictConfig) -> None:
 
     torch.multiprocessing.set_sharing_strategy('file_system')
     torch.set_float32_matmul_precision('medium')
+    torch.backends.cudnn.benchmark = True
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     matplotlib.rcParams.update(cfg.matplotlib_style)
@@ -143,13 +217,18 @@ def main(cfg: DictConfig) -> None:
         # canopy/phenology only exist in the batch when the data config loads them
         eval_auxiliary = cfg.eval_auxiliary and cfg.data.load_auxiliary
 
+        stats_names = class_stats_names(cfg.data.classes)
         metrics = evaluate_model(model, dataModule.test_dataloader(), cfg.model.num_classes, device,
                                  ignore_index=cfg.data.ignore_index,
                                  eval_auxiliary=eval_auxiliary, eval_site=cfg.eval_site,
                                  eval_month=cfg.eval_month, eval_cv=cfg.eval_cv, cv_folds=cv_folds,
                                  compute_auc=cfg.compute_auc, auc_thresholds=cfg.auc_thresholds,
                                  save_dir=metrics_dir, class_names=class_names,
-                                 display_order=display_order)
+                                 display_order=display_order,
+                                 phenology_names=list(cfg.data.phenology_names),
+                                 phenology_class_names=stats_names,
+                                 phenology_min_px=cfg.phenology_min_px,
+                                 autocast=cfg.autocast)
 
         score_keys = ['F1', 'IoU', 'Precision', 'Recall']
         visualize_scores_per_class(reorder_scores(shrink_dict(metrics['semseg'], score_keys)),
@@ -191,6 +270,17 @@ def main(cfg: DictConfig) -> None:
                                            x_label=r"canopy density [\%]",
                                            class_order=list(cfg.data.display_order))
 
+            breakdown = metrics["phenology_breakdown"]
+            species_order = [stats_names[i] for i in cfg.data.display_order]
+            display_by_stats = {stats: class_names[i] for i, stats in enumerate(stats_names)}
+            heatmap_path = os.path.join(metrics_dir, "phenology_recall_heatmap.png")
+            bars_path = os.path.join(metrics_dir, "phenology_failure_bars.png")
+            visualize_phenology_recall_heatmap(breakdown, heatmap_path, species_order, display_by_stats)
+            visualize_phenology_failure_bars(breakdown, bars_path, species_order, display_by_stats)
+            print("Worst stage per species (stage recall):")
+            print(format_worst_stages(breakdown))
+            _log_phenology_wandb(cfg, breakdown, heatmap_path, bars_path)
+
     # %% qualitative results for a few picked test tiles
     print('Start qualitative evaluation of some picked samples from the test set.')
     qual_dir = make_dir(cfg.test_path, 'qualitative')
@@ -200,7 +290,8 @@ def main(cfg: DictConfig) -> None:
                            ignore_index=cfg.data.ignore_index,
                            ndsm_mean=float(ndsm_norm.mean) if ndsm_norm else 0.0,
                            ndsm_std=float(ndsm_norm.std) if ndsm_norm else 1.0,
-                           entropy_gamma=cfg.entropy_gamma)
+                           entropy_gamma=cfg.entropy_gamma,
+                           autocast=cfg.autocast)
 
     hydra.core.global_hydra.GlobalHydra.instance().clear()
 

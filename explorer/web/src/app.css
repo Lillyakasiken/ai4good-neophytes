@@ -748,6 +748,23 @@ button.map-month { cursor: pointer; }
   font-size: 12px;
 }
 
+.species-group { margin: 9px 0 12px; }
+.species-group .bar-row {
+  margin: 3px 0;
+  grid-template-columns: 108px minmax(0, 1fr) 64px;
+}
+.species-group .num { text-align: right; }
+
+.phase-row .phase {
+  padding-left: 14px;
+  color: var(--mist);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.phase-row .track { height: 5px; }
+.phase-row .num { font-size: 11px; }
+
 .month-row { grid-template-columns: 76px minmax(0, 1fr) auto; }
 .site-row { grid-template-columns: 104px minmax(0, 1fr) auto; }
 

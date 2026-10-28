@@ -270,6 +270,13 @@ Swapping one line of a `defaults` list is therefore a whole experiment: the five
   `datasets/neophyte_dataset.py` for the other selection modes.
 - **Validation.** `val_few_shot_k: null` validates on the complete val set,
   including background-only tiles. Filtering them away makes validation fast but
-  hides false positives on empty ground.
+  hides false positives on empty ground. `val_subset.enabled` (false by default)
+  is the same trade-off with a fixed shape: every labelled tile plus `bg_k`
+  background tiles. `check_val_every_n_epoch` in the model config is how often
+  that pass runs. A training epoch is much cheaper than a validation pass, so
+  raising it is the simplest way to spend less of the run validating.
+  `run_final_test` (true by default) keeps the test pass at the end of `train.py`;
+  set it false when `test.py` will do that evaluation. `test.py autocast=true`
+  runs the test forward in bfloat16. The default stays fp32.
 
 ---

@@ -16,6 +16,12 @@ ckpt_type: best      # 'best' (highest val_f1_species; val_f1 for runs before 20
 pl_seed: 42
 
 qualitative_only: False  # skip the (slow) quantitative pass, only draw prediction figures
+# Forward precision. false (the default) is fp32, which is what every past test.py
+# result used. true runs the forward in bfloat16, matching training's bf16-mixed,
+# and casts probabilities back to fp32 before the metrics. The metric code is
+# unchanged; scores can move in the last digits because the forward rounding
+# changed. Leave false when comparing with older runs.
+autocast: false
 entropy_gamma: 0.5       # colour-scale warping of the entropy panel; <1 makes the small
                          # values visible, where nearly every pixel sits (1.0 = linear)
 
@@ -28,6 +34,17 @@ eval_cv: True         # per cross-validation fold -- the basis of the headline m
 # # Threshold-independent AUROC (one-vs-rest per class + binary background-vs-neophyte)
 compute_auc: True
 auc_thresholds: 200   # score-axis discretization; memory is O(num_classes * thresholds)
+
+# # Per-stage breakdown. Cells with fewer labelled pixels are drawn grey and are
+# # not logged as scores. Same threshold as training (model.phenology_min_px).
+phenology_min_px: ${model.phenology_min_px}
+
+# # Where the breakdown table and figures go. 'csv' keeps them on disk only.
+# # 'wandb' attaches them to the training run (looked up by name = exp_name),
+# # or starts a new run in the same project if that run cannot be found.
+logger: wandb
+log_name: ai4good-neophytes
+wandb_entity: max-zehnder-university-of-z-rich
 
 log_dir: lightning_logs
 log_path: ${log_dir}/${exp_name}

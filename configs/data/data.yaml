@@ -21,7 +21,9 @@ ignore_index: -1
 
 # # Some defaults
 data_name: null
-load_auxiliary: False  # load canopy density + phenology (bands 2/3 of the mask)
+load_auxiliary: False  # load canopy density + phenology (bands 2/3 of the mask) for the training set.
+                       # Validation and the end-of-training test pass always load them, so the
+                       # per-stage metrics can be logged. test.py turns this on for its own pass.
 load_dsm: False        # surface model (set automatically from model.in_channels)
 load_dtm: False        # terrain model
 load_ndsm: False       # nDSM = DSM - DTM, i.e. object height above ground
@@ -67,3 +69,15 @@ few_shot_bg_k: 1000  # additional background-only images (0 = none)
 val_few_shot_k: null
 val_few_shot_mode: 'all'
 val_few_shot_bg_k: 0
+
+# Opt-in faster validation. enabled: false (the default) scores the full val set,
+# so runs stay comparable. enabled: true keeps every labelled tile (labelled: all)
+# plus bg_k background-only tiles, via the same few-shot selection as
+# val_few_shot_k. This changes which tiles are scored, not how any metric is
+# computed. False positives on the background tiles left out stay invisible --
+# the same caveat as filtering with val_few_shot_k.
+#   data.val_subset.enabled=true data.val_subset.bg_k=300
+val_subset:
+  enabled: false
+  labelled: all
+  bg_k: 300

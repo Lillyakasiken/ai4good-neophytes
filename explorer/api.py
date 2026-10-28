@@ -1020,7 +1020,14 @@ class JobIn(BaseModel):
     batch_size_val: int = 2
     precision: str = "bf16-mixed"
     logger: str = "wandb"
+    exp_name: str = ""
     run_test: bool = False
+    few_shot_k: int | None = None
+    few_shot_bg_k: int | None = None
+    few_shot_mode: str | None = None
+    val_few_shot_k: int | None = None
+    val_few_shot_bg_k: int | None = None
+    val_few_shot_mode: str | None = None
     overrides: list[str] = Field(default_factory=list)
 
 

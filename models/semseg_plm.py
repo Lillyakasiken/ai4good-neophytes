@@ -8,7 +8,10 @@ and adds the pieces this project needs:
   encoder at every scale (``ElevationFusion``),
 - patch-wise inference for transformer encoders whose positional embedding fixes
   the input size,
-- the usual train/val/test metrics (macro accuracy, IoU, F1, AUROC + per-class F1).
+- the usual train/val/test metrics (macro accuracy, IoU, F1, AUROC + per-class F1),
+- per-stage mean recall and error shares on val and test, when the batch carries
+  a phenology band (``val_phenology/<metric>/<stage>/mean``). The per-species grid
+  is one W&B table, ``val_phenology/breakdown``.
 """
 
 import math
@@ -25,6 +28,10 @@ from torchmetrics.classification import (
     MulticlassStatScores,
 )
 
+from utils.eval_utils import (
+    phenology_breakdown, phenology_scalar_dict, phenology_stage_keys,
+    phenology_table_rows, restore_compact_labels, update_phenology_counts,
+)
 from utils.scheduler_utils import get_scheduler
 
 
@@ -99,11 +106,16 @@ class SegmentationModel(pl.LightningModule):
         patch_2_img_size: if True, inputs larger than ``img_size`` are split into
             overlapping patches, pushed through the model and stitched back
             together. Needed for encoders with a fixed positional embedding.
+        phenology_names: the three stage names, band values 1, 2, 3. Hyphens are
+            turned into underscores for the log keys.
+        class_names: one key per class index, background first (``stats_name``).
+        phenology_min_px: cells with fewer labelled pixels are not logged as scores.
     """
 
     def __init__(self, model, encoder_name, img_size, num_classes, learning_rate,
                  in_channels=None, ignore_index=-1, optimizer='AdamW', lr_scheduler=None,
-                 loss='CE', weight=None, patch_2_img_size=False, fusion_mode='concat'):
+                 loss='CE', weight=None, patch_2_img_size=False, fusion_mode='concat',
+                 phenology_names=None, class_names=None, phenology_min_px=10000):
         super().__init__()
         self.save_hyperparameters()
         self.in_channels = in_channels
@@ -156,6 +168,21 @@ class SegmentationModel(pl.LightningModule):
             setattr(self, f"{split}_f1_per_class", MulticlassF1Score(num_classes=num_classes, average=None, ignore_index=ignore_index))
             # # per-class tp/fp/fn for the species F1 (see species_f1)
             setattr(self, f"{split}_stats", MulticlassStatScores(num_classes=num_classes, average=None, ignore_index=ignore_index))
+
+        # # Per-stage counters. CPU tensors on purpose: validation runs under
+        # # inference mode, and these must stay ordinary tensors so they can be
+        # # updated and are not written into the checkpoint.
+        self.phenology_stage_names = phenology_stage_keys(phenology_names)
+        if class_names is None:
+            class_names = [f"class_{i}" for i in range(num_classes)]
+        if len(class_names) != num_classes:
+            raise ValueError(f"class_names has length {len(class_names)}, expected {num_classes}")
+        self.phenology_class_names = list(class_names)
+        self.phenology_min_px = int(phenology_min_px)
+        for split in ("val", "test"):
+            setattr(self, f"{split}_pheno_counts",
+                    torch.zeros(num_classes, len(self.phenology_stage_names), num_classes, dtype=torch.long))
+        self._pheno_seen = {"val": False, "test": False}
 
     # -------------------------------------------------------------------------
     # setup
@@ -234,6 +261,9 @@ class SegmentationModel(pl.LightningModule):
     # train / val / test
     # -------------------------------------------------------------------------
     def _step(self, batch, stage):
+        # Labels arrive as int8/uint8. This casts them back, on device, to the
+        # long/float tensors the loss and the metrics have always seen.
+        restore_compact_labels(batch)
         masks = batch['mask']
         inputs, aux = self.prepare_inputs(batch)
         logits = self._forward(inputs, aux)
@@ -248,7 +278,47 @@ class SegmentationModel(pl.LightningModule):
         getattr(self, f"{stage}_auc").update(logits.detach(), masks.detach().long())
         getattr(self, f"{stage}_f1_per_class").update(preds.detach(), masks.detach())
         getattr(self, f"{stage}_stats").update(preds.detach(), masks.detach())
+        if stage in ("val", "test") and "phenology" in batch:
+            self._accumulate_phenology(stage, preds, masks, batch["phenology"])
         return loss
+
+    def _accumulate_phenology(self, stage, preds, masks, phenology):
+        """Count label pixels by species, stage and predicted class. No grad."""
+        if not torch.is_tensor(phenology):
+            phenology = torch.as_tensor(phenology, device=preds.device)
+        phenology = phenology.to(device=preds.device).long()
+        if phenology.shape != masks.shape and phenology.ndim == masks.ndim + 1 and phenology.shape[1] == 1:
+            phenology = phenology[:, 0]
+        if phenology.shape != masks.shape:
+            raise ValueError(f"phenology shape {tuple(phenology.shape)} != mask shape {tuple(masks.shape)}")
+        update_phenology_counts(getattr(self, f"{stage}_pheno_counts"), preds.detach(), masks.detach(), phenology)
+        self._pheno_seen[stage] = True
+
+    def _log_phenology(self, stage):
+        """Log stage means, and one species-by-stage table on W&B.
+
+        Skipped when the batch had no stage band. The table goes out with
+        ``commit=False`` so it stays on the same step as the means Lightning logs.
+        """
+        if not self._pheno_seen.get(stage):
+            return
+        counts = getattr(self, f"{stage}_pheno_counts")
+        breakdown = phenology_breakdown(counts, self.phenology_stage_names,
+                                        self.phenology_class_names, self.phenology_min_px)
+        prefix = f"{stage}_phenology"
+        for key, value in phenology_scalar_dict(prefix, breakdown).items():
+            self.log(key, value, prog_bar=False)
+        self._log_phenology_table(prefix, breakdown)
+        counts.zero_()
+        self._pheno_seen[stage] = False
+
+    def _log_phenology_table(self, prefix, breakdown):
+        experiment = getattr(getattr(self, "logger", None), "experiment", None)
+        if type(experiment).__module__.split(".")[0] != "wandb":
+            return
+        import wandb
+        columns, rows = phenology_table_rows(breakdown)
+        experiment.log({f"{prefix}/breakdown": wandb.Table(columns=columns, data=rows)}, commit=False)
 
     @staticmethod
     def species_f1(stats):
@@ -282,6 +352,9 @@ class SegmentationModel(pl.LightningModule):
 
         for metric in ("acc", "iou", "f1", "auc", "f1_per_class", "stats"):
             getattr(self, f"{stage}_{metric}").reset()
+
+        if stage in ("val", "test"):
+            self._log_phenology(stage)
 
     def training_step(self, batch, batch_idx):
         return self._step(batch, 'train')
@@ -345,3 +418,75 @@ def merge_output_patches_to_image(output_patches, num_patches, patch_size, strid
                      kernel_size=(stride, stride), stride=(stride, stride))
 
     return outputs[:, :, border:border + img_size, border:border + img_size]
+
+
+# =============================================================================
+# Fused attention for the SegFormer (MiT) encoder
+# =============================================================================
+# SMP 0.5.0 materialises the full (queries x keys) score matrix. At a 2048 px
+# tile the first stage is 262k queries by 4096 keys, which is most of the
+# validation memory traffic. scaled_dot_product_attention computes the same
+# softmax(q k^T) v without storing that matrix. The scale, the spatial-reduction
+# of keys, and the output projection are unchanged. Summation order inside the
+# kernel can move logits by a rounding error; scripts/verify_speed.py checks that
+# the logged metrics stay put. CPU, and any shape the fused kernels reject, keep
+# the original implementation.
+
+_sdpa_warned = False
+
+
+def set_efficient_mit_attention(enabled=True):
+    """Turn the MiT fused-attention patch on or off. On by default at import."""
+    from segmentation_models_pytorch.encoders.mix_transformer import Attention
+
+    if not hasattr(Attention, "_forward_explicit"):
+        Attention._forward_explicit = Attention.forward
+    Attention.forward = _mit_sdpa_forward if enabled else Attention._forward_explicit
+
+
+def _mit_sdpa_forward(self, x, height, width):
+    global _sdpa_warned
+    if not x.is_cuda:
+        return type(self)._forward_explicit(self, x, height, width)
+
+    batch_size, tokens, channels = x.shape
+    q = (
+        self.q(x)
+        .reshape(batch_size, tokens, self.num_heads, channels // self.num_heads)
+        .permute(0, 2, 1, 3)
+    )
+    if self.sr_ratio > 1:
+        reduced = x.permute(0, 2, 1).reshape(batch_size, channels, height, width)
+        reduced = self.sr(reduced).reshape(batch_size, channels, -1).permute(0, 2, 1)
+        reduced = self.norm(reduced)
+        kv = (
+            self.kv(reduced)
+            .reshape(batch_size, -1, 2, self.num_heads, channels // self.num_heads)
+            .permute(2, 0, 3, 1, 4)
+        )
+    else:
+        kv = (
+            self.kv(x)
+            .reshape(batch_size, -1, 2, self.num_heads, channels // self.num_heads)
+            .permute(2, 0, 3, 1, 4)
+        )
+    k, v = kv[0], kv[1]
+    # attn_drop is 0 in the SegFormer configs; honour it if a caller sets it.
+    dropout_p = self.attn_drop.p if self.training else 0.0
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+            attended = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=dropout_p, scale=self.scale)
+    except Exception as exc:
+        if not _sdpa_warned:
+            print(f"MiT fused attention unavailable ({exc}); using the explicit score matrix.")
+            _sdpa_warned = True
+        return type(self)._forward_explicit(self, x, height, width)
+
+    attended = attended.transpose(1, 2).reshape(batch_size, tokens, channels)
+    attended = self.proj(attended)
+    return self.proj_drop(attended)
+
+
+set_efficient_mit_attention(True)

@@ -24,8 +24,19 @@ _thread = None
 
 KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 VALUE = re.compile(r"^[A-Za-z0-9_./+\-:,\[\]{}]+$")
+# A directory name and a W&B display name. No spaces or slashes.
+EXP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,180}$")
 PRECISIONS = ("bf16-mixed", "16-mixed", "32-true")
 LOGGERS = ("wandb", "csv")
+# Same names as few_shot_mode in configs/data/data.yaml.
+FEW_SHOT_MODES = (
+    "max_px_site_pheno",
+    "max_px_site",
+    "max_px_pheno",
+    "max_px",
+    "random",
+    "all",
+)
 DATA_DEFAULT = "neophytes_split_cv3_train_1024"
 MODEL_DEFAULT = "model_neophytes_mit_b2"
 # Example command in a model config's header, e.g. the 512 schedule in
@@ -135,8 +146,61 @@ def train_options():
             "precision": default_model["precision"],
             "logger": "wandb",
             "run_test": False,
+            "few_shot_k": None,
+            "few_shot_bg_k": 10,
+            "few_shot_mode": "max_px_site_pheno",
+            "val_few_shot_k": None,
+            "val_few_shot_bg_k": 0,
+            "val_few_shot_mode": "all",
         },
+        "few_shot_modes": list(FEW_SHOT_MODES),
     }
+
+
+def _count(value, name, low, high):
+    """An optional tile count. None and '' mean the field was left blank."""
+    if value is None or value == "":
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError) as exc:
+        raise JobError(f"{name} must be a whole number") from exc
+    if not low <= count <= high:
+        raise JobError(f"{name} must be from {low} to {high}")
+    return count
+
+
+def few_shot_overrides(body):
+    """Hydra args for a per-species subset. Blank counts use the whole split.
+
+    Background tiles are only sent together with a species count. Otherwise the
+    training config would add its own default (1000 background tiles) on top of
+    a small species subset.
+    """
+    args = []
+    train_k = _count(body.get("few_shot_k"), "images per species", 1, 5000)
+    if train_k is not None:
+        bg = _count(body.get("few_shot_bg_k"), "background tiles", 0, 5000)
+        mode = body.get("few_shot_mode") or "max_px_site_pheno"
+        if mode not in FEW_SHOT_MODES:
+            raise JobError("unknown tile selection")
+        args += [
+            f"data.few_shot_k={train_k}",
+            f"data.few_shot_bg_k={0 if bg is None else bg}",
+            f"data.few_shot_mode={mode}",
+        ]
+    val_k = _count(body.get("val_few_shot_k"), "val images per species", 1, 5000)
+    if val_k is not None:
+        bg = _count(body.get("val_few_shot_bg_k"), "val background tiles", 0, 5000)
+        mode = body.get("val_few_shot_mode") or "all"
+        if mode not in FEW_SHOT_MODES:
+            raise JobError("unknown val tile selection")
+        args += [
+            f"data.val_few_shot_k={val_k}",
+            f"data.val_few_shot_bg_k={0 if bg is None else bg}",
+            f"data.val_few_shot_mode={mode}",
+        ]
+    return args
 
 
 def _check_override(arg):
@@ -199,6 +263,117 @@ def list_jobs():
         return {"jobs": [_public(job) for job in jobs]}
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# Lightning's tqdm line, plus test.py's Evaluating bar. Epoch is 0-based.
+# The step counts sit after the bar.
+_BAR = re.compile(
+    r"^(?:Epoch (?P<epoch>\d+)"
+    r"|(?P<phase>Validation|Testing|Sanity Checking) DataLoader \d+"
+    r"|(?P<plain>Evaluating)):"
+    r"[^|\n]*\|[^|\n]*\|\s*(?P<step>\d+)/(?P<total>\d+)\s+\[(?P<elapsed>[^<]*)<(?P<left>[^,\]]*)"
+)
+_PHASE = {
+    "Validation": "validation",
+    "Testing": "testing",
+    "Sanity Checking": "sanity check",
+    "Evaluating": "evaluating",
+}
+
+
+def _max_epochs(job):
+    match = re.search(r"(?:^|\s)model\.max_epochs=(\d+)", job.get("command") or "")
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _left(token):
+    """Turn a tqdm remainder like 50:29 or 1:13:55 into a short phrase."""
+    token = token.strip()
+    if not token or "?" in token:
+        return ""
+    parts = token.split(":")
+    if not all(part.isdigit() for part in parts):
+        return ""
+    nums = [int(part) for part in parts]
+    if len(nums) == 2:
+        seconds = nums[0] * 60 + nums[1]
+    elif len(nums) == 3:
+        seconds = nums[0] * 3600 + nums[1] * 60 + nums[2]
+    else:
+        return ""
+    if seconds <= 0:
+        return ""
+    minutes = max(1, round(seconds / 60))
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m left"
+    return f"{minutes}m left"
+
+
+def _phrase(kind, epoch, epochs, step, total, left):
+    bits = []
+    if epoch is not None:
+        shown = epoch + 1
+        bits.append(f"epoch {shown}/{epochs}" if epochs else f"epoch {shown}")
+    bits.append(kind)
+    bits.append(f"{step}/{total}")
+    if left:
+        bits.append(left)
+    return " · ".join(bits)
+
+
+def _describe_progress(text, epochs):
+    """One line for the latest training, validation, or test bar in a log tail."""
+    epoch = None
+    latest = None
+    finished = False
+    for line in re.split(r"[\r\n]+", text):
+        line = line.strip()
+        if line.startswith("Training finished"):
+            finished = True
+            latest = None
+            continue
+        match = _BAR.match(line)
+        if not match:
+            continue
+        finished = False
+        if match.group("epoch") is not None:
+            epoch = int(match.group("epoch"))
+            latest = ("training", epoch, match)
+        else:
+            kind = _PHASE[match.group("phase") or match.group("plain")]
+            latest = (kind, epoch if kind == "validation" else None, match)
+    if latest is None:
+        return "training finished" if finished else ""
+    kind, epoch_n, match = latest
+    return _phrase(
+        kind,
+        epoch_n,
+        epochs,
+        match.group("step"),
+        match.group("total"),
+        _left(match.group("left")),
+    )
+
+
+def _progress_text(job):
+    if job.get("status") != "running":
+        return ""
+    path = JOBS_DIR / f"{job['id']}.log"
+    if not path.is_file():
+        return ""
+    size = path.stat().st_size
+    if size <= 0:
+        return ""
+    take = min(size, 1_048_576)
+    with open(path, "rb") as handle:
+        handle.seek(size - take)
+        data = handle.read()
+    text = _ANSI.sub("", data.decode("utf-8", "replace"))
+    return _describe_progress(text, _max_epochs(job))
+
+
 def _public(job):
     return {
         "id": job["id"],
@@ -214,6 +389,7 @@ def _public(job):
         "exit_code": job.get("exit_code"),
         "error": job.get("error"),
         "wait_reason": job.get("wait_reason") or "",
+        "progress": _progress_text(job),
     }
 
 
@@ -260,9 +436,8 @@ def enqueue(body):
     if len(overrides) > 40:
         raise JobError("too many overrides")
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     job_id = datetime.now().strftime("%Y%m%d%H%M%S") + f"{datetime.now().microsecond:06d}"
-    exp_name = f"{stamp}_{data}_{model}_s{seed}"
+    exp_name = resolve_exp_name(body, data, model, seed)
     train_argv = [
         str(python),
         str(REPO_ROOT / "train.py"),
@@ -276,6 +451,7 @@ def enqueue(body):
         f"data.batch_size_val={batch_val}",
         f"model.precision={precision}",
         f"logger={logger}",
+        *few_shot_overrides(body),
         *overrides,
         f"exp_name={exp_name}",
     ]
@@ -316,6 +492,42 @@ def _trim(jobs):
     keep = {job["id"] for job in finished[-50:]}
     keep.update(job["id"] for job in jobs if job["status"] in {"queued", "running"})
     return [job for job in jobs if job["id"] in keep]
+
+
+def subset_tag(body):
+    """Short name suffix for a subset, e.g. t10_v10_tbg10_vbg0.
+
+    Species counts come first, then the background tiles sent with each of them.
+    A side with no species count is left out.
+    """
+    parts = []
+    train_k = _count(body.get("few_shot_k"), "images per species", 1, 5000)
+    val_k = _count(body.get("val_few_shot_k"), "val images per species", 1, 5000)
+    if train_k is not None:
+        parts.append(f"t{train_k}")
+    if val_k is not None:
+        parts.append(f"v{val_k}")
+    if train_k is not None:
+        bg = _count(body.get("few_shot_bg_k"), "background tiles", 0, 5000)
+        parts.append(f"tbg{0 if bg is None else bg}")
+    if val_k is not None:
+        bg = _count(body.get("val_few_shot_bg_k"), "val background tiles", 0, 5000)
+        parts.append(f"vbg{0 if bg is None else bg}")
+    return "_".join(parts)
+
+
+def resolve_exp_name(body, data, model, seed):
+    """The W&B name. Blank keeps the timestamped name the queue used to assign."""
+    raw = str(body.get("exp_name") or "").strip()
+    if not raw:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        raw = f"{stamp}_{data}_{model}_s{seed}"
+        tag = subset_tag(body)
+        if tag:
+            raw = f"{raw}_{tag}"
+    if not EXP_NAME.fullmatch(raw):
+        raise JobError("W&B name must use letters, numbers, dots, hyphens, and underscores")
+    return raw
 
 
 def _format_lr(lr):

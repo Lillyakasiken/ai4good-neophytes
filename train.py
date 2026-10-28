@@ -38,6 +38,7 @@ def main(cfg: DictConfig) -> None:
     from datasets.neophyte_datamodule import NeophyteDataModule
     from models.semseg_plm import SegmentationModel
     from utils.callback_utils import get_callbacks
+    from utils.eval_utils import class_stats_names
     from utils.transform_utils import get_transforms
 
     print('Imports completed.')
@@ -45,6 +46,9 @@ def main(cfg: DictConfig) -> None:
     # # avoids shared-memory allocation errors with many dataloader workers
     torch.multiprocessing.set_sharing_strategy('file_system')
     torch.set_float32_matmul_precision('medium')
+    # Fixed crop and tile shapes, and deterministic_train is already off, so letting
+    # cuDNN pick the fastest convolution is free. Skip it when determinism is requested.
+    torch.backends.cudnn.benchmark = not cfg.deterministic_train
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     matplotlib.rcParams.update(cfg.matplotlib_style)
@@ -85,6 +89,7 @@ def main(cfg: DictConfig) -> None:
                                     val_few_shot_k=cfg.data.val_few_shot_k,
                                     val_few_shot_mode=cfg.data.val_few_shot_mode,
                                     val_few_shot_bg_k=cfg.data.val_few_shot_bg_k,
+                                    val_subset=cfg.data.val_subset,
                                     load_into_ram=cfg.data.load_into_ram,
                                     batch_size_train=cfg.data.batch_size_train,
                                     batch_size_val=cfg.data.batch_size_val,
@@ -97,9 +102,10 @@ def main(cfg: DictConfig) -> None:
     print('# Val imgs:   ', len(dataModule.val_dataset))
     print('# Test imgs:  ', len(dataModule.test_dataset))
 
-    # # sanity check: one batch through the pipeline before the model is built
-    batch = next(iter(dataModule.train_dataloader()))
-    print('Image batch shape: ', batch['image'].shape, '\nMask batch shape:  ', batch['mask'].shape)
+    # One sample, on the main process. A DataLoader here would start the persistent
+    # worker pool twice (this check, then Trainer) and throw the first pool away.
+    sample = dataModule.train_dataset[0]
+    print('Image shape: ', tuple(sample['image'].shape), '\nMask shape:  ', tuple(sample['mask'].shape))
 
     # %% model
     model = SegmentationModel(cfg.model.model_name,
@@ -114,7 +120,10 @@ def main(cfg: DictConfig) -> None:
                               loss=cfg.model.loss,
                               weight=cfg.model.weight,
                               patch_2_img_size=cfg.model.patch_2_img_size,
-                              fusion_mode=cfg.model.fusion_mode)
+                              fusion_mode=cfg.model.fusion_mode,
+                              phenology_names=list(cfg.data.phenology_names) if "phenology_names" in cfg.data else None,
+                              class_names=class_stats_names(cfg.data.classes) if "classes" in cfg.data else None,
+                              phenology_min_px=cfg.model.phenology_min_px)
 
     # %% training
     callbacks = get_callbacks(cfg.model.callbacks)
@@ -143,12 +152,17 @@ def main(cfg: DictConfig) -> None:
     print('Training finished. Elapsed Time:', round((time.time() - start_time) / 60, 2), 'min')
 
     # %% quick test-set pass with the best checkpoint
-    # # (the detailed evaluation lives in test.py)
-    ckpt_path = trainer.checkpoint_callback.best_model_path
-    print('ckpt_path: ', ckpt_path)
-    model = SegmentationModel.load_from_checkpoint(ckpt_path, weights_only=False).to(device)
-    model.eval()
-    trainer.test(model=model, dataloaders=dataModule)
+    # # (the detailed evaluation lives in test.py). model.run_final_test=false skips
+    # # it when test.py is run afterwards; the default is to keep this pass.
+    if cfg.model.run_final_test:
+        ckpt_path = trainer.checkpoint_callback.best_model_path
+        print('ckpt_path: ', ckpt_path)
+        model = SegmentationModel.load_from_checkpoint(ckpt_path, weights_only=False).to(device)
+        model.eval()
+        trainer.test(model=model, dataloaders=dataModule)
+    else:
+        print('Skipping the end-of-training test pass (model.run_final_test=false). '
+              'Run test.py for the full evaluation.')
 
     if cfg.logger == 'wandb':
         import wandb

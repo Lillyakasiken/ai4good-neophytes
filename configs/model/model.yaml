@@ -9,6 +9,10 @@ in_channels:
   image: 3
 
 num_classes: 7        # 6 species + background
+# # Per-stage metrics (val_phenology/*, test_phenology/*). A species x stage cell with
+# # fewer labelled pixels than this is not logged as a score (its pixel count still is):
+# # fruiting is empty for some species, and a NaN would break the W&B line charts.
+phenology_min_px: 10000
 img_size: ${data.crop_size_train}
 
 # # Architecture, see https://smp.readthedocs.io
@@ -35,7 +39,15 @@ lr: 0.0001
 optimizer: AdamW      # AdamW or Adam
 loss: Focal           # Focal (down-weights the dominant background) or CE
 weight: null          # optional per-class loss weights, length = num_classes
+# A validation pass scores every val tile at full resolution and takes much longer
+# than one training epoch (minutes against seconds on the cv folds). 1 scores every
+# epoch. 5 or 10 still selects the best checkpoint and cuts the share of the run
+# that validation takes. The metrics themselves are unchanged.
 check_val_every_n_epoch: 1
+# The trainer.test pass at the end of train.py. test.py repeats that evaluation
+# with the full breakdowns, so set this false when you run test.py afterwards.
+# true keeps the pass.
+run_final_test: true
 precision: 'bf16-mixed'  # 'bf16-mixed' (recommended), '16-mixed' (older GPUs), '32-true'
 
 lr_scheduler:

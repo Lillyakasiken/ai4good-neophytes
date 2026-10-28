@@ -43,6 +43,314 @@ def extract_month(path):
     return os.path.normpath(path).split(os.sep)[-1][5:7]
 
 
+# Stage band values 1, 2, 3. Value 0 (unknown) and 4 (excluded) are not scored.
+PHENO_STAGE_KEYS = ("non_flowering", "flowering", "fruiting")
+
+
+def slug_stage_name(name):
+    """``non-flowering`` -> ``non_flowering``, so the name is safe in a W&B key."""
+    return str(name).strip().replace("-", "_").replace(" ", "_")
+
+
+def phenology_stage_keys(names=None):
+    """Three stage keys in band order (values 1, 2, 3)."""
+    if names is None:
+        return list(PHENO_STAGE_KEYS)
+    keys = [slug_stage_name(n) for n in names]
+    if len(keys) != len(PHENO_STAGE_KEYS):
+        raise ValueError(f"Expected {len(PHENO_STAGE_KEYS)} phenology stages, got {keys}")
+    return keys
+
+
+def class_stats_names(classes):
+    """Class key per class index, using ``stats_name`` (``B_davidii``) when present."""
+    names = []
+    for i in sorted(classes.keys(), key=lambda k: int(k)):
+        entry = classes[i]
+        names.append(str(entry.stats_name if "stats_name" in entry else entry.name))
+    return names
+
+
+def restore_compact_labels(batch):
+    """Cast compact labels back to the dtypes the metrics have always received.
+
+    ``NeophyteDataset`` ships the mask as int8 and canopy/phenology as uint8 so a
+    2048 px tile is not copied around as int64. ``ignore_index`` is -1, which does
+    not fit in uint8, so the mask stays int8 and ``.long()`` restores -1 exactly.
+    Canopy and phenology values are non-negative and small, so uint8 round-trips
+    through ``.float()`` and ``.long()``. Call this after the batch is on device:
+    the cast then runs on the GPU and the host-to-device copy stays compact.
+    """
+    mask = batch.get("mask")
+    if torch.is_tensor(mask) and mask.dtype != torch.long:
+        batch["mask"] = mask.long()
+    phenology = batch.get("phenology")
+    if torch.is_tensor(phenology) and phenology.dtype != torch.long:
+        batch["phenology"] = phenology.long()
+    canopy = batch.get("canopy")
+    if torch.is_tensor(canopy) and canopy.dtype != torch.float32:
+        batch["canopy"] = canopy.float()
+    return batch
+
+
+def update_phenology_counts(counts, preds, masks, phenology):
+    """Add label pixels to ``counts[species, stage, predicted class]``.
+
+    ``counts`` is a CPU long tensor of shape ``[C, 3, C]``. Stage value 1 is index 0.
+    Ignored labels, background, and stages other than 1..3 are skipped. The three
+    stages are non-flowering, flowering and fruiting.
+    """
+    num_classes = counts.shape[0]
+    preds = preds.reshape(-1)
+    masks = masks.reshape(-1).long()
+    phenology = phenology.reshape(-1).long()
+    valid = (
+        (masks >= 1) & (masks < num_classes)
+        & (phenology >= 1) & (phenology <= len(PHENO_STAGE_KEYS))
+        & (preds >= 0) & (preds < num_classes)
+    )
+    if not bool(valid.any()):
+        return
+    c = masks[valid]
+    s = phenology[valid] - 1
+    p = preds[valid].long()
+    flat = c * (len(PHENO_STAGE_KEYS) * num_classes) + s * num_classes + p
+    # bincount stays on the prediction device; only the  C*3*C  bin vector is copied
+    inc = torch.bincount(flat, minlength=counts.numel()).to(dtype=torch.long)
+    # .tolist() leaves inference mode (validation steps run under it), so the
+    # accumulator, which lives outside that mode, can be updated.
+    counts.view(-1).add_(torch.tensor(inc.detach().cpu().tolist(), dtype=torch.long))
+
+
+def phenology_breakdown(counts, stage_names, class_names, min_px):
+    """Shares per species and stage from a ``[C, 3, C]`` count tensor.
+
+    For each cell the three shares sum to 1: recall (predicted as that species),
+    miss_to_background, and confused (predicted as some other species). Cells with
+    fewer than ``min_px`` label pixels have ``below_min_px`` set; their shares are
+    still filled in when the cell is non-empty, so a caller can decide what to log.
+    """
+    if torch.is_tensor(counts):
+        counts = counts.detach().cpu().numpy()
+    counts = np.asarray(counts)
+    stage_names = list(stage_names)
+    species = [(i, class_names[i]) for i in range(1, counts.shape[0])]
+    cells = {}
+    for class_id, name in species:
+        cells[name] = {}
+        for s, stage in enumerate(stage_names):
+            row = counts[class_id, s]
+            support = int(row.sum())
+            confused_with = {}
+            if support > 0:
+                correct = int(row[class_id])
+                missed = int(row[0])
+                recall = correct / support
+                miss_to_background = missed / support
+                confused = (support - correct - missed) / support
+                for j in range(1, counts.shape[0]):
+                    if j == class_id:
+                        continue
+                    confused_with[class_names[j]] = int(row[j]) / support
+            else:
+                recall = miss_to_background = confused = None
+            cells[name][stage] = {
+                "recall": recall,
+                "miss_to_background": miss_to_background,
+                "confused": confused,
+                "support_px": support,
+                "below_min_px": support < min_px,
+                "confused_with": confused_with,
+            }
+    return {
+        "stages": stage_names,
+        "species": [name for _, name in species],
+        "min_px": int(min_px),
+        "cells": cells,
+    }
+
+
+def phenology_scalar_dict(prefix, breakdown):
+    """One mean per stage for recall, background misses, and species confusion.
+
+    Per-species numbers stay in ``phenology_table_rows``. A key per species made
+    W&B open a chart for each one. Cells below ``min_px`` are left out of the
+    mean so an empty stage does not pull it down, and a missing mean is not logged.
+    """
+    names = ("recall", "miss_to_background", "confused")
+    buckets = {name: {stage: [] for stage in breakdown["stages"]} for name in names}
+    for stages in breakdown["cells"].values():
+        for stage, cell in stages.items():
+            if cell["below_min_px"] or cell["recall"] is None:
+                continue
+            for name in names:
+                buckets[name][stage].append(float(cell[name]))
+    out = {}
+    for name, by_stage in buckets.items():
+        for stage, vals in by_stage.items():
+            if vals:
+                out[f"{prefix}/{name}/{stage}/mean"] = float(sum(vals) / len(vals))
+    return out
+
+
+def phenology_table_rows(breakdown):
+    """One row per species and stage. Shares are blank when the cell is below ``min_px``."""
+    columns = ["species", "stage", "recall", "miss_to_background", "confused", "support_px"]
+    rows = []
+    for species, stages in breakdown["cells"].items():
+        for stage, cell in stages.items():
+            show = cell["recall"] is not None and not cell["below_min_px"]
+            rows.append([
+                species,
+                stage,
+                float(cell["recall"]) if show else None,
+                float(cell["miss_to_background"]) if show else None,
+                float(cell["confused"]) if show else None,
+                int(cell["support_px"]),
+            ])
+    return columns, rows
+
+
+def format_worst_stages(breakdown):
+    """One line per species: the stage with the lowest recall, among cells with enough pixels."""
+    lines = []
+    for species, stages in breakdown["cells"].items():
+        eligible = [(stage, cell) for stage, cell in stages.items()
+                    if cell["recall"] is not None and not cell["below_min_px"]]
+        if not eligible:
+            lines.append(f"{species}: no stage with at least {breakdown['min_px']} labelled pixels")
+            continue
+        stage, cell = min(eligible, key=lambda item: item[1]["recall"])
+        lines.append(
+            f"{species}: worst stage {stage}  recall={cell['recall']:.3f}  "
+            f"miss_to_background={cell['miss_to_background']:.3f}  "
+            f"confused={cell['confused']:.3f}  n={cell['support_px']}"
+        )
+    return "\n".join(lines)
+
+
+def _pheno_species_order(breakdown, species_order):
+    order = list(species_order) if species_order is not None else list(breakdown["species"])
+    missing = [name for name in order if name not in breakdown["cells"]]
+    if missing:
+        raise KeyError(f"Species not in the phenology breakdown: {missing}")
+    return order
+
+
+def _fmt_support(n):
+    n = int(n)
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1e3:.0f}k"
+    return str(n)
+
+
+def visualize_phenology_recall_heatmap(breakdown, save_name, species_order=None, display_names=None):
+    """Species (rows) by stage (columns). Cells below ``min_px`` are grey.
+
+    The number in each cell is the recall in percent, with the labelled pixel
+    count underneath. Grey cells show only the pixel count.
+    """
+    order = _pheno_species_order(breakdown, species_order)
+    stages = breakdown["stages"]
+    labels = [display_names.get(name, name) if display_names else name for name in order]
+    recall = np.full((len(order), len(stages)), np.nan)
+    below = np.zeros_like(recall, dtype=bool)
+    support = np.zeros_like(recall)
+    for i, species in enumerate(order):
+        for j, stage in enumerate(stages):
+            cell = breakdown["cells"][species][stage]
+            support[i, j] = cell["support_px"]
+            below[i, j] = cell["below_min_px"] or cell["recall"] is None
+            if cell["recall"] is not None:
+                recall[i, j] = cell["recall"]
+
+    shown = np.ma.masked_where(below | np.isnan(recall), recall)
+    cmap = plt.cm.viridis.copy()
+    cmap.set_bad("#d9d9d9")
+    fig_h = 0.7 * len(order) + 1.6
+    fig, ax = plt.subplots(figsize=(7.2, fig_h))
+    im = ax.imshow(shown, vmin=0, vmax=1, cmap=cmap, aspect="auto")
+    ax.set_xticks(range(len(stages)))
+    ax.set_xticklabels([s.replace("_", " ") for s in stages])
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels(labels)
+    for i in range(len(order)):
+        for j in range(len(stages)):
+            if below[i, j]:
+                text, color = f"n={_fmt_support(support[i, j])}", "#555555"
+            else:
+                text = f"{recall[i, j] * 100:.0f}%\n{_fmt_support(support[i, j])}"
+                color = "white" if recall[i, j] >= 0.55 else "black"
+            ax.text(j, i, text, ha="center", va="center", fontsize=9, color=color)
+    ax.set_title("Stage recall (grey: too few labelled pixels)")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="recall")
+    plt.tight_layout()
+    plt.savefig(save_name, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+def visualize_phenology_failure_bars(breakdown, save_name, species_order=None, display_names=None):
+    """Stacked shares per species and stage: correct, missed to background, confused.
+
+    A stage with too few pixels is left empty and marked ``low n``, so it is not
+    read as a real failure rate.
+    """
+    order = _pheno_species_order(breakdown, species_order)
+    stages = breakdown["stages"]
+    labels = [display_names.get(name, name) if display_names else name for name in order]
+    n_stages = len(stages)
+    width = 0.8 / n_stages
+    fig, ax = plt.subplots(figsize=(max(8, 1.4 * len(order)), 4.8))
+    colors = {"correct": "#4c78a8", "missed": "#c7c7c7", "confused": "#e45756"}
+    x_base = np.arange(len(order))
+    legend_done = set()
+    for j, stage in enumerate(stages):
+        offset = (j - (n_stages - 1) / 2) * width
+        xs = x_base + offset
+        correct, missed, confused, low = [], [], [], []
+        for species in order:
+            cell = breakdown["cells"][species][stage]
+            if cell["below_min_px"] or cell["recall"] is None:
+                correct.append(0.0)
+                missed.append(0.0)
+                confused.append(0.0)
+                low.append(True)
+            else:
+                correct.append(cell["recall"])
+                missed.append(cell["miss_to_background"])
+                confused.append(cell["confused"])
+                low.append(False)
+        series = (
+            ("correct", correct, colors["correct"]),
+            ("missed to background", missed, colors["missed"]),
+            ("confused with another species", confused, colors["confused"]),
+        )
+        bottom = np.zeros(len(order))
+        for name, values, color in series:
+            label = name if name not in legend_done else None
+            legend_done.add(name)
+            ax.bar(xs, values, width * 0.92, bottom=bottom, color=color, label=label)
+            bottom += np.asarray(values)
+        for x, is_low, species_i in zip(xs, low, range(len(order))):
+            if is_low:
+                n = breakdown["cells"][order[species_i]][stage]["support_px"]
+                ax.text(x, 0.02, f"low n\n{_fmt_support(n)}", ha="center", va="bottom",
+                        fontsize=7, color="#555555", rotation=90)
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("share of labelled pixels")
+    ax.set_xticks(x_base)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.yaxis.grid(True, linestyle="--", alpha=0.6)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.16), ncol=3, frameon=False)
+    # stage names under the group, one small label per bar slot via a second line
+    ax.set_xlabel("  ".join(s.replace("_", "-") for s in stages) + "   (left to right within each species)")
+    plt.tight_layout()
+    plt.savefig(save_name, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
 def collapse_confusion_to_binary(conf):
     """Collapse a multiclass confusion matrix into 2x2: background vs. any neophyte."""
     bg, fg = 0, slice(1, None)
@@ -105,7 +413,9 @@ def binary_metrics_from_confusion(conf):
 def evaluate_model(model, dataloader, num_classes, device, ignore_index=-1,
                    eval_auxiliary=False, eval_site=False, eval_month=False,
                    eval_cv=False, cv_folds=None, compute_auc=False, auc_thresholds=200,
-                   save_dir=None, class_names=None, display_order=None):
+                   save_dir=None, class_names=None, display_order=None,
+                   phenology_names=None, phenology_class_names=None, phenology_min_px=10000,
+                   autocast=False):
     """Run the model over a dataloader and score it.
 
     One pass accumulates every confusion matrix at once -- the global one plus the
@@ -123,8 +433,14 @@ def evaluate_model(model, dataloader, num_classes, device, ignore_index=-1,
             per class, plus binary background-vs-neophyte). The score axis is
             discretised into ``auc_thresholds`` steps -- storing every pixel score
             would be terabytes.
+        autocast: run the forward in bfloat16 (then cast probabilities back to
+            fp32 before every metric). Off by default, so the forward stays fp32
+            as in previous evaluations. The metric code itself is not changed.
         display_order: class order used for the JSON output and the plots (the
             class ids of the data config, background first).
+        phenology_names / phenology_class_names / phenology_min_px: only used for the
+            extra per-stage breakdown (``phenology_breakdown``). The existing
+            phenology and canopy scores are computed exactly as before.
 
     Returns a dict with the confusion matrix and the metric dicts.
     """
@@ -140,6 +456,9 @@ def evaluate_model(model, dataloader, num_classes, device, ignore_index=-1,
                       for c in range(num_classes)} if eval_auxiliary else {}
     metrics_phenology = {c: {phe: {'correct': 0, 'total': 0, 'ratio': 0} for phe in range(1, 4)}
                          for c in range(num_classes)} if eval_auxiliary else {}
+    # separate from metrics_phenology: species x stage x predicted class
+    pheno_counts = (torch.zeros(num_classes, len(PHENO_STAGE_KEYS), num_classes, dtype=torch.long)
+                    if eval_auxiliary else None)
 
     auc_metric = MulticlassAUROC(num_classes=num_classes, average=None, ignore_index=ignore_index,
                                  thresholds=auc_thresholds).to(device) if compute_auc else None
@@ -147,14 +466,22 @@ def evaluate_model(model, dataloader, num_classes, device, ignore_index=-1,
 
     with torch.no_grad():
         for batch in tqdm(dataloader, total=len(dataloader), desc="Evaluating"):
+            # Compact labels are cast on the GPU, after the host-to-device copy.
             masks = batch['mask'].to(device)
+            if masks.dtype != torch.long:
+                masks = masks.long()
             names = batch['name']
 
             inputs, aux = model.prepare_inputs(batch)
             inputs = inputs.to(device)
             if aux is not None:
                 aux = aux.to(device)
-            probs = model(inputs, aux)
+            if autocast and device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    probs = model(inputs, aux)
+                probs = probs.float()
+            else:
+                probs = model(inputs, aux)
             preds = torch.argmax(probs, dim=1)
 
             conf_.update(preds, masks)
@@ -211,9 +538,14 @@ def evaluate_model(model, dataloader, num_classes, device, ignore_index=-1,
             if eval_auxiliary:
                 canopy = batch['canopy'].to(device)
                 phenology = batch['phenology'].to(device)
+                if canopy.dtype != torch.float32:
+                    canopy = canopy.float()
+                if phenology.dtype != torch.long:
+                    phenology = phenology.long()
                 known = (canopy != ignore_index) & (phenology != ignore_index)
                 valid_preds, valid_masks = preds[known], masks[known]
                 valid_can, valid_phe = canopy[known], phenology[known]
+                update_phenology_counts(pheno_counts, valid_preds, valid_masks, valid_phe)
 
                 for class_id in range(num_classes):
                     is_class = valid_masks == class_id
@@ -273,6 +605,14 @@ def evaluate_model(model, dataloader, num_classes, device, ignore_index=-1,
                 if counts['total'] > 0:
                     counts['ratio'] = round(counts['correct'] / counts['total'] * 100, 2)
 
+    phenology_breakdown_dict = None
+    if pheno_counts is not None:
+        stage_keys = phenology_stage_keys(phenology_names)
+        if phenology_class_names is None:
+            phenology_class_names = [f"class_{i}" for i in range(num_classes)]
+        phenology_breakdown_dict = phenology_breakdown(
+            pheno_counts, stage_keys, list(phenology_class_names), phenology_min_px)
+
     # ---- save --------------------------------------------------------------
     if save_dir:
         _PER_CLASS_KEYS = ('F1', 'IoU', 'Precision', 'Recall', 'AUC')
@@ -306,6 +646,7 @@ def evaluate_model(model, dataloader, num_classes, device, ignore_index=-1,
         if eval_auxiliary:
             _dump(metrics_canopy, 'metrics_canopy.json')
             _dump(metrics_phenology, 'metrics_phenology.json')
+            _dump(phenology_breakdown_dict, 'metrics_phenology_breakdown.json')
 
     return {
         'conf': conf,
@@ -316,6 +657,7 @@ def evaluate_model(model, dataloader, num_classes, device, ignore_index=-1,
         'semseg_cv': metrics_semseg_cv,
         'canopy': metrics_canopy,
         'phenology': metrics_phenology,
+        'phenology_breakdown': phenology_breakdown_dict,
     }
 
 
@@ -491,7 +833,7 @@ def visualize_f1_per_month(metrics_month, save_path, class_names, class_colors):
 # =============================================================================
 def save_model_predictions(model, dataloader, device, save_dir, colors, class_names=None,
                            gray_boost=1.15, ignore_index=-1, ndsm_mean=0.0, ndsm_std=1.0,
-                           entropy_gamma=0.5):
+                           entropy_gamma=0.5, autocast=False):
     """One figure per tile: [RGB | reference | prediction | entropy | (nDSM)].
 
     Masks are drawn over a brightened grayscale version of the tile so the plants
@@ -518,6 +860,8 @@ def save_model_predictions(model, dataloader, device, save_dir, colors, class_na
         for batch in dataloader:
             imgs = batch["image"]
             masks = batch["mask"]
+            if torch.is_tensor(masks) and masks.dtype != torch.long:
+                masks = masks.long()
             names = batch.get("name", None)
             ndsm_batch = batch.get("ndsm", None)
 
@@ -525,7 +869,12 @@ def save_model_predictions(model, dataloader, device, save_dir, colors, class_na
             inputs = inputs.to(device)
             if aux is not None:
                 aux = aux.to(device)
-            probs = model(inputs, aux)
+            if autocast and device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    probs = model(inputs, aux)
+                probs = probs.float()
+            else:
+                probs = model(inputs, aux)
             preds = probs.argmax(dim=1).cpu().numpy()
             num_classes = probs.shape[1]
             norm_entropy = (-(probs * torch.log(probs + 1e-10)).sum(dim=1)

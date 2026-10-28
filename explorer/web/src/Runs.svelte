@@ -15,6 +15,17 @@
   let batchVal = $state(2);
   let precision = $state('bf16-mixed');
   let logger = $state('wandb');
+  let nameStamp = $state(stampNow());
+  let expName = $state(`${nameStamp}_neophytes_split_cv3_train_1024_model_neophytes_mit_b2_s42`);
+  let expNameCustom = $state(false);
+  let subsetOn = $state(false);
+  let fewShotK = $state(null);
+  let fewShotBg = $state(10);
+  let fewShotMode = $state('max_px_site_pheno');
+  let valFewShotK = $state(null);
+  let valFewShotBg = $state(0);
+  let valFewShotMode = $state('all');
+  let subsetNote = $state(false);
   let runTest = $state(false);
   let testNote = $state(false);
   let extraNote = $state(false);
@@ -61,16 +72,98 @@
       `data.batch_size_val=${batchVal}`,
       `model.precision=${precision}`,
       `logger=${logger}`,
+      ...subsetArgs(),
       ...overrideLines(extra),
-      'exp_name=<set when queued>',
+      `exp_name=${runName()}`,
     ];
     let text = lines.join(' ');
-    if (runTest) text += '\n.venv/bin/python test.py exp_name=<same run>';
+    if (runTest) text += `\n.venv/bin/python test.py exp_name=${runName()}`;
     return text;
   });
 
   let running = $derived(jobs.find((job) => job.status === 'running') ?? null);
   let trace = $derived(polyline(samples));
+
+  const modeLabel = {
+    max_px_site_pheno: 'largest, spread over sites and stages',
+    max_px_site: 'largest, spread over sites',
+    max_px_pheno: 'largest, spread over stages',
+    max_px: 'largest tiles',
+    random: 'random',
+    all: 'any tile with that species',
+  };
+
+  function stampNow() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+
+  function countText(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? String(n) : '0';
+  }
+
+  // t10_v10_tbg10_vbg0: species counts first, then the background tiles that go with them.
+  function subsetTag() {
+    if (!subsetOn) return '';
+    const parts = [];
+    const trainSet = fewShotK != null && fewShotK !== '';
+    const valSet = valFewShotK != null && valFewShotK !== '';
+    if (trainSet) parts.push(`t${countText(fewShotK)}`);
+    if (valSet) parts.push(`v${countText(valFewShotK)}`);
+    if (trainSet) parts.push(`tbg${countText(fewShotBg)}`);
+    if (valSet) parts.push(`vbg${countText(valFewShotBg)}`);
+    return parts.join('_');
+  }
+
+  function defaultRunName() {
+    const base = `${nameStamp}_${dataName}_${modelName}_s${seed}`;
+    const tag = subsetTag();
+    return tag ? `${base}_${tag}` : base;
+  }
+
+  function runName() {
+    const typed = expName.trim();
+    if (typed) return typed;
+    return defaultRunName();
+  }
+
+  // Keep the prefilled name in step with data, model, seed, and the subset
+  // counts until it is edited. The timestamp changes only with data, model, or seed.
+  let trackedNameKey = '';
+  $effect(() => {
+    const key = `${dataName}\0${modelName}\0${seed}`;
+    if (expNameCustom) return;
+    const tag = subsetTag();
+    if (key !== trackedNameKey) {
+      trackedNameKey = key;
+      nameStamp = stampNow();
+    }
+    const base = `${nameStamp}_${dataName}_${modelName}_s${seed}`;
+    expName = tag ? `${base}_${tag}` : base;
+  });
+
+  function subsetArgs() {
+    const args = [];
+    if (!subsetOn) return args;
+    if (fewShotK != null && fewShotK !== '') {
+      args.push(`data.few_shot_k=${Number(fewShotK)}`);
+      args.push(`data.few_shot_bg_k=${Number(fewShotBg)}`);
+      args.push(`data.few_shot_mode=${fewShotMode}`);
+    }
+    if (valFewShotK != null && valFewShotK !== '') {
+      args.push(`data.val_few_shot_k=${Number(valFewShotK)}`);
+      args.push(`data.val_few_shot_bg_k=${Number(valFewShotBg)}`);
+      args.push(`data.val_few_shot_mode=${valFewShotMode}`);
+    }
+    return args;
+  }
+
+  function countOrNull(value) {
+    if (value == null || value === '') return null;
+    return Number(value);
+  }
 
   function overrideLines(text) {
     return text.split('\n').map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
@@ -142,6 +235,10 @@
         if (d.batch_size_val != null) batchVal = d.batch_size_val;
         if (d.precision) precision = d.precision;
         if (d.logger) logger = d.logger;
+        if (d.few_shot_bg_k != null) fewShotBg = d.few_shot_bg_k;
+        if (d.few_shot_mode) fewShotMode = d.few_shot_mode;
+        if (d.val_few_shot_bg_k != null) valFewShotBg = d.val_few_shot_bg_k;
+        if (d.val_few_shot_mode) valFewShotMode = d.val_few_shot_mode;
       })
       .catch((err) => {
         if (err.name === 'AbortError') return;
@@ -311,7 +408,14 @@
           batch_size_val: Number(batchVal),
           precision,
           logger,
+          exp_name: expName.trim(),
           run_test: runTest,
+          few_shot_k: subsetOn ? countOrNull(fewShotK) : null,
+          few_shot_bg_k: subsetOn ? countOrNull(fewShotBg) : null,
+          few_shot_mode: subsetOn ? fewShotMode : null,
+          val_few_shot_k: subsetOn ? countOrNull(valFewShotK) : null,
+          val_few_shot_bg_k: subsetOn ? countOrNull(valFewShotBg) : null,
+          val_few_shot_mode: subsetOn ? valFewShotMode : null,
           overrides: overrideLines(extra),
         }),
       });
@@ -377,6 +481,12 @@
     else if (run.state === 'running') end = now;
     if (Number.isNaN(end) || end < start) return '—';
     return formatDuration(end - start);
+  }
+
+  function stateTone(state) {
+    if (state === 'running') return 'running';
+    if (state === 'failed' || state === 'crashed' || state === 'killed') return 'failed';
+    return state || '';
   }
 </script>
 
@@ -448,6 +558,76 @@
           {/each}
         </select>
       </label>
+      <label>
+        W&B name
+        <input type="text" spellcheck="false" bind:value={expName} oninput={() => (expNameCustom = true)} />
+      </label>
+      <div class="override-field">
+        <div class="check-row">
+          <label class="check">
+            <input type="checkbox" bind:checked={subsetOn} />
+            Subset
+          </label>
+          <span class="note-wrap">
+            <button
+              type="button"
+              class="info"
+              aria-label="What the subset fields do"
+              aria-expanded={subsetNote}
+              onclick={() => (subsetNote = !subsetNote)}
+            >i</button>
+            {#if subsetNote}
+              <div class="test-note" role="dialog" aria-label="What the subset fields do">
+                <p>
+                  Leave images per species empty to train or validate on the whole split.
+                  A number keeps that many tiles of each species. Background tiles are added on top.
+                </p>
+                <p>
+                  The training choice prefers the largest single-species tiles and spreads them over
+                  sites and stages. A validation subset drops empty tiles, so false positives on bare
+                  ground stay out of the score.
+                </p>
+              </div>
+            {/if}
+          </span>
+        </div>
+        {#if subsetOn}
+        <div class="grid">
+          <label>
+            Train images per species
+            <input type="number" min="1" max="5000" placeholder="all" bind:value={fewShotK} />
+          </label>
+          <label>
+            Val images per species
+            <input type="number" min="1" max="5000" placeholder="all" bind:value={valFewShotK} />
+          </label>
+          <label>
+            Train background tiles
+            <input type="number" min="0" max="5000" bind:value={fewShotBg} disabled={fewShotK == null || fewShotK === ''} />
+          </label>
+          <label>
+            Val background tiles
+            <input type="number" min="0" max="5000" bind:value={valFewShotBg} disabled={valFewShotK == null || valFewShotK === ''} />
+          </label>
+          <label>
+            Train tile choice
+            <select bind:value={fewShotMode} disabled={fewShotK == null || fewShotK === ''}>
+              {#each options?.few_shot_modes ?? [fewShotMode] as name}
+                <option value={name}>{modeLabel[name] ?? name}</option>
+              {/each}
+            </select>
+          </label>
+          <label>
+            Val tile choice
+            <select bind:value={valFewShotMode} disabled={valFewShotK == null || valFewShotK === ''}>
+              {#each options?.few_shot_modes ?? [valFewShotMode] as name}
+                <option value={name}>{modeLabel[name] ?? name}</option>
+              {/each}
+            </select>
+          </label>
+        </div>
+        {/if}
+      </div>
       <div class="check-row">
         <label class="check">
           <input type="checkbox" bind:checked={runTest} />
@@ -491,7 +671,7 @@
                 </p>
                 <p>
                   These are added to the train.py command after the fields above.
-                  A later key replaces an earlier one. The queue still sets the run name itself.
+                  A later key replaces an earlier one. The W&B name is added after these lines.
                 </p>
               </div>
             {/if}
@@ -569,6 +749,9 @@
                     <button type="button" class="cancel" onclick={() => askCancel(job)}>Cancel</button>
                   {/if}
                 </div>
+                {#if job.progress}
+                  <p class="now">{job.progress}</p>
+                {/if}
                 {#if job.wait_reason}
                   <p class="hint">{job.wait_reason}</p>
                 {/if}
@@ -662,7 +845,7 @@
                     {run.name}
                   {/if}
                 </td>
-                <td>{run.state}</td>
+                <td><span class="status" data-status={stateTone(run.state)}>{run.state}</span></td>
                 <td>{when(run.created_at)}</td>
                 <td>{when(run.finished_at) || '—'}</td>
                 <td class="num">{duration(run)}</td>
@@ -897,6 +1080,13 @@
 
   .status[data-status='running'] { color: var(--canopy); }
   .status[data-status='failed'] { color: #8c2f2f; }
+
+  .now {
+    margin: 2px 0 0;
+    color: var(--canopy);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
 
   .exp { word-break: break-all; }
 

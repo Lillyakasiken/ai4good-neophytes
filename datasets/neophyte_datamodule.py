@@ -6,6 +6,35 @@ from datasets.neophyte_dataset import NeophyteDataset
 from utils.utils import ensure_list_values
 
 
+def resolve_val_subset(val_subset, few_shot_k, few_shot_mode, few_shot_bg_k):
+    """Map the opt-in ``val_subset`` config onto the existing few-shot arguments.
+
+    ``enabled: false`` (the default) leaves validation on the full val set.
+    ``labelled: all`` keeps every tile that contains a neophyte and adds
+    ``bg_k`` background-only tiles. ``labelled: <int>`` keeps that many tiles
+    per class instead. This chooses which tiles are scored. It does not change
+    how a metric is computed. An explicit ``val_few_shot_k`` is left alone
+    unless the subset is enabled.
+    """
+    if val_subset is None:
+        return few_shot_k, few_shot_mode, few_shot_bg_k
+    enabled = val_subset["enabled"] if "enabled" in val_subset else True
+    if not enabled:
+        return few_shot_k, few_shot_mode, few_shot_bg_k
+    labelled = val_subset["labelled"]
+    bg_k = int(val_subset["bg_k"])
+    if str(labelled) == "all":
+        # mode 'all' returns every candidate when k is larger than the class
+        new_k = 10**9
+        described = "all labelled tiles"
+    else:
+        new_k = int(labelled)
+        described = f"{new_k} tiles per class"
+    print(f"val_subset: {described} plus {bg_k} background tiles. "
+          f"Tiles left out are not scored, so false positives there stay invisible.")
+    return new_k, "all", bg_k
+
+
 def _has_elevation(image_dirs):
     """True if any of the given image dirs has a non-empty 'dsm' subfolder."""
     dirs = [image_dirs] if isinstance(image_dirs, str) else list(image_dirs)
@@ -18,7 +47,7 @@ def _has_elevation(image_dirs):
     return False
 
 class NeophyteDataModule(pl.LightningDataModule):
-    def __init__(self, image_dirs, classes, transform_train, transform_val, transform_test, dsm_transform=False, ndsm_transform=False, dataset_stats=None, weighted_sampling=False, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, val_few_shot_k=None, val_few_shot_mode='all', val_few_shot_bg_k=0, pick_few_shot_k=10, pick_few_shot_mode='max_px_site_pheno', pick_few_shot_bg_k=0, load_into_ram=False, batch_size_train=16, batch_size_val=16, batch_size_test=16, num_workers=4):
+    def __init__(self, image_dirs, classes, transform_train, transform_val, transform_test, dsm_transform=False, ndsm_transform=False, dataset_stats=None, weighted_sampling=False, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, val_few_shot_k=None, val_few_shot_mode='all', val_few_shot_bg_k=0, val_subset=None, pick_few_shot_k=10, pick_few_shot_mode='max_px_site_pheno', pick_few_shot_bg_k=0, load_into_ram=False, batch_size_train=16, batch_size_val=16, batch_size_test=16, num_workers=4):
         super().__init__()
         self.image_dirs = ensure_list_values(image_dirs)
         self.classes = classes
@@ -43,9 +72,8 @@ class NeophyteDataModule(pl.LightningDataModule):
         self.few_shot_mode = few_shot_mode
         self.few_shot_bg_k = few_shot_bg_k
         self.max_nodata_frac = max_nodata_frac
-        self.val_few_shot_k = val_few_shot_k
-        self.val_few_shot_mode = val_few_shot_mode
-        self.val_few_shot_bg_k = val_few_shot_bg_k
+        self.val_few_shot_k, self.val_few_shot_mode, self.val_few_shot_bg_k = resolve_val_subset(
+            val_subset, val_few_shot_k, val_few_shot_mode, val_few_shot_bg_k)
         self.pick_few_shot_k = pick_few_shot_k
         self.pick_few_shot_mode = pick_few_shot_mode
         self.pick_few_shot_bg_k = pick_few_shot_bg_k
@@ -63,14 +91,17 @@ class NeophyteDataModule(pl.LightningDataModule):
             # # Val dataset. val_few_shot_k restricts it to labelled images, which makes
             # # validation much faster but also removes every background-only tile -- see
             # # the note in configs/data/data.yaml before switching it on.
-            self.val_dataset = NeophyteDataset(self.image_dirs.val, self.classes, transform=self.transform_val, dsm_transform=self.dsm_transform, ndsm_transform=self.ndsm_transform, dataset_stats=self.dataset_stats, value_mapping=self.value_mapping, ignore_index=self.ignore_index, load_auxiliary=self.load_auxiliary, load_dsm=self.load_dsm, load_dtm=self.load_dtm, load_ndsm=self.load_ndsm, few_shot_k=self.val_few_shot_k, few_shot_mode=self.val_few_shot_mode, few_shot_bg_k=self.val_few_shot_bg_k, load_into_ram=self.load_into_ram, preload_workers=self.num_workers)
+            # # Always load the stage band here. The per-stage metrics are logged every
+            # # validation epoch, and the training set stays on load_auxiliary.
+            self.val_dataset = NeophyteDataset(self.image_dirs.val, self.classes, transform=self.transform_val, dsm_transform=self.dsm_transform, ndsm_transform=self.ndsm_transform, dataset_stats=self.dataset_stats, value_mapping=self.value_mapping, ignore_index=self.ignore_index, load_auxiliary=True, load_dsm=self.load_dsm, load_dtm=self.load_dtm, load_ndsm=self.load_ndsm, few_shot_k=self.val_few_shot_k, few_shot_mode=self.val_few_shot_mode, few_shot_bg_k=self.val_few_shot_bg_k, load_into_ram=self.load_into_ram, preload_workers=self.num_workers)
             self.data_dims = self.train_dataset[0]['image'].shape
             # Initialize WeightedRandomSampler (only for train dataset)
             if self.weighted_sampling:
                 self.sampler = WeightedRandomSampler(self.train_dataset.sample_weights, num_samples=len(self.train_dataset), replacement=True)
         if stage == "test" or stage is None:
             # Initialize Datasets
-            self.test_dataset = NeophyteDataset(self.image_dirs.test, self.classes, transform=self.transform_test, dsm_transform=self.dsm_transform, ndsm_transform=self.ndsm_transform, dataset_stats=self.dataset_stats, value_mapping=self.value_mapping, ignore_index=self.ignore_index, load_auxiliary=self.load_auxiliary, load_dsm=self.load_dsm, load_dtm=self.load_dtm, load_ndsm=self.load_ndsm, return_dsm_dtm=True)
+            # # Same for the test pass at the end of training (test_phenology on W&B).
+            self.test_dataset = NeophyteDataset(self.image_dirs.test, self.classes, transform=self.transform_test, dsm_transform=self.dsm_transform, ndsm_transform=self.ndsm_transform, dataset_stats=self.dataset_stats, value_mapping=self.value_mapping, ignore_index=self.ignore_index, load_auxiliary=True, load_dsm=self.load_dsm, load_dtm=self.load_dtm, load_ndsm=self.load_ndsm, return_dsm_dtm=True)
             # Load ndsm for qualitative plots when elevation data is available; for
             # RGB-only datasets (no dsm/ folder) fall back to RGB+mask only so the
             # pick still works (save_model_predictions drops the ndsm column itself).
