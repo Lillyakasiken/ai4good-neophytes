@@ -1,0 +1,8 @@
+# Control for model_neophytes_vit_pc24: the same DINOv2 ViT-B/14 (4 registers) with
+# the original self-supervised weights, i.e. without the PlantCLEF fine-tuning. The
+# paired difference to vit_pc24 is the effect of the plant photos alone.
+defaults:
+  - model_neophytes_vit_pc24
+
+name: ${model.model_name}_vitb14_dinov2
+encoder_weights_path: null  # timm pretrained weights (vit_base_patch14_reg4_dinov2.lvd142m)

@@ -25,6 +25,7 @@ from torchmetrics.classification import (
     MulticlassStatScores,
 )
 
+from models.vit_encoder import ViTUnet, layer_decay_param_groups
 from utils.scheduler_utils import get_scheduler
 
 
@@ -99,11 +100,20 @@ class SegmentationModel(pl.LightningModule):
         patch_2_img_size: if True, inputs larger than ``img_size`` are split into
             overlapping patches, pushed through the model and stitched back
             together. Needed for encoders with a fixed positional embedding.
+        encoder_weights_path: ViT encoders only (``encoder_name`` = a timm ``vit_*``
+            model, U-Net only): backbone state dict to load instead of the timm
+            pretrained weights, see :mod:`models.vit_encoder`.
+        layer_decay: ViT encoders only: layer-wise LR decay factor (None = one LR).
+        freeze_encoder_epochs: ViT encoders only: the ViT stays frozen for this many
+            epochs and only pyramid + decoder train (the LP stage of LP-FT).
+        grad_checkpointing: ViT encoders only: recompute blocks in the backward pass.
     """
 
     def __init__(self, model, encoder_name, img_size, num_classes, learning_rate,
                  in_channels=None, ignore_index=-1, optimizer='AdamW', lr_scheduler=None,
-                 loss='CE', weight=None, patch_2_img_size=False, fusion_mode='concat'):
+                 loss='CE', weight=None, patch_2_img_size=False, fusion_mode='concat',
+                 encoder_weights_path=None, layer_decay=None, freeze_encoder_epochs=0,
+                 grad_checkpointing=False):
         super().__init__()
         self.save_hyperparameters()
         self.in_channels = in_channels
@@ -128,8 +138,16 @@ class SegmentationModel(pl.LightningModule):
         if model not in smp_models:
             raise ValueError(f"Unknown model '{model}'. Available: {sorted(smp_models)} "
                              f"(many more exist in segmentation-models-pytorch).")
-        self.model = smp_models[model](encoder_name=encoder_name, in_channels=num_channels,
-                                       classes=num_classes)
+        # # plain ViTs (DINOv2, PlantCLEF 2024) come from timm directly, see models/vit_encoder.py
+        if encoder_name.startswith('vit_'):
+            if model != 'Unet' or num_channels != 3:
+                raise ValueError("ViT encoders support model=Unet with RGB input only; "
+                                 "add elevation with fusion_mode=stem.")
+            self.model = ViTUnet(encoder_name, num_classes, weights_path=encoder_weights_path,
+                                 grad_checkpointing=grad_checkpointing)
+        else:
+            self.model = smp_models[model](encoder_name=encoder_name, in_channels=num_channels,
+                                           classes=num_classes)
 
         # # Build elevation fusion module when using stem fusion
         self.elevation_fusion = None
@@ -160,14 +178,24 @@ class SegmentationModel(pl.LightningModule):
     # -------------------------------------------------------------------------
     # setup
     # -------------------------------------------------------------------------
+    @property
+    def vit(self):
+        """The timm ViT of a ViT encoder, None for SMP encoders (a plain attribute
+        would register it twice and store its weights twice in every checkpoint)."""
+        return getattr(self.model.encoder, 'vit', None)
+
     def set_patch_2_img_size(self, new_patch_2_img_size):
         self.hparams.patch_2_img_size = new_patch_2_img_size
 
     def configure_optimizers(self):
+        params = self.parameters()
+        if self.vit is not None and self.hparams.layer_decay:
+            params = layer_decay_param_groups(self, self.vit, self.hparams.learning_rate,
+                                              self.hparams.layer_decay)
         if self.hparams.optimizer == 'Adam':
-            optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+            optimizer = optim.Adam(params, lr=self.hparams.learning_rate)
         elif self.hparams.optimizer == 'AdamW':
-            optimizer = optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
+            optimizer = optim.AdamW(params, lr=self.hparams.learning_rate)
         else:
             raise ValueError(f"Unknown optimizer '{self.hparams.optimizer}'. Available: Adam, AdamW.")
         if self.hparams.lr_scheduler:
@@ -282,6 +310,14 @@ class SegmentationModel(pl.LightningModule):
 
         for metric in ("acc", "iou", "f1", "auc", "f1_per_class", "stats"):
             getattr(self, f"{stage}_{metric}").reset()
+
+    def on_train_epoch_start(self):
+        # # LP-FT: frozen ViT for the first freeze_encoder_epochs, then full fine-tuning.
+        # # Set every epoch, so a resumed run lands in the right stage.
+        if self.vit is not None and self.hparams.freeze_encoder_epochs:
+            frozen = self.current_epoch < self.hparams.freeze_encoder_epochs
+            self.vit.requires_grad_(not frozen)
+            self.log('encoder_frozen', float(frozen), prog_bar=False)
 
     def training_step(self, batch, batch_idx):
         return self._step(batch, 'train')

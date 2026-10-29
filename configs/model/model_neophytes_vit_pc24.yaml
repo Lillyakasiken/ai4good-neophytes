@@ -1,0 +1,21 @@
+# PlantCLEF 2024 ViT (ViTD2PC24All) in the U-Net of the baseline (RQ1): DINOv2
+# ViT-B/14 with 4 registers, fine-tuned on ~1.4M Pl@ntNet photos of 7,806 species.
+# The simple feature pyramid of models/vit_encoder.py gives the same decoder as
+# model_neophytes_mit_b2, so only the encoder differs. See
+# docs/plantclef2024_vit_notes_en.md, section 8.
+#
+# Weights: the backbone (EMA, no classifier head) of model_best.pth.tar from Zenodo
+# 10.5281/zenodo.10848263 (CC BY 4.0), extracted with
+# scripts/extract_pc24_backbone.py.
+defaults:
+  - model
+
+name: ${model.model_name}_vitb14_pc24
+encoder_name: vit_base_patch14_reg4_dinov2.lvd142m
+encoder_weights_path: /zfs/ai4good/groups/neophytes/zhixuan_li/pretrained/plantclef2024/vitd2pc24all_backbone_ema.pth
+
+# # LP-FT: pyramid + decoder train alone first, then everything with layer-wise LR
+# # decay. With check_val_every_n_epoch=3 the validation after epoch 6 is the last one
+# # with a frozen ViT, i.e. a frozen-feature screen for free.
+freeze_encoder_epochs: 6
+layer_decay: 0.75

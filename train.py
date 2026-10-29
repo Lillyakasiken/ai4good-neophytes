@@ -114,7 +114,11 @@ def main(cfg: DictConfig) -> None:
                               loss=cfg.model.loss,
                               weight=cfg.model.weight,
                               patch_2_img_size=cfg.model.patch_2_img_size,
-                              fusion_mode=cfg.model.fusion_mode)
+                              fusion_mode=cfg.model.fusion_mode,
+                              encoder_weights_path=cfg.model.encoder_weights_path,
+                              layer_decay=cfg.model.layer_decay,
+                              freeze_encoder_epochs=cfg.model.freeze_encoder_epochs,
+                              grad_checkpointing=cfg.model.grad_checkpointing)
 
     # %% training
     callbacks = get_callbacks(cfg.model.callbacks)

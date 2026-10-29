@@ -30,6 +30,12 @@ fusion_mode: concat
 # # the encoder tolerates a different input size, which CNNs do.
 patch_2_img_size: False
 
+# # ViT encoders only (encoder_name: vit_*, see model_neophytes_vit_pc24.yaml)
+encoder_weights_path: null  # backbone state dict; null = timm pretrained weights
+layer_decay: null           # layer-wise LR decay, e.g. 0.75 (null = one LR for all)
+freeze_encoder_epochs: 0    # LP-FT: epochs with a frozen ViT before full fine-tuning
+grad_checkpointing: False   # trade compute for memory in the ViT blocks
+
 max_epochs: 50
 lr: 0.0001
 optimizer: AdamW      # AdamW or Adam
