@@ -13,6 +13,7 @@
   let stats = $state(null);
   let error = $state('');
   let showLabels = $state(true);
+  let labelLayer = $state('species');
   let openId = $state(null);
   let detailTab = $state('tile');
   let detailCkpt = $state('');
@@ -34,6 +35,7 @@
       month: '',
       species: [],
       speciesOp: 'or',
+      stages: [],
       labelled: false,
       backgroundOnly: false,
       nodataMin: '',
@@ -49,8 +51,8 @@
   let filtersChanged = $derived.by(() => {
     const base = defaultFilters();
     for (const key of Object.keys(base)) {
-      if (key === 'species') {
-        if (filters.species.length > 0) return true;
+      if (key === 'species' || key === 'stages') {
+        if (filters[key].length > 0) return true;
         continue;
       }
       if (filters[key] !== base[key]) return true;
@@ -98,6 +100,7 @@
     if (filters.month) p.set('month', filters.month);
     for (const name of filters.species) p.append('species', name);
     if (filters.species.length) p.set('species_op', filters.speciesOp || 'or');
+    for (const name of filters.stages) p.append('stage', name);
     if (filters.labelled) p.set('labelled', 'true');
     if (filters.backgroundOnly) p.set('background_only', 'true');
     setNumber(p, 'nodata_min', filters.nodataMin);
@@ -309,7 +312,7 @@
   </header>
 
   {#if view === 'tiles'}
-    <Filters {facets} bind:filters bind:showLabels changed={filtersChanged} onreset={resetFilters} />
+    <Filters {facets} bind:filters bind:showLabels bind:labelLayer changed={filtersChanged} onreset={resetFilters} />
   {/if}
 
   <div class="workspace" class:map-mode={view === 'map'} class:runs-mode={view === 'runs'} class:model-mode={view === 'model'} class:batch-mode={view === 'batch'}>
@@ -328,7 +331,7 @@
         <Stats {stats} bind:filters />
       {/if}
       <div class="grid-wrap">
-        <Grid {query} {showLabels} {colors} onopen={openTile} />
+        <Grid {query} {showLabels} {labelLayer} {colors} onopen={openTile} />
       </div>
     {/if}
   </div>
@@ -336,6 +339,6 @@
 
 {#if openId}
   {#key detailKey}
-    <Detail tileId={openId} fold={filters.fold} initialTab={detailTab} initialCkpt={detailCkpt} onclose={() => (openId = null)} onopenmodel={openModel} />
+    <Detail tileId={openId} fold={filters.fold} phases={facets?.phases} bind:labelLayer initialTab={detailTab} initialCkpt={detailCkpt} onclose={() => (openId = null)} onopenmodel={openModel} />
   {/key}
 {/if}

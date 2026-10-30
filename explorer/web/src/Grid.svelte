@@ -1,7 +1,7 @@
 <script>
   import { untrack } from 'svelte';
 
-  let { query, showLabels, colors, onopen } = $props();
+  let { query, showLabels, labelLayer = 'species', colors, onopen } = $props();
 
   const PAGE = 48;
 
@@ -125,8 +125,8 @@
                 alt=""
                 onerror={(e) => e.currentTarget.classList.add('missing')}
               />
-              {#if showLabels}
-                <img class="mask" src={tile.mask} alt="" />
+              {#if showLabels && (labelLayer !== 'stage' || tile.stage_mask)}
+                <img class="mask" src={labelLayer === 'stage' ? tile.stage_mask : tile.mask} alt="" />
               {/if}
             </span>
             <span class="caption">

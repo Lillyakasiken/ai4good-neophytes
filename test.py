@@ -9,9 +9,10 @@ The matching test data config is derived from the name embedded in
 is tested on ``neophytes_split_cv3_test`` (``_ds2`` stays on the half-resolution
 test config). Pass ``data=<config>`` explicitly to override that.
 
-``train_site=Aarau_1`` also scores that site's validation tiles. Those are the
-same-site numbers. The test split is the held-out number. Both are written to
-``quantitative/metrics_site_split.json``.
+``train_site=Aarau_1`` (a site), ``train_site=Aarau_3_1`` (one flight), or
+``train_site=[Aarau_3_1,Rueti_1_1]`` also scores those validation tiles. Those
+are the same-site numbers. The test split is the held-out number. Both are
+written to ``quantitative/metrics_site_split.json``.
 
 Results land in ``lightning_logs/<exp_name>/test_<timestamp>_<data>_<ckpt>/``:
     quantitative/  metrics as JSON + score plots + confusion matrices
@@ -60,6 +61,16 @@ def _auto_data_config(exp_name: str) -> str | None:
     return None
 
 
+def _site_keys(value):
+    """A site, a flight, or a list of either. None when unset."""
+    if value is None or value == "" or value == "null":
+        return None
+    if isinstance(value, str):
+        return [value]
+    items = [str(item) for item in value if str(item) not in ("", "null", "None")]
+    return items or None
+
+
 def _site_split_record(metrics, n_tiles, class_names):
     """Mean species F1, plus each class, for one group of tiles."""
     return {
@@ -72,11 +83,12 @@ def _site_split_record(metrics, n_tiles, class_names):
 
 def _write_site_split(cfg, model, device, train_site, held_out_metrics, class_names,
                       metrics_dir, n_held_out):
-    """Score the training site's validation tiles and store both groups.
+    """Score the training flights' validation tiles and store both groups.
 
-    Same-site tiles are the val folders of ``train_site``. Held-out tiles are the
-    test split already scored (the fold's other sites). Training did not use the
-    val tiles, and it did not use the held-out sites.
+    Same-site tiles are the val folders of ``train_site`` (one site, one flight,
+    or a list). Held-out tiles are the test split already scored (the fold's
+    other sites). Training did not use the val tiles, and it did not use the
+    held-out sites.
     """
     import json
     import os
@@ -96,22 +108,23 @@ def _write_site_split(cfg, model, device, train_site, held_out_metrics, class_na
         dataset_stats=cfg.data.dataset_stats, value_mapping=cfg.data.value_mapping,
         ignore_index=cfg.data.ignore_index, load_dsm=cfg.data.load_dsm,
         load_dtm=cfg.data.load_dtm, load_ndsm=cfg.data.load_ndsm,
-        train_site=str(train_site),
+        train_site=train_site,
     )
-    print(f"Same-site evaluation: {train_site}, {len(dataset)} validation tiles.")
+    shown = ", ".join(train_site)
+    print(f"Same-site evaluation: {shown}, {len(dataset)} validation tiles.")
     loader = DataLoader(dataset, batch_size=cfg.data.batch_size_test, shuffle=False,
                         num_workers=cfg.data.num_workers)
     same = evaluate_model(model, loader, cfg.model.num_classes, device,
                           ignore_index=cfg.data.ignore_index)
     record = {
-        "train_site": str(train_site),
+        "train_site": list(train_site),
         "same_site": _site_split_record(same, len(dataset), class_names),
         "held_out": _site_split_record(held_out_metrics, n_held_out, class_names),
     }
     path = os.path.join(metrics_dir, "metrics_site_split.json")
     with open(path, "w") as handle:
         json.dump(convert_ndarray_to_list(record), handle, indent=4)
-    print(f"same-site ({train_site}) mF1 (wo bg): {record['same_site']['F1-avg-wo0']:.4f}  |  "
+    print(f"same-site ({shown}) mF1 (wo bg): {record['same_site']['F1-avg-wo0']:.4f}  |  "
           f"tiles: {len(dataset)}")
     print(f"held-out mF1 (wo bg): {record['held_out']['F1-avg-wo0']:.4f}  |  "
           f"tiles: {n_held_out}")
@@ -355,7 +368,7 @@ def main(cfg: DictConfig) -> None:
             print(format_worst_stages(breakdown))
             _log_phenology_wandb(cfg, breakdown, heatmap_path, bars_path)
 
-        train_site = cfg.train_site if cfg.train_site not in (None, "", "null") else None
+        train_site = _site_keys(cfg.train_site)
         if train_site:
             _write_site_split(cfg, model, device, train_site, metrics, class_names,
                               metrics_dir, len(dataModule.test_dataset))

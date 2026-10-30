@@ -25,11 +25,15 @@
   let valFewShotK = $state(null);
   let valFewShotBg = $state(0);
   let valFewShotMode = $state('all');
-  let trainSite = $state('');
+  let trainFlights = $state([]);
+  let flightsOpen = $state(false);
+  let flightsRoot = $state(null);
+  let stageOn = $state({ nonflower: true, flower: true, fruiting: true });
   let speciesOn = $state({});
   let speciesOpen = $state(false);
   let speciesRoot = $state(null);
   let siteNote = $state(false);
+  let stageNote = $state(false);
   let subsetNote = $state(false);
   let runTest = $state(false);
   let testNote = $state(false);
@@ -79,6 +83,7 @@
       `model.precision=${precision}`,
       `logger=${logger}`,
       ...siteArgs(),
+      ...stageArgs(),
       ...subsetArgs(),
       ...overrideLines(extra),
       `exp_name=${runName()}`,
@@ -86,7 +91,8 @@
     let text = lines.join(' ');
     if (runTest) {
       let test = `\n.venv/bin/python test.py exp_name=${runName()}`;
-      if (trainSite) test += ` train_site=${trainSite}`;
+      if (trainFlights.length === 1) test += ` train_site=${trainFlights[0]}`;
+      else if (trainFlights.length) test += ` train_site=[${trainFlights.join(',')}]`;
       text += test;
     }
     return text;
@@ -115,10 +121,83 @@
     return Number.isFinite(n) ? String(n) : '0';
   }
 
-  let sites = $derived(options?.sites_by_data?.[dataName] ?? []);
+  const STAGE_COLOR = {
+    nonflower: '#1b7f4e',
+    flower: '#f08c14',
+    fruiting: '#5b2d8e',
+  };
+
+  // Matches configs/data/neophytes_names_colors.yaml when the options payload has no color.
+  const SPECIES_COLOR = {
+    B_davidii: '#dce14c',
+    R_typhina: '#b76e44',
+    R_japonica: '#305dc6',
+    B_orientalis: '#e2256a',
+    S_inaequidens: '#50e3c2',
+    A_altissima: '#dd60f6',
+  };
+  const STAGE_NAMES = ['nonflower', 'flower', 'fruiting'];
+
+  let flights = $derived(options?.flights_by_data?.[dataName] ?? []);
+  let flightGroups = $derived.by(() => {
+    const groups = [];
+    for (const row of flights) {
+      let group = groups.at(-1);
+      if (!group || group.site !== row.site) {
+        group = { site: row.site, flights: [] };
+        groups.push(group);
+      }
+      group.flights.push(row);
+    }
+    return groups;
+  });
+  let stageReady = $derived.by(() => {
+    const chosen = flights.filter((row) => trainFlights.includes(row.flight));
+    const pool = chosen.length ? chosen : flights;
+    const ready = { nonflower: false, flower: false, fruiting: false };
+    if (!pool.length) return { nonflower: true, flower: true, fruiting: true };
+    for (const row of pool) {
+      for (const name of STAGE_NAMES) {
+        if ((row.stage_px?.[name] || 0) > 0) ready[name] = true;
+      }
+    }
+    return ready;
+  });
+
+  let coveredSpecies = $derived.by(() => {
+    const chosen = flights.filter((row) => trainFlights.includes(row.flight));
+    if (!chosen.length) return null;
+    const names = new Set();
+    for (const row of chosen) {
+      for (const [name, count] of Object.entries(row.species || {})) {
+        if (count > 0) names.add(name);
+      }
+    }
+    return names;
+  });
 
   $effect(() => {
-    if (trainSite && !sites.includes(trainSite)) trainSite = '';
+    if (!flights.length) return;
+    const allowed = new Set(flights.map((row) => row.flight));
+    if (trainFlights.some((key) => !allowed.has(key))) {
+      trainFlights = trainFlights.filter((key) => allowed.has(key));
+    }
+  });
+
+  $effect(() => {
+    if (!flightsOpen) return;
+    const close = (event) => {
+      if (flightsRoot && !flightsRoot.contains(event.target)) flightsOpen = false;
+    };
+    const onKey = (event) => {
+      if (event.key === 'Escape') flightsOpen = false;
+    };
+    document.addEventListener('click', close);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('click', close);
+      document.removeEventListener('keydown', onKey);
+    };
   });
 
   let speciesLocked = $derived(fewShotK == null || fewShotK === '');
@@ -161,9 +240,65 @@
 
   // siteAarau_1_t10_tbg10_spB_davidii: site, then tile counts, then a species list
   // only when it is not every species.
+  function readyStageCount() {
+    return STAGE_NAMES.filter((name) => stageReady[name]).length;
+  }
+
+  function selectedStages() {
+    return STAGE_NAMES.filter((name) => stageOn[name] && stageReady[name]);
+  }
+
+  function stagesRestricted() {
+    const chosen = selectedStages();
+    const ready = readyStageCount();
+    return chosen.length > 0 && chosen.length < ready;
+  }
+
+  function toggleFlight(key) {
+    trainFlights = trainFlights.includes(key)
+      ? trainFlights.filter((item) => item !== key)
+      : [...trainFlights, key];
+  }
+
+  function toggleSiteFlights(group) {
+    const keys = group.flights.map((row) => row.flight);
+    const allOn = keys.every((key) => trainFlights.includes(key));
+    trainFlights = allOn
+      ? trainFlights.filter((key) => !keys.includes(key))
+      : [...trainFlights, ...keys.filter((key) => !trainFlights.includes(key))];
+  }
+
+  function flightWhen(row) {
+    return row.acq_date || (row.year ? String(row.year) : '');
+  }
+
+  const STAGE_WORD = {
+    nonflower: 'non-flowering',
+    flower: 'flowering',
+    fruiting: 'fruiting',
+  };
+
+  function stageWords(row) {
+    return STAGE_NAMES
+      .filter((name) => (row.stage_px?.[name] || 0) > 0)
+      .map((name) => STAGE_WORD[name])
+      .join(' · ');
+  }
+
+  function flightSpecies(row) {
+    return (options?.species ?? []).filter((sp) => (row.species?.[sp.stats_name] || 0) > 0);
+  }
+
+  function chipColor(sp) {
+    return sp.color || SPECIES_COLOR[sp.stats_name] || '#8d8d8d';
+  }
+
   function nameTag() {
     const parts = [];
-    if (trainSite) parts.push(`site${trainSite}`);
+    if (trainFlights.length === 1) parts.push(`site${trainFlights[0]}`);
+    else if (trainFlights.length > 3) parts.push(`fl${trainFlights.length}`);
+    else if (trainFlights.length) parts.push(`fl_${trainFlights.join('-')}`);
+    if (stagesRestricted()) parts.push(`st${selectedStages().join('-')}`);
     if (subsetOn) {
       const trainSet = fewShotK != null && fewShotK !== '';
       const valSet = valFewShotK != null && valFewShotK !== '';
@@ -204,7 +339,14 @@
   });
 
   function siteArgs() {
-    return trainSite ? [`data.train_site=${trainSite}`] : [];
+    if (!trainFlights.length) return [];
+    if (trainFlights.length === 1) return [`data.train_site=${trainFlights[0]}`];
+    return [`data.train_site=[${trainFlights.join(',')}]`];
+  }
+
+  function stageArgs() {
+    if (!stagesRestricted()) return [];
+    return [`data.train_stages=[${selectedStages().join(',')}]`];
   }
 
   function subsetArgs() {
@@ -466,6 +608,10 @@
       formError = 'Pick at least one species.';
       return;
     }
+    if (selectedStages().length === 0) {
+      formError = 'Pick at least one stage.';
+      return;
+    }
     submitting = true;
     try {
       const res = await fetch('/api/jobs', {
@@ -484,7 +630,8 @@
           logger,
           exp_name: expName.trim(),
           run_test: runTest,
-          train_site: trainSite || null,
+          train_site: trainFlights.length ? trainFlights : null,
+          train_stages: stagesRestricted() ? selectedStages() : null,
           few_shot_species: speciesRestricted() ? selectedSpecies() : null,
           few_shot_k: subsetOn ? countOrNull(fewShotK) : null,
           few_shot_bg_k: subsetOn ? countOrNull(fewShotBg) : null,
@@ -690,35 +837,152 @@
       </label>
       <div class="override-field">
         <div class="check-row">
-          <label class="site-field">
-            Train on one site
-            <select bind:value={trainSite}>
-              <option value="">All sites in this split</option>
-              {#each sites as name}
-                <option value={name}>{name}</option>
-              {/each}
-            </select>
-          </label>
+          <span class="override-label" id="flights-label">Train on flights</span>
           <span class="note-wrap">
             <button
               type="button"
               class="info"
-              aria-label="What training on one site does"
+              aria-label="What training on chosen flights does"
               aria-expanded={siteNote}
               onclick={() => (siteNote = !siteNote)}
             >i</button>
             {#if siteNote}
-              <div class="test-note" role="dialog" aria-label="What training on one site does">
+              <div class="test-note" role="dialog" aria-label="What training on chosen flights does">
                 <p>
-                  Training and validation use only that site. The test split stays the other sites in the fold.
+                  Leave this empty to train on every flight in the split. Pick flights to keep only those.
+                  A new plant often has a single flight, so this is how that case is trained.
                 </p>
                 <p>
-                  Val F1 in the table is same-site (this site's validation tiles). Test F1 is held-out (the other sites).
-                  test.py writes both to metrics_site_split.json.
+                  Each row is one flight. The names are the species labelled there, and the bar is the share of
+                  non-flowering, flowering, and fruiting pixels. A site name selects every flight of that site.
+                </p>
+                <p>
+                  Validation uses the same flights. The test split stays the other sites in the fold.
+                  Val F1 is same-flight. Test F1 is held-out. test.py writes both to metrics_site_split.json.
                 </p>
               </div>
             {/if}
           </span>
+        </div>
+        <div class="flight-pick" bind:this={flightsRoot}>
+          <div class="multi" class:open={flightsOpen}>
+            <div class="multi-value">
+              {#if trainFlights.length === 0}
+                <span class="multi-empty">All flights in this split</span>
+              {:else}
+                {#each trainFlights as key (key)}
+                  <span class="chip">
+                    {key}
+                    <button type="button" aria-label={`Remove ${key}`} onclick={(event) => { event.stopPropagation(); toggleFlight(key); }}>×</button>
+                  </span>
+                {/each}
+              {/if}
+            </div>
+            <button
+              type="button"
+              class="multi-toggle"
+              aria-haspopup="listbox"
+              aria-expanded={flightsOpen}
+              aria-labelledby="flights-label"
+              onclick={() => (flightsOpen = !flightsOpen)}
+            >▾</button>
+            {#if flightsOpen}
+              <div class="flight-menu" role="listbox" aria-multiselectable="true" aria-labelledby="flights-label">
+                {#each flightGroups as group (group.site)}
+                  <div class="flight-site">
+                    <button type="button" onclick={() => toggleSiteFlights(group)}>{group.site}</button>
+                  </div>
+                  {#each group.flights as row (row.flight)}
+                    <label class="flight-row">
+                      <input
+                        type="checkbox"
+                        checked={trainFlights.includes(row.flight)}
+                        onchange={() => toggleFlight(row.flight)}
+                      />
+                      <span class="flight-name">
+                        <strong>{row.flight}</strong>
+                        <span>{flightWhen(row)} · {row.labelled} labelled</span>
+                      </span>
+                      <span class="flight-detail">
+                        {#if flightSpecies(row).length}
+                          <span class="flight-species">
+                            {#each flightSpecies(row) as sp (sp.stats_name)}
+                              <span class="sp-chip">
+                                <i class="swatch" style:background={chipColor(sp)} style:--swatch={chipColor(sp)}></i>
+                                {sp.name}
+                              </span>
+                            {/each}
+                          </span>
+                        {/if}
+                        {#if stageWords(row)}
+                          <span class="stage-line">
+                            <span class="mini-stages" aria-hidden="true">
+                              {#each STAGE_NAMES as name}
+                                <i style:width="{(100 * (row.stages?.[name] || 0)).toFixed(2)}%" style:background={STAGE_COLOR[name]}></i>
+                              {/each}
+                            </span>
+                            <span class="stage-words">{stageWords(row)}</span>
+                          </span>
+                        {/if}
+                      </span>
+                    </label>
+                  {/each}
+                {/each}
+              </div>
+            {/if}
+          </div>
+          {#if coveredSpecies}
+            <p class="hint">
+              Species in the chosen flights:
+              {#each options?.species ?? [] as sp (sp.stats_name)}
+                <span class:missing={!coveredSpecies.has(sp.stats_name)}>{sp.name}</span>
+              {/each}
+            </p>
+            {#if (options?.species ?? []).some((sp) => !coveredSpecies.has(sp.stats_name))}
+              <p class="hint">A flight that lacks a species cannot teach it. Add a flight that has the missing species.</p>
+            {/if}
+          {/if}
+        </div>
+      </div>
+      <div class="override-field">
+        <div class="check-row">
+          <span class="override-label">Train stages</span>
+          <span class="note-wrap">
+            <button
+              type="button"
+              class="info"
+              aria-label="What training on chosen stages does"
+              aria-expanded={stageNote}
+              onclick={() => (stageNote = !stageNote)}
+            >i</button>
+            {#if stageNote}
+              <div class="test-note" role="dialog" aria-label="What training on chosen stages does">
+                <p>
+                  All three stages are the normal setting. Turn one off to ignore that stage.
+                  Pixels of a skipped stage become ignore, so the model is not taught that they are background.
+                  Tiles with none of the chosen stages are dropped. Background-only tiles stay.
+                </p>
+                <p>
+                  Validation uses the same stages. The test split does not, so test scores still include every stage.
+                  That is the stage-transfer check. Sampling weights still use the full pixel counts of a tile.
+                </p>
+              </div>
+            {/if}
+          </span>
+        </div>
+        <div class="stage-toggles">
+          {#each options?.stages ?? STAGE_NAMES.map((name) => ({ phase: name, label: name })) as stage (stage.phase)}
+            <label class="check" class:locked={!stageReady[stage.phase]}>
+              <input
+                type="checkbox"
+                checked={stageOn[stage.phase] && stageReady[stage.phase]}
+                disabled={!stageReady[stage.phase]}
+                onchange={(event) => (stageOn[stage.phase] = event.currentTarget.checked)}
+              />
+              <i class="swatch" style:--swatch={STAGE_COLOR[stage.phase]}></i>
+              {stage.label}
+            </label>
+          {/each}
         </div>
       </div>
       <div class="override-field">
@@ -858,7 +1122,7 @@
               <p>
                 test.py scores the best checkpoint on this split's held-out sites.
                 A name like neophytes_split_cv3_train_1024 is matched to neophytes_split_cv3_test.
-                With one site selected it also scores that site's validation tiles.
+                With flights selected it also scores those flights' validation tiles.
               </p>
               <p>Training already does a short test pass. This checkbox adds that full evaluation in the same tmux session.</p>
             </div>
@@ -1176,7 +1440,120 @@
 
   .override-field .check-row { margin-bottom: 0; }
 
-  .site-field { flex: 1; margin: 0; min-width: 0; }
+  .flight-pick { position: relative; }
+
+  .flight-menu {
+    position: absolute;
+    z-index: 6;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    max-height: 320px;
+    overflow: auto;
+    margin: 0;
+    padding: 4px;
+    background: var(--sheet);
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    box-shadow: var(--shadow);
+  }
+
+  .flight-site {
+    position: sticky;
+    top: 0;
+    background: var(--sheet);
+    padding: 4px 4px 2px;
+  }
+
+  .flight-site button {
+    width: auto;
+    border: 0;
+    background: transparent;
+    color: var(--canopy);
+    padding: 2px 4px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .flight-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 2px 6px;
+    align-items: start;
+    margin: 0;
+    padding: 6px 4px;
+    color: var(--ink);
+    font-size: 12px;
+  }
+
+  .flight-row input { width: auto; margin-top: 2px; }
+
+  .flight-name {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .flight-name span { color: var(--mist); }
+
+  .flight-detail {
+    grid-column: 2;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .flight-species {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px 8px;
+  }
+
+  .sp-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--ink);
+    font-size: 11px;
+  }
+
+  .stage-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .stage-words {
+    color: var(--mist);
+    font-size: 11px;
+  }
+
+  .mini-stages {
+    display: flex;
+    width: 64px;
+    flex: none;
+    height: 8px;
+    background: #eef3f4;
+    border: 1px solid var(--line);
+  }
+
+  .mini-stages i { display: block; height: 100%; }
+
+  .stage-toggles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+  }
+
+  .stage-toggles .check { margin: 0; }
+
+  .stage-toggles .locked { opacity: 0.45; }
+
+  .hint .missing { color: #8c2f2f; }
+
+  .hint span + span::before { content: " · "; color: var(--mist); }
 
   .species-pick {
     position: relative;

@@ -7,7 +7,7 @@
   import Zoom from './Zoom.svelte';
   import { paintIsolate } from './isolate.js';
 
-  let { tileId, fold, onclose, onopenmodel = null, initialTab = 'tile', initialCkpt = '' } = $props();
+  let { tileId, fold, phases = [], labelLayer = $bindable('species'), onclose, onopenmodel = null, initialTab = 'tile', initialCkpt = '' } = $props();
 
   let tile = $state(null);
   let activeId = $state(null);
@@ -28,6 +28,13 @@
   let ignoreNext = false;
 
   const MONTHS = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const STAGE_ORDER = ['nonflower', 'flower', 'fruiting', 'unknown'];
+  const STAGE_FALLBACK = {
+    nonflower: { label: 'non-flowering', color: '#1b7f4e' },
+    flower: { label: 'flowering', color: '#f08c14' },
+    fruiting: { label: 'fruiting', color: '#5b2d8e' },
+    unknown: { label: 'unknown', color: '#8d8d8d' },
+  };
 
   const IGNORE = {
     254: { kind: 'ignore', color: '#737373', label: 'unlabelled' },
@@ -175,8 +182,35 @@
     return Number(value).toLocaleString();
   }
 
+  let phaseLook = $derived.by(() => {
+    const look = { ...STAGE_FALLBACK };
+    for (const phase of phases ?? []) look[phase.phase] = phase;
+    return look;
+  });
+
+  let overlaySrc = $derived.by(() => {
+    if (!tile) return '';
+    if (labelLayer !== 'stage') return tile.mask || '';
+    if (tile.stage_mask) return tile.stage_mask;
+    return tile.labelled ? `/stage-masks/${tile.tile_id}.webp` : '';
+  });
+
+  let stageLegend = $derived.by(() => {
+    const totals = new Map();
+    for (const spec of tile?.species ?? []) {
+      for (const phase of spec.phases ?? []) {
+        if (!(phase.m2 > 0)) continue;
+        totals.set(phase.phase, (totals.get(phase.phase) || 0) + phase.m2);
+      }
+    }
+    return STAGE_ORDER.filter((name) => totals.has(name)).map((name) => ({
+      color: phaseLook[name]?.color || '#999',
+      label: phaseLook[name]?.label || name,
+    }));
+  });
+
   $effect(() => {
-    const src = tile?.mask;
+    const src = overlaySrc;
     const color = focusColor;
     if (!src || !color) {
       isolatedMask = '';
@@ -318,21 +352,46 @@
       <div class="shot">
         <button type="button" class="stage" class:busy={switching} aria-label="Enlarge orthophoto" onclick={() => (zoomOpen = true)}>
           <img class="photo" class:dim={!!focusColor} src={tile.thumb} alt="" fetchpriority="high" draggable="false" />
-          <img class="mask" src={isolatedMask || tile.mask} alt="" style:opacity={opacity} fetchpriority="high" draggable="false" />
+          {#if overlaySrc}
+            <img class="mask" src={isolatedMask || overlaySrc} alt="" style:opacity={opacity} fetchpriority="high" draggable="false" />
+          {/if}
         </button>
         <CopyButton overlay />
       </div>
       <Zoom open={zoomOpen} onclose={() => (zoomOpen = false)} label="Orthophoto" note={sharpBusy ? 'Loading a sharper view…' : ''} bind:opacity>
         <img class="photo" class:dim={!!focusColor} src={sharp || tile.thumb} alt="Orthophoto" draggable="false" />
-        <img class="mask" src={isolatedMask || tile.mask} alt="" style:opacity={opacity} draggable="false" />
+        {#if overlaySrc}
+          <img class="mask" src={isolatedMask || overlaySrc} alt="" style:opacity={opacity} draggable="false" />
+        {/if}
       </Zoom>
-      <label class="slider">
-        Labels
-        <input type="range" min="0" max="1" step="0.05" bind:value={opacity} />
-      </label>
+      <div class="slider-row">
+        <label class="slider">
+          Labels
+          <input type="range" min="0" max="1" step="0.05" bind:value={opacity} />
+        </label>
+        <div class="layer-switch" role="group" aria-label="Label colours">
+          <button type="button" class:on={labelLayer === 'species'} aria-pressed={labelLayer === 'species'} onclick={() => { labelLayer = 'species'; focusColor = ''; }}>Species</button>
+          <button type="button" class:on={labelLayer === 'stage'} aria-pressed={labelLayer === 'stage'} onclick={() => { labelLayer = 'stage'; focusColor = ''; }}>Stage</button>
+        </div>
+      </div>
     {/if}
     <div class="legend">
-      {#each legend as item}
+      {#if labelLayer === 'stage'}
+        {#each stageLegend as item}
+          <button
+            type="button"
+            class:on={focusColor === item.color}
+            style:--swatch={item.color}
+            aria-pressed={focusColor === item.color}
+            title="Show only this stage"
+            onclick={() => (focusColor = focusColor === item.color ? '' : item.color)}
+          >
+            <i class="swatch" style:--swatch={item.color}></i>
+            {item.label}
+          </button>
+        {/each}
+      {/if}
+      {#each labelLayer === 'stage' ? [] : legend as item}
         {#if item.kind === 'species'}
           <button
             type="button"
@@ -352,7 +411,7 @@
           </span>
         {/if}
       {/each}
-      {#if shownIgnore.length}
+      {#if labelLayer !== 'stage' && shownIgnore.length}
         <button
           type="button"
           class="info"
@@ -362,7 +421,7 @@
         >i</button>
       {/if}
     </div>
-    {#if legendOpen}
+    {#if labelLayer !== 'stage' && legendOpen}
       <p class="legend-note">
         {#if shownIgnore.some((item) => item.label === 'unlabelled')}Grey was never labelled. {/if}
         {#if shownIgnore.some((item) => item.label === 'uncertain')}Yellow is a label the annotator marked as unsure. {/if}
@@ -386,13 +445,14 @@
           <th>flower</th>
           <th>fruit</th>
           <th>unknown</th>
+          <th>stages</th>
         </tr>
       </thead>
       <tbody>
         <tr>
           <td>Background</td>
           <td>{area(tile.background.m2)}</td>
-          <td colspan="4"></td>
+          <td colspan="5"></td>
         </tr>
         {#each tile.species as spec}
           <tr>
@@ -401,6 +461,17 @@
             {#each spec.phases as phase}
               <td>{area(phase.m2)}</td>
             {/each}
+            <td>
+              {#if spec.m2 > 0}
+                <span class="mix" aria-hidden="true">
+                  {#each spec.phases as phase}
+                    {#if phase.m2 > 0}
+                      <i style:width="{(100 * phase.m2) / spec.m2}%" style:background={phase.color || phaseLook[phase.phase]?.color}></i>
+                    {/if}
+                  {/each}
+                </span>
+              {/if}
+            </td>
           </tr>
         {/each}
       </tbody>
@@ -426,4 +497,22 @@
 <style>
   h3 { font-size: 13px; margin: 16px 0 6px; }
   p { margin: 2px 0 0; color: var(--muted); }
+
+  .slider-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .slider-row .slider { flex: 1; }
+
+  .mix {
+    display: flex;
+    width: 72px;
+    height: 8px;
+    background: #eef3f4;
+    border: 1px solid var(--line);
+  }
+
+  .mix i { display: block; height: 100%; }
 </style>

@@ -65,10 +65,21 @@ few_shot_bg_k: 1000  # additional background-only images (0 = none)
 # # (B_davidii, R_typhina, ...) draws k tiles only for those species.
 few_shot_species: null
 
-# # null = every site in the split. A site key such as Aarau_1 keeps only that
-# # site's tiles in train and val. The test split stays the fold's other sites,
-# # so val F1 is same-site and test F1 is held-out.
+# # null = every site in the split. A site key such as Aarau_1 keeps every
+# # flight of that site. A flight key such as Aarau_3_1 keeps that flight.
+# # A list keeps the union. Applied to train and val. The test split stays
+# # the fold's other sites, so val F1 is same-site and test F1 is held-out.
 train_site: null
+
+# # null = learn every stage, including pixels whose stage is unknown.
+# # A list such as [nonflower] keeps only those stages (nonflower, flower,
+# # fruiting). Pixels of any other stage become ignore_index, so they are
+# # not learned as background. Labelled tiles with none of the chosen stages
+# # are dropped. Background-only tiles stay. The test split is not filtered.
+train_stages: null
+# # When true, validation uses the same stage filter as training. Test does not,
+# # so a test score still includes the stages that were left out of training.
+stage_apply_val: true
 
 # # Validation subset. null = validate on the complete val set, which is the honest
 # # setting: filtering the val set down to labelled images removes exactly the

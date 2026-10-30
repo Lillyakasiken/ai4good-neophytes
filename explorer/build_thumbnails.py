@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Precompute 256px WebP thumbnails for every tile in the catalog.
 
-Two files per tile: an RGB thumbnail (empty orthophoto margin painted flat)
-and a class-mask thumbnail with a transparent background, so the viewer can
-lay the labels over the photo. Width, height, and ground sampling distance
-are written to ``cache/raster_meta.parquet`` while each image is open.
+An RGB thumbnail (empty orthophoto margin painted flat) and a class-mask
+thumbnail with a transparent background, so the viewer can lay the labels
+over the photo. Labelled tiles also get a stage mask: the same pixels,
+coloured by phenology (band 3) instead of species. Width, height, and
+ground sampling distance are written to ``cache/raster_meta.parquet``
+while each image is open.
 
-The run is resumable. A tile whose thumb, mask, and meta row already exist
-is skipped.
+The run is resumable. A tile whose thumb, mask, stage mask (when the tile
+is labelled), and meta row already exist is skipped.
 
     python build_thumbnails.py              # all tiles
     python build_thumbnails.py --limit 20   # trial run
@@ -32,19 +34,25 @@ from common import (
     IGNORE_COLORS,
     MASKS_DIR,
     META_PARQUET,
+    PHASE_CODES,
+    PHASE_COLORS,
+    STAGE_MASKS_DIR,
     THUMB_PX,
     THUMBS_DIR,
     TILES_PARQUET,
+    hex_to_rgb,
     load_names,
     resolve_data_path,
 )
 
 _LUT = None
+_STAGE_LUT = None
 
 
 def _init_worker():
-    global _LUT
+    global _LUT, _STAGE_LUT
     _LUT = _lut()
+    _STAGE_LUT = _stage_lut()
 
 META_SCHEMA = pa.schema([
     ("tile_id", pa.string()),
@@ -113,26 +121,57 @@ def _mask_thumb(path, out_h, out_w, lut):
     return lut[cls]
 
 
+def _stage_lut():
+    """Index by phenology code. Only codes 0–3 are drawn; the rest stay clear."""
+    lut = np.zeros((256, 4), dtype=np.uint8)
+    for code, phase in PHASE_CODES.items():
+        lut[code, :3] = hex_to_rgb(PHASE_COLORS[phase])
+        lut[code, 3] = 255
+    return lut
+
+
+def _stage_thumb(path, out_h, out_w, lut):
+    """Labelled pixels coloured by stage. Background and excluded pixels stay clear."""
+    with rasterio.open(path) as src:
+        cls = src.read(1, out_shape=(out_h, out_w), resampling=Resampling.nearest)
+        if src.count >= 3:
+            pheno = src.read(3, out_shape=(out_h, out_w), resampling=Resampling.nearest)
+        else:
+            pheno = np.zeros((out_h, out_w), dtype=np.uint8)
+    rgba = lut[np.clip(pheno, 0, 255)].copy()
+    labelled = (cls >= 1) & (cls <= 6)
+    rgba[~labelled, 3] = 0
+    return rgba
+
+
 def render(task):
     """Write the missing files for one tile and return its raster meta row."""
     tile_id = task["tile_id"]
     thumb_path = task["thumb_path"]
     mask_path = task["mask_path"]
+    stage_path = task["stage_path"]
     try:
-        with rasterio.open(task["img_path"]) as src:
-            width, height = int(src.width), int(src.height)
-            gsd = _gsd_mm(src)
-            if task["write_thumb"]:
-                out_h, out_w = _thumb_hw(height, width)
-                rgb = _rgb_thumb(src, out_h, out_w)
-            else:
-                out_h = out_w = None
-        if task["write_mask"]:
+        width = height = gsd = None
+        out_h = out_w = None
+        rgb = None
+        if task["write_thumb"] or task["need_meta"]:
+            with rasterio.open(task["img_path"]) as src:
+                width, height = int(src.width), int(src.height)
+                gsd = _gsd_mm(src)
+                if task["write_thumb"]:
+                    out_h, out_w = _thumb_hw(height, width)
+                    rgb = _rgb_thumb(src, out_h, out_w)
+        if task["write_mask"] or task["write_stage"]:
             if out_h is None:
-                out_h, out_w = _thumb_hw(height, width)
-            rgba = _mask_thumb(task["mask_src"], out_h, out_w, _LUT)
-            Image.fromarray(rgba, mode="RGBA").save(mask_path, "WEBP", quality=80, method=4)
-        if task["write_thumb"]:
+                with rasterio.open(task["mask_src"]) as src:
+                    out_h, out_w = _thumb_hw(int(src.height), int(src.width))
+            if task["write_mask"]:
+                rgba = _mask_thumb(task["mask_src"], out_h, out_w, _LUT)
+                Image.fromarray(rgba, mode="RGBA").save(mask_path, "WEBP", quality=80, method=4)
+            if task["write_stage"]:
+                stage = _stage_thumb(task["mask_src"], out_h, out_w, _STAGE_LUT)
+                Image.fromarray(stage, mode="RGBA").save(stage_path, "WEBP", quality=80, method=4)
+        if task["write_thumb"] and rgb is not None:
             Image.fromarray(rgb, mode="RGB").save(thumb_path, "WEBP", quality=80, method=4)
         return {"tile_id": tile_id, "width": width, "height": height, "gsd_mm": gsd, "error": None}
     except Exception as exc:
@@ -164,21 +203,26 @@ def main():
 
     THUMBS_DIR.mkdir(parents=True, exist_ok=True)
     MASKS_DIR.mkdir(parents=True, exist_ok=True)
+    STAGE_MASKS_DIR.mkdir(parents=True, exist_ok=True)
     CACHE.mkdir(parents=True, exist_ok=True)
 
     existing = _load_meta()
     have_meta = {row["tile_id"] for row in existing}
-    catalog = pq.read_table(TILES_PARQUET, columns=["tile_id", "img_path", "mask_path"]).to_pylist()
+    catalog = pq.read_table(
+        TILES_PARQUET, columns=["tile_id", "img_path", "mask_path", "labelled"]
+    ).to_pylist()
 
     tasks = []
     for row in catalog:
         tid = row["tile_id"]
         thumb_path = THUMBS_DIR / f"{tid}.webp"
         mask_out = MASKS_DIR / f"{tid}.webp"
+        stage_out = STAGE_MASKS_DIR / f"{tid}.webp"
         write_thumb = not thumb_path.is_file()
         write_mask = not mask_out.is_file()
+        write_stage = bool(row["labelled"]) and not stage_out.is_file()
         need_meta = tid not in have_meta
-        if not (write_thumb or write_mask or need_meta):
+        if not (write_thumb or write_mask or write_stage or need_meta):
             continue
         tasks.append({
             "tile_id": tid,
@@ -186,8 +230,11 @@ def main():
             "mask_src": str(resolve_data_path(row["mask_path"])),
             "thumb_path": str(thumb_path),
             "mask_path": str(mask_out),
+            "stage_path": str(stage_out),
             "write_thumb": write_thumb,
             "write_mask": write_mask,
+            "write_stage": write_stage,
+            "need_meta": need_meta,
         })
         if args.limit is not None and len(tasks) >= args.limit:
             break

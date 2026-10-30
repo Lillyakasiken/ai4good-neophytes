@@ -281,6 +281,36 @@ label.field span { display: flex; gap: 4px; }
   background: color-mix(in srgb, var(--swatch) 28%, white);
 }
 
+.species.stages { width: 100%; }
+
+.stage-label {
+  font-size: 12px;
+  color: var(--mist);
+  padding-bottom: 2px;
+}
+
+.layer-switch {
+  display: inline-flex;
+  align-self: end;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 2px;
+}
+
+.layer-switch button {
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  padding: 5px 10px;
+  font-size: 13px;
+}
+
+.layer-switch button.on {
+  background: var(--canopy);
+  color: var(--sheet);
+}
+
 .species-op {
   position: relative;
 }

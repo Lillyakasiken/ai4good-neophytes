@@ -1,7 +1,7 @@
 <script>
   import { tick } from 'svelte';
 
-  let { facets, filters = $bindable(), showLabels = $bindable(), changed = false, onreset } = $props();
+  let { facets, filters = $bindable(), showLabels = $bindable(), labelLayer = $bindable('species'), changed = false, onreset } = $props();
 
   // Same limits as explorer/api.py. Used until /api/facets returns.
   const FALLBACK = { nodata_min: 0, nodata_max: 1, m2_min: 0, m2_max: 40 };
@@ -23,6 +23,9 @@
       ['nodata_frac', 'Empty margin'],
       ['acq_date', 'Date'],
       ['site_name', 'Site'],
+      ['nonflower_m2', 'Non-flowering area'],
+      ['flower_m2', 'Flowering area'],
+      ['fruiting_m2', 'Fruiting area'],
     ];
     for (const spec of facets?.species ?? []) {
       base.push([`${spec.stats_name}_m2`, `${spec.name} area`]);
@@ -150,6 +153,22 @@
     filters.species = filters.species.includes(name)
       ? filters.species.filter((item) => item !== name)
       : [...filters.species, name];
+  }
+
+  const STAGE_FALLBACK = [
+    { phase: 'nonflower', label: 'non-flowering', color: '#1b7f4e' },
+    { phase: 'flower', label: 'flowering', color: '#f08c14' },
+    { phase: 'fruiting', label: 'fruiting', color: '#5b2d8e' },
+  ];
+
+  let stageChoices = $derived(
+    (facets?.phases ?? STAGE_FALLBACK).filter((phase) => phase.phase !== 'unknown'),
+  );
+
+  function toggleStage(name) {
+    filters.stages = filters.stages.includes(name)
+      ? filters.stages.filter((item) => item !== name)
+      : [...filters.stages, name];
   }
 
   function setSpeciesOp(value) {
@@ -357,6 +376,10 @@
     <input type="checkbox" bind:checked={showLabels} />
     Show labels
   </label>
+  <div class="layer-switch" role="group" aria-label="Label colours">
+    <button type="button" class:on={labelLayer === 'species'} aria-pressed={labelLayer === 'species'} onclick={() => (labelLayer = 'species')}>Species</button>
+    <button type="button" class:on={labelLayer === 'stage'} aria-pressed={labelLayer === 'stage'} onclick={() => (labelLayer = 'stage')}>Stage</button>
+  </div>
   <button type="button" class="reset" disabled={!changed} onclick={onreset}>Reset filters</button>
   <div class="species">
     <div class="species-op" bind:this={opEl}>
@@ -396,6 +419,20 @@
       >
         <i class="swatch" style:--swatch={spec.color}></i>
         <span class="binomial">{spec.name}</span>
+      </button>
+    {/each}
+  </div>
+  <div class="species stages">
+    <span class="stage-label">Stage</span>
+    {#each stageChoices as phase (phase.phase)}
+      <button
+        type="button"
+        class:on={filters.stages.includes(phase.phase)}
+        style:--swatch={phase.color}
+        onclick={() => toggleStage(phase.phase)}
+      >
+        <i class="swatch" style:--swatch={phase.color}></i>
+        {phase.label}
       </button>
     {/each}
   </div>

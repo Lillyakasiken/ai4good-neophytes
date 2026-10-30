@@ -23,6 +23,7 @@ META_PARQUET = CACHE / "raster_meta.parquet"
 GRID_PARQUET = CACHE / "grid.parquet"
 THUMBS_DIR = CACHE / "thumbs"
 MASKS_DIR = CACHE / "masks"
+STAGE_MASKS_DIR = CACHE / "stage_masks"
 
 FOLDS = ["cv1", "cv2", "cv3", "cv4", "cv5"]
 ROLES = ("train", "val", "test", "unused")
@@ -33,6 +34,16 @@ PHASE_LABELS = {
     "fruiting": "fruiting",
     "unknown": "unknown",
 }
+# Band 3 of a mask. Same codes as dataset_stats.PHENO_MAP. 4 is excluded.
+PHASE_CODES = {0: "unknown", 1: "nonflower", 2: "flower", 3: "fruiting"}
+PHASE_COLORS = {
+    "nonflower": "#1b7f4e",
+    "flower": "#f08c14",
+    "fruiting": "#5b2d8e",
+    "unknown": "#8d8d8d",
+}
+# The three stages a training run can keep. Unknown is never a training choice.
+TRAIN_STAGES = ("nonflower", "flower", "fruiting")
 
 # Mask values mapped to ignore_index by configs/data/data.yaml. They are drawn
 # on the thumbnail so excluded pixels are visible, and they are not a species.

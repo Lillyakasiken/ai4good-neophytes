@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 import yaml
 
+from common import DATA_CSV, PHASE_LABELS, TILES_PARQUET, TRAIN_STAGES
 from gpu import compute_busy, snapshot
 from runtime import EXPLORER_ROOT, JOBS_DIR, REPO_ROOT, TrainEnvError, gpu_lock, train_python
 
@@ -86,12 +87,21 @@ def species_catalog():
         if int(key) == 0:
             continue
         entry = doc["classes"][key]
-        items.append({"stats_name": str(entry["stats_name"]), "name": str(entry["name"])})
+        items.append({
+            "stats_name": str(entry["stats_name"]),
+            "name": str(entry["name"]),
+            "color": str(entry["color"]),
+        })
     return items
 
 
-def sites_for_data(stem):
-    """Site keys present in a training config's train folders, such as ``Aarau_1``."""
+def _fold_name(stem):
+    match = re.search(r"split_(cv[1-5])(?:_|$)", stem)
+    return match.group(1) if match else None
+
+
+def _flight_keys(stem):
+    """Flight folders in a training config, such as ``Aarau_3_1``."""
     path = REPO_ROOT / "configs" / "data" / f"{stem}.yaml"
     if not path.is_file():
         return []
@@ -105,10 +115,130 @@ def sites_for_data(stem):
     folders = (split.get("image_dir") or {}).get("train") or []
     found = []
     for item in folders:
-        key = _site_group(str(item).rstrip("/").split("/")[-2])
+        key = str(item).rstrip("/").split("/")[-2]
         if key not in found:
             found.append(key)
     return found
+
+
+_FLIGHT_CACHE = {"sig": None, "by_role": None, "by_folder": None, "species": None}
+
+
+def _blank_flight(species):
+    return {
+        "tiles": 0,
+        "labelled": 0,
+        "acq_date": None,
+        "year": None,
+        "month": None,
+        "species": {name: 0 for name in species},
+        "stage_px": {phase: 0 for phase in TRAIN_STAGES},
+    }
+
+
+def _flight_table():
+    """Per-flight tile counts. Parquet rows are split by CV role; the CSV is not."""
+    import duckdb
+
+    species = [item["stats_name"] for item in species_catalog()]
+    if TILES_PARQUET.is_file():
+        source = TILES_PARQUET
+        reader = "read_parquet"
+        has_role = True
+    elif DATA_CSV.is_file():
+        source = DATA_CSV
+        reader = "read_csv_auto"
+        has_role = False
+    else:
+        return {}, {}, species
+    sig = (str(source), source.stat().st_mtime_ns, has_role)
+    if _FLIGHT_CACHE["sig"] == sig:
+        return _FLIGHT_CACHE["by_role"], _FLIGHT_CACHE["by_folder"], species
+
+    role_cols = [f"cv{i}_role" for i in range(1, 6)] if has_role else []
+    extra = ["acq_date", "month", "labelled"] if has_role else []
+    px_cols = [f"{name}_px" for name in species]
+    stage_cols = [f"{phase}_{name}_px" for phase in TRAIN_STAGES for name in species]
+    columns = ["site", "year", *extra, *role_cols, *px_cols, *stage_cols]
+    con = duckdb.connect()
+    try:
+        con.execute(
+            f"SELECT {', '.join(columns)} FROM {reader}(?)",
+            [str(source)],
+        )
+        names = [item[0] for item in con.description]
+        raw_rows = con.fetchall()
+    finally:
+        con.close()
+
+    by_role = {}
+    by_folder = {}
+    for raw in raw_rows:
+        row = dict(zip(names, raw))
+        site = str(row["site"])
+        targets = [by_folder.setdefault(site, _blank_flight(species))]
+        for fold_i in range(1, 6):
+            role_col = f"cv{fold_i}_role"
+            if role_col not in row:
+                continue
+            key = (site, f"cv{fold_i}", row[role_col])
+            targets.append(by_role.setdefault(key, _blank_flight(species)))
+        labelled = row["labelled"] if "labelled" in row else any((row.get(f"{name}_px") or 0) > 0 for name in species)
+        acq = row.get("acq_date")
+        acq_text = acq.isoformat()[:10] if hasattr(acq, "isoformat") else (str(acq)[:10] if acq else None)
+        for bucket in targets:
+            bucket["tiles"] += 1
+            if labelled:
+                bucket["labelled"] += 1
+            if acq_text and (bucket["acq_date"] is None or acq_text < bucket["acq_date"]):
+                bucket["acq_date"] = acq_text
+                bucket["year"] = row.get("year")
+                bucket["month"] = row.get("month")
+            elif bucket["year"] is None:
+                bucket["year"] = row.get("year")
+            for name in species:
+                if (row.get(f"{name}_px") or 0) > 0:
+                    bucket["species"][name] += 1
+            for phase in TRAIN_STAGES:
+                bucket["stage_px"][phase] += sum((row.get(f"{phase}_{name}_px") or 0) for name in species)
+    _FLIGHT_CACHE.update(sig=sig, by_role=by_role, by_folder=by_folder, species=species)
+    return by_role, by_folder, species
+
+
+def _flight_public(key, stat, species):
+    stat = stat or _blank_flight(species)
+    total = sum(stat["stage_px"].values())
+    return {
+        "flight": key,
+        "site": _site_group(key),
+        "acq_date": stat["acq_date"],
+        "year": stat["year"],
+        "month": stat["month"],
+        "tiles": stat["tiles"],
+        "labelled": stat["labelled"],
+        "species": {name: stat["species"].get(name, 0) for name in species},
+        "stage_px": {phase: int(stat["stage_px"][phase]) for phase in TRAIN_STAGES},
+        "stages": {
+            phase: (round(stat["stage_px"][phase] / total, 4) if total else 0.0)
+            for phase in TRAIN_STAGES
+        },
+    }
+
+
+def flights_for_data(stem):
+    """One row per training flight, with species counts and stage shares.
+
+    Counts are the fold's training tiles when the config is a CV split, and
+    every tile of the flight otherwise (debug and local splits).
+    """
+    keys = _flight_keys(stem)
+    fold = _fold_name(stem)
+    by_role, by_folder, species = _flight_table()
+    rows = []
+    for key in keys:
+        stat = by_role.get((key, fold, "train")) if fold else by_folder.get(key)
+        rows.append(_flight_public(key, stat, species))
+    return rows
 
 
 def data_configs():
@@ -198,7 +328,11 @@ def train_options():
         },
         "few_shot_modes": list(FEW_SHOT_MODES),
         "species": species_catalog(),
-        "sites_by_data": {name: sites_for_data(name) for name in data_configs()},
+        "stages": [
+            {"phase": phase, "label": PHASE_LABELS[phase]}
+            for phase in TRAIN_STAGES
+        ],
+        "flights_by_data": {name: flights_for_data(name) for name in data_configs()},
     }
 
 
@@ -215,15 +349,81 @@ def _count(value, name, low, high):
     return count
 
 
-def _train_site(body, data):
-    raw = body.get("train_site")
+def _as_site_list(raw):
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item).strip()]
+    raise JobError("train_site must be a flight name or a list of them")
+
+
+def _allowed_train_keys(data):
+    """Flight folders (``Aarau_3_1``) and site groups (``Aarau_1``)."""
+    allowed = set()
+    for item in flights_for_data(data):
+        allowed.add(item["flight"])
+        if item["site"]:
+            allowed.add(item["site"])
+    return allowed
+
+
+def _train_sites(body, data):
+    """Flights or site groups to keep. Empty means every flight in the split."""
+    sites = _as_site_list(body.get("train_site"))
+    if not sites:
+        return []
+    allowed = _allowed_train_keys(data)
+    unknown = [site for site in sites if site not in allowed]
+    if unknown:
+        raise JobError("unknown site for this split: " + ", ".join(unknown))
+    return list(dict.fromkeys(sites))
+
+
+def _train_site_arg(sites, key):
+    if not sites:
+        return []
+    if len(sites) == 1:
+        return [f"{key}={sites[0]}"]
+    return [f"{key}=[" + ",".join(sites) + "]"]
+
+
+def _train_stages(body):
+    """Stages to learn. None means every stage, unknown pixels included."""
+    raw = body.get("train_stages")
     if raw is None or raw == "":
         return None
-    site = str(raw)
-    allowed = sites_for_data(data)
-    if site not in allowed:
-        raise JobError(f"unknown site for this split: {site}")
-    return site
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise JobError("train_stages must be a list")
+    names = [str(item) for item in raw]
+    unknown = [name for name in names if name not in TRAIN_STAGES]
+    if unknown:
+        raise JobError("unknown stage: " + ", ".join(unknown))
+    ordered = [name for name in TRAIN_STAGES if name in set(names)]
+    if not ordered:
+        raise JobError("pick at least one stage")
+    if ordered == list(TRAIN_STAGES):
+        return None
+    return ordered
+
+
+def _flight_tag(sites):
+    if not sites:
+        return ""
+    if len(sites) == 1:
+        return f"site{sites[0]}"
+    if len(sites) <= 3:
+        return "fl_" + "-".join(sites)
+    return f"fl{len(sites)}"
+
+
+def _stage_tag(stages):
+    if not stages:
+        return ""
+    return "st" + "-".join(stages)
 
 
 def _species_list(body):
@@ -254,9 +454,10 @@ def few_shot_overrides(body, data):
     a small species subset.
     """
     args = []
-    site = _train_site(body, data)
-    if site:
-        args.append(f"data.train_site={site}")
+    args += _train_site_arg(_train_sites(body, data), "data.train_site")
+    stages = _train_stages(body)
+    if stages:
+        args.append("data.train_stages=[" + ",".join(stages) + "]")
     train_k = _count(body.get("few_shot_k"), "images per species", 1, 5000)
     if train_k is not None:
         bg = _count(body.get("few_shot_bg_k"), "background tiles", 0, 5000)
@@ -543,9 +744,7 @@ def enqueue(body):
     test_argv = None
     if run_test:
         test_argv = [str(python), str(REPO_ROOT / "test.py"), f"exp_name={exp_name}"]
-        site = _train_site(body, data)
-        if site:
-            test_argv.append(f"train_site={site}")
+        test_argv += _train_site_arg(_train_sites(body, data), "train_site")
     command = _command_text(train_argv)
     if test_argv:
         command += "\n" + _command_text(test_argv)
@@ -583,16 +782,21 @@ def _trim(jobs):
 
 
 def subset_tag(body):
-    """Short name suffix, e.g. siteAarau_1_t10_tbg10_spB_davidii.
+    """Short name suffix, e.g. fl_Aarau_3_1-Rueti_1_1_stnonflower_t10.
 
-    A chosen site comes first. Species counts come next, then the background
-    tiles sent with each of them. A side with no species count is left out.
-    A species list is added only when it is not every species.
+    Chosen flights come first, then a stage list when it is not every stage.
+    Species counts come next. A species list is added only when it is not
+    every species.
     """
     parts = []
-    site = str(body.get("train_site") or "")
-    if site:
-        parts.append(f"site{site}")
+    data = str(body.get("data") or "")
+    sites = _train_sites(body, data) if data else _as_site_list(body.get("train_site"))
+    flight = _flight_tag(sites)
+    if flight:
+        parts.append(flight)
+    stage = _stage_tag(_train_stages(body))
+    if stage:
+        parts.append(stage)
     train_k = _count(body.get("few_shot_k"), "images per species", 1, 5000)
     val_k = _count(body.get("val_few_shot_k"), "val images per species", 1, 5000)
     if train_k is not None:

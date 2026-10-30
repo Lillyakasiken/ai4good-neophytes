@@ -27,6 +27,72 @@ cv2.setNumThreads(0)
 DEFAULT_TILE_GSD_MM = 2.34  # median over the drone tiles; fallback for non-georeferenced input
 
 
+_STAGE_CODE = {"nonflower": 1, "flower": 2, "fruiting": 3}
+_STAGE_NAMES = ("nonflower", "flower", "fruiting")
+
+
+def _as_names(value):
+    """A Hydra string, list, or null into a list of names. Empty means unset."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text in {"null", "None"}:
+            return []
+        return [text]
+    names = []
+    for item in value:
+        text = str(item).strip()
+        if text and text not in {"null", "None"}:
+            names.append(text)
+    return names
+
+
+def _normalize_stages(value):
+    names = _as_names(value)
+    if not names:
+        return None
+    unknown = [name for name in names if name not in _STAGE_NAMES]
+    if unknown:
+        raise ValueError(f"Unknown train_stages {unknown}. Known: {list(_STAGE_NAMES)}")
+    return [name for name in _STAGE_NAMES if name in set(names)]
+
+
+def _drop_other_stages(mask, phenology, stages, ignore_index):
+    """Species pixels whose stage is not in ``stages`` become ignore_index.
+
+    Unknown and excluded stage codes are not in the kept set, so they are
+    ignored too. Background pixels are left as background.
+    """
+    if phenology is None:
+        return mask
+    allowed = [_STAGE_CODE[name] for name in stages]
+    if torch.is_tensor(mask):
+        ph = phenology if torch.is_tensor(phenology) else torch.as_tensor(phenology, device=mask.device)
+        species = (mask > 0) & (mask != ignore_index)
+        keep = torch.zeros(ph.shape, dtype=torch.bool, device=ph.device)
+        for code in allowed:
+            keep = keep | (ph == code)
+        if keep.shape != species.shape:
+            keep = keep.reshape(species.shape)
+        drop = species & ~keep
+        if bool(drop.any()):
+            mask = mask.clone()
+            mask[drop] = ignore_index
+        return mask
+    ph = np.asarray(phenology)
+    arr = np.asarray(mask)
+    species = (arr > 0) & (arr != ignore_index)
+    keep = np.isin(ph, allowed)
+    if keep.shape != species.shape:
+        keep = keep.reshape(species.shape)
+    drop = species & ~keep
+    if drop.any():
+        mask = np.array(arr, copy=True)
+        mask[drop] = ignore_index
+    return mask
+
+
 def _tile_month(path):
     """Acquisition month from the tile filename (YYYY_MM_DD_...), else None."""
     m = re.search(r'(?:^|[/_])(\d{4})_(\d{2})_\d{2}_', os.path.basename(str(path)))
@@ -59,7 +125,7 @@ def _tile_gsd_mm(src):
 
 
 class NeophyteDataset(Dataset):
-    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, few_shot_species=None, train_site=None, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False):
+    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, few_shot_species=None, train_site=None, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False, train_stages=None):
         self.image_dirs = image_dirs if isinstance(image_dirs, ListConfig) or isinstance(image_dirs, list) else [image_dirs]
         self.classes = classes
         self.num_classes = len(classes)
@@ -83,7 +149,11 @@ class NeophyteDataset(Dataset):
         self.few_shot_mode = few_shot_mode
         self.few_shot_bg_k = few_shot_bg_k # number of fewshot background samples
         self.few_shot_species = few_shot_species  # stats names, or None for every species
-        self.train_site = train_site or None  # site key such as Aarau_1, or None for every site
+        self.train_site = train_site or None  # site or flight keys, or None for every site
+        self.train_stages = _normalize_stages(train_stages)
+        if self.train_stages:
+            # The stage band has to be loaded so skipped stages can be ignored.
+            self.load_auxiliary = True
         self.load_into_ram = load_into_ram
         self.preload_workers = preload_workers
         
@@ -173,10 +243,15 @@ class NeophyteDataset(Dataset):
                 "Filtered dataset_stats does not match dataset length."
             )
         
-        # # one site only (train and val). The test split is left unfiltered so it
-        # # stays the fold's other sites.
+        # # chosen sites or flights (train and val). The test split is left
+        # # unfiltered so it stays the fold's other sites.
         if self.train_site:
             self._keep_train_site(self.train_site)
+
+        # # chosen phenological stages. Labelled tiles with none of them are
+        # # dropped. Background-only tiles stay. Pixel masking happens in __getitem__.
+        if self.train_stages:
+            self._keep_train_stages(self.train_stages)
 
         # # optional few-shot subset of the split
         if few_shot_k is not None:
@@ -230,18 +305,46 @@ class NeophyteDataset(Dataset):
 
 
     def _keep_train_site(self, train_site):
-        """Drop every tile whose site key is not ``train_site``."""
+        """Drop every tile whose flight folder or site group is not selected.
+
+        A key such as ``Aarau_1`` keeps every flight of that site. A key such
+        as ``Aarau_1_1`` keeps that flight. A list keeps the union.
+        """
+        keys = _as_names(train_site)
+        if not keys:
+            return
         if self.stats_df is None or "site" not in self.stats_df.columns:
             raise ValueError("train_site needs the 'site' column from dataset_stats.py")
         folders = self.stats_df["site"].astype(str)
         groups = folders.map(site_group)
-        keep = (groups == train_site) | (folders == train_site)
-        available = sorted(set(groups))
+        keep = groups.isin(keys) | folders.isin(keys)
         if not bool(keep.any()):
+            available = sorted(set(groups))
             raise ValueError(
-                f"No tiles for site {train_site}. Sites in this split: {available}"
+                f"No tiles for site {keys}. Sites in this split: {available}"
             )
-        print(f"train_site={train_site}: keeping {int(keep.sum())} of {len(keep)} tiles")
+        shown = ",".join(keys)
+        print(f"train_site={shown}: keeping {int(keep.sum())} of {len(keep)} tiles")
+        self._filter_by(keep)
+
+    def _keep_train_stages(self, stages):
+        """Drop labelled tiles that have no pixels in the chosen stages."""
+        if self.stats_df is None:
+            raise ValueError("train_stages needs dataset_stats")
+        cols = []
+        for stage in stages:
+            for name in self.neophytes_stats_names:
+                col = f"{stage}_{name}_px"
+                if col not in self.stats_df.columns:
+                    raise ValueError(f"train_stages needs column {col} from dataset_stats.py")
+                cols.append(col)
+        stage_px = self.stats_df[cols].sum(axis=1)
+        labelled = self.stats_df[[class_px_col(s) for s in self.neophytes_stats_names]].sum(axis=1) > 0
+        keep = ~labelled | (stage_px > 0)
+        print(
+            f"train_stages={','.join(stages)}: dropping {int((~keep).sum())} labelled tiles "
+            f"with none of those stages; keeping {int(keep.sum())} of {len(keep)}"
+        )
         self._filter_by(keep)
 
     def _few_shot_names(self, few_shot_species):
@@ -706,6 +809,9 @@ class NeophyteDataset(Dataset):
                     dsm = augmented['dsm']
                 if self.load_dtm:
                     dtm = augmented['dtm']
+
+        if self.train_stages:
+            mask = _drop_other_stages(mask, phenology, self.train_stages, self.ignore_index)
 
         # # Create sample =====================================================
         # int8/uint8 keeps a 2048 px tile at 1 byte per label channel instead of 8.

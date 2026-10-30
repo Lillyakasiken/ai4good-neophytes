@@ -46,9 +46,10 @@ logger: wandb
 log_name: ai4good-neophytes
 wandb_entity: max-zehnder-university-of-z-rich
 
-# # Set when training used data.train_site. test.py then also scores that site's
-# # validation tiles (same-site) and writes both that score and the held-out
-# # test-split score to quantitative/metrics_site_split.json.
+# # Set when training used data.train_site. A site (Aarau_1), a flight
+# # (Aarau_3_1), or a list of either. test.py then also scores those validation
+# # tiles (same-site) and writes both that score and the held-out test-split
+# # score to quantitative/metrics_site_split.json.
 train_site: null
 
 log_dir: lightning_logs

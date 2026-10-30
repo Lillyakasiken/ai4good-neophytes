@@ -55,7 +55,7 @@
             <div class="bar-row phase-row">
               <span class="phase">{phase.label}</span>
               <div class="bar" data-pct={pct(phase.m2, totalM2)}>
-                <div class="track"><span style:width="{(100 * phase.m2) / totalM2}%" style:--swatch={spec.color}></span></div>
+                <div class="track"><span style:width="{(100 * phase.m2) / totalM2}%" style:--swatch={phase.color || spec.color}></span></div>
               </div>
               <span class="num">{area(phase.m2)} m²</span>
             </div>

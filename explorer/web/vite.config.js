@@ -9,6 +9,7 @@ export default defineConfig({
       '/api': 'http://127.0.0.1:8000',
       '/thumbs': 'http://127.0.0.1:8000',
       '/masks': 'http://127.0.0.1:8000',
+      '/stage-masks': 'http://127.0.0.1:8000',
       '/batch-masks': 'http://127.0.0.1:8000',
     },
   },

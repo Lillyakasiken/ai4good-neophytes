@@ -34,12 +34,15 @@ from common import (
     GRID_PARQUET,
     MASKS_DIR,
     META_PARQUET,
+    PHASE_COLORS,
     PHASE_LABELS,
     PHASES,
     ROLES,
+    STAGE_MASKS_DIR,
     THUMB_PX,
     TILES_PARQUET,
     THUMBS_DIR,
+    TRAIN_STAGES,
     load_names,
     resolve_data_path,
     species_columns,
@@ -91,6 +94,15 @@ M2_MAX = 40.0
 for _name in SPECIES_NAMES:
     SORTS[f"{_name}_m2"] = f"{_name}_m2 DESC, tile_id"
 
+
+def _stage_area_expr(phase):
+    terms = " + ".join(f"COALESCE({phase}_{name}_m2, 0)" for name in SPECIES_NAMES)
+    return f"({terms})"
+
+
+for _phase in TRAIN_STAGES:
+    SORTS[f"{_phase}_m2"] = f"{_stage_area_expr(_phase)} DESC, tile_id"
+
 app = FastAPI(title="Neophyte tile explorer")
 
 
@@ -99,8 +111,10 @@ def _start_train_queue():
     train_jobs.start_scheduler()
 THUMBS_DIR.mkdir(parents=True, exist_ok=True)
 MASKS_DIR.mkdir(parents=True, exist_ok=True)
+STAGE_MASKS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/thumbs", StaticFiles(directory=THUMBS_DIR), name="thumbs")
 app.mount("/masks", StaticFiles(directory=MASKS_DIR), name="masks")
+app.mount("/stage-masks", StaticFiles(directory=STAGE_MASKS_DIR), name="stage-masks")
 
 
 def _require_catalog():
@@ -197,10 +211,31 @@ def _species_clause(species, species_op):
     return inner if len(parts) == 1 else f"({inner})"
 
 
+def _stage_clause(stages, species):
+    """Tiles with labelled pixels in any chosen stage.
+
+    When species chips are on, only those species count. Otherwise any species.
+    """
+    chosen = []
+    for stage in stages:
+        if stage not in TRAIN_STAGES:
+            names = ", ".join(TRAIN_STAGES)
+            raise HTTPException(status_code=400, detail=f"stage must be one of {names}")
+        if stage not in chosen:
+            chosen.append(stage)
+    if not chosen:
+        return None
+    names = species if species else SPECIES_NAMES
+    parts = [f"({stage}_{name}_px > 0)" for stage in chosen for name in names]
+    if not parts:
+        return None
+    return "(" + " OR ".join(parts) + ")"
+
+
 def _where(
     fold, role, split, site, flight, year, month, species, labelled,
     nodata_min, nodata_max, min_m2, m2_species, include_role=True,
-    background_only=False, max_m2=None, species_op="or",
+    background_only=False, max_m2=None, species_op="or", stages=None,
 ):
     if nodata_min is not None and nodata_max is not None and nodata_min > nodata_max:
         raise HTTPException(status_code=400, detail="empty margin min cannot be greater than max")
@@ -232,6 +267,8 @@ def _where(
         params.append(month)
     if species:
         clauses.append(_species_clause(species, species_op))
+    if stages:
+        clauses.append(_stage_clause(stages, species))
     if labelled:
         clauses.append("labelled")
     if background_only:
@@ -330,6 +367,7 @@ def _tile_brief(row):
         "species": _present(row),
         "thumb": f"/thumbs/{row['tile_id']}.webp",
         "mask": f"/masks/{row['tile_id']}.webp",
+        "stage_mask": f"/stage-masks/{row['tile_id']}.webp" if row.get("labelled") else None,
     }
 
 
@@ -366,6 +404,10 @@ def facets():
             {"id": s["id"], "stats_name": s["stats_name"], "name": s["name"], "color": s["color"]}
             for s in SPECIES
         ],
+        "phases": [
+            {"phase": phase, "label": PHASE_LABELS[phase], "color": PHASE_COLORS[phase]}
+            for phase in PHASES
+        ],
         "folds": {fold: {"test_sites": sites} for fold, sites in CV_FOLDS.items()},
         "sorts": list(SORTS),
         "bounds": {
@@ -388,6 +430,7 @@ def tiles(
     month: int | None = None,
     species: list[str] = Query(default=[]),
     species_op: str = "or",
+    stage: list[str] = Query(default=[]),
     labelled: bool = False,
     background_only: bool = False,
     nodata_min: float | None = Query(default=None, ge=NODATA_MIN, le=NODATA_MAX),
@@ -407,6 +450,7 @@ def tiles(
         fold, role, split, site, flight, year, month, species, labelled,
         nodata_min, nodata_max, min_m2, m2_species,
         background_only=background_only, max_m2=max_m2, species_op=species_op,
+        stages=stage,
     )
     px_cols = ", ".join(f"{name}_px" for name in SPECIES_NAMES)
     source, source_params = "FROM read_parquet(?) t", [str(TILES_PARQUET)]
@@ -457,6 +501,7 @@ def tile_detail(tile_id: str):
                 {
                     "phase": phase,
                     "label": PHASE_LABELS[phase],
+                    "color": PHASE_COLORS[phase],
                     "px": row[f"{phase}_{name}_px"],
                     "m2": row[f"{phase}_{name}_m2"],
                 }
@@ -489,6 +534,7 @@ def tile_detail(tile_id: str):
         "label_ids": _label_ids(row["mask_path"]),
         "thumb": f"/thumbs/{row['tile_id']}.webp",
         "mask": f"/masks/{row['tile_id']}.webp",
+        "stage_mask": f"/stage-masks/{row['tile_id']}.webp" if row["labelled"] else None,
         "seasons": _seasons(row["site_name"], row["img_path"]),
     }
 
@@ -1420,6 +1466,7 @@ def batch_tiles(
     month: int | None = None,
     species: list[str] = Query(default=[]),
     species_op: str = "or",
+    stage: list[str] = Query(default=[]),
     labelled: bool = True,
     background_only: bool = False,
     nodata_min: float | None = Query(default=None, ge=NODATA_MIN, le=NODATA_MAX),
@@ -1438,6 +1485,7 @@ def batch_tiles(
         fold, role, split, site, flight, year, month, species, labelled,
         nodata_min, nodata_max, min_m2, m2_species,
         background_only=background_only, max_m2=max_m2, species_op=species_op,
+        stages=stage,
     )
     px_cols = ", ".join(f"{name}_px" for name in SPECIES_NAMES)
     source, source_params = "FROM read_parquet(?) t", [str(TILES_PARQUET)]
@@ -1638,6 +1686,9 @@ class JobIn(BaseModel):
     few_shot_k: int | None = None
     few_shot_bg_k: int | None = None
     few_shot_mode: str | None = None
+    few_shot_species: list[str] | None = None
+    train_site: list[str] | str | None = None
+    train_stages: list[str] | None = None
     val_few_shot_k: int | None = None
     val_few_shot_bg_k: int | None = None
     val_few_shot_mode: str | None = None
@@ -1729,6 +1780,7 @@ def stats(
     month: int | None = None,
     species: list[str] = Query(default=[]),
     species_op: str = "or",
+    stage: list[str] = Query(default=[]),
     labelled: bool = False,
     background_only: bool = False,
     nodata_min: float | None = Query(default=None, ge=NODATA_MIN, le=NODATA_MAX),
@@ -1743,7 +1795,7 @@ def stats(
         fold=fold, split=split, site=site, flight=flight, year=year, month=month,
         species=species, species_op=species_op, labelled=labelled, background_only=background_only,
         nodata_min=nodata_min, nodata_max=nodata_max,
-        min_m2=min_m2, max_m2=max_m2, m2_species=m2_species,
+        min_m2=min_m2, max_m2=max_m2, m2_species=m2_species, stages=stage,
     )
     where, params = _where(role=role, include_role=True, **common)
     where_roles, params_roles = _where(role=role, include_role=False, **common)
@@ -1835,6 +1887,7 @@ def stats(
                     {
                         "phase": phase,
                         "label": PHASE_LABELS[phase],
+                        "color": PHASE_COLORS[phase],
                         "m2": wide[f"{phase}_{spec['stats_name']}_m2"],
                     }
                     for phase in PHASES
