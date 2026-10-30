@@ -6,19 +6,23 @@ The catalog is one Parquet row per tile, queried with DuckDB. Thumbnails are 256
 
 ## In the browser
 
-The page opens on the tile grid for cv3 train. Switch to Map to see one flight, or to Runs to watch the GPU, recent W&B runs, and the training queue. Open a tile to look at the photo and its labels, try image filters, ask for a zero-shot mask, or run a trained checkpoint. The label switch next to Show labels draws either the species mask or the phenology mask (non-flowering, flowering, fruiting). Stage chips in the filter bar keep tiles that have labelled pixels in the chosen stages.
+The page opens on the tile grid for cv3 train. Switch to Map to see one flight, Model to inspect checkpoint architectures and tensor shapes, Batch to run and evaluate predictions across many tiles, or Runs to watch the GPU, recent W&B runs, and the training queue. Open a tile to look at the photo and its labels, try image filters, ask for a zero-shot mask, or run a trained checkpoint. The label switch next to Show labels draws either the species mask or the phenology mask (non-flowering, flowering, fruiting). Stage chips in the filter bar keep tiles that have labelled pixels in the chosen stages.
 
 ```mermaid
 flowchart TD
   page["Open the explorer"] --> tiles["Tiles"]
   page --> map["Map"]
+  page --> model["Model"]
+  page --> batch["Batch"]
+  page --> runs["Runs"]
   tiles -->|"filter and sort"| tile["Open a tile"]
   map -->|"pick a flight"| tile
+  batch -->|"filter and sort predictions"| tile
   tile --> photo["Photo and class mask"]
   tile --> vision["Vision"]
   tile --> segment["Segment"]
   tile --> predict["Predict"]
-  page --> runs["Runs"]
+  predict -->|"inspect architecture"| model
   runs --> queue["Training queue"]
   runs --> wandb["Recent W&B runs"]
   runs --> gpu["GPU"]
@@ -56,7 +60,7 @@ Open a tile and choose Vision to preview OpenCV filters and a gray-value histogr
 
 Choose Segment to run a zero-shot mask on that same preview. The tab offers YOLOE-26s, which takes a text phrase, and SAM 2.1 tiny, which takes include and exclude points and boxes. Neither model is trained on the six neophytes, so the overlay is only a visual test. The first text prompt downloads `yoloe-26s-seg.pt` and a MobileCLIP encoder into `cache/weights` (about 254 MB for the encoder) and needs network access. That first call also installs the Ultralytics CLIP fork if it is missing (`pip install git+https://github.com/ultralytics/CLIP.git`). The mask is returned in the response and is not saved.
 
-## Predict, runs, and the GPU
+## Predict, batch, model, runs, and the GPU
 
 The explorer API stays in `explorer/.venv`. Prediction and training use the repo-root `.venv` from `pyproject.toml`. Create it once from the repo root:
 
@@ -66,7 +70,11 @@ uv sync
 
 Choose Predict on an open tile, pick a checkpoint under `lightning_logs/`, and run it. The forward pass matches `test.py`: the whole tile at its own resolution, patching off. The overlay uses the same class colors as the ground-truth label. Photo, Labels, Prediction, Compare, and Importance are separate views, so the two masks are not blended. Compare can split them with a wipe or show agreement: a fill matches the label, a white edge is extra, an outline was missed, and a colored edge is the label where the class is wrong. A half-resolution (`_ds2`) run is scaled down before the forward pass, the same way its test config does. A checkpoint that was trained with an nDSM reads that tile's DSM and DTM. The first load of an architecture can take a while. A successful run is saved under `cache/predictions/` and loads again without the GPU, including while a training job is running. Re-run computes it again. Clear saved drops that tile and checkpoint; Clear all drops every saved prediction. Free GPU unloads the prediction model only. A new prediction is refused while a training job is running, so the two do not share the GPU.
 
-Runs is the third view in the header. It lists recent runs from the W&B project `max-zehnder-university-of-z-rich/ai4good-neophytes`. If the panel says W&B is not logged in, run `uv run wandb login` once from the repo root. The same view has a form for a new training job and tails that job's log. Queue run writes the job to `explorer/cache/jobs/` and starts it in tmux (`np-<id>`) when `nvidia-smi` shows no compute process. Only one job runs at a time. Clear cancels every job still waiting and hides finished rows. Hide on one finished row removes that row. A running job stays, and its log file stays on disk. Turn Subset on to limit training and validation to a number of tiles per species; with it off the job uses the whole split. The species field starts with every species. Remove one to leave its tiles out of the subset. Train on flights limits training and validation to the flights you tick. Leave it empty for every flight in the split. Each flight row shows its date, the species labelled there, and the share of non-flowering, flowering, and fruiting pixels. A site name selects every flight of that site. Val F1 is then same-flight and test F1 is the fold's other sites. Train stages starts with all three. Turn one off to ignore that stage: those pixels are not learned as background, and tiles with none of the chosen stages are dropped. The test split stays unfiltered, so the test score still includes the stages left out of training. The W&B name field starts as the name the queue would assign; edit it to choose another. With flights, stages, or Subset narrowed, that default also gains a tag, such as fl_Aarau_3_1-Rueti_1_1, stnonflower, or t10_v10_tbg10_vbg0. The extra lines are `key=value` Hydra overrides with no spaces. The header readout (`GPU 84% · 18/24 GB`) stays visible on Tiles and Map.
+The Batch view runs predictions on multiple tiles at once. It shows summary metrics (F1, IoU, Precision, Recall) across the batch and lets you filter the results to find false positives, missed plants, or confused classes. Clicking a tile in the batch opens it in the Predict view.
+
+The Model view inspects a checkpoint's architecture. It traces the forward pass to show tensor shapes for the image, the height layers, and the output, and visualizes the model's structure. You can open it from the header or from the Predict tab of an open tile.
+
+Runs is the last view in the header. It lists recent runs from the W&B project `max-zehnder-university-of-z-rich/ai4good-neophytes`. If the panel says W&B is not logged in, run `uv run wandb login` once from the repo root. The same view has a form for a new training job and tails that job's log. Queue run writes the job to `explorer/cache/jobs/` and starts it in tmux (`np-<id>`) when `nvidia-smi` shows no compute process. Only one job runs at a time. Clear cancels every job still waiting and hides finished rows. Hide on one finished row removes that row. A running job stays, and its log file stays on disk. Turn Subset on to limit training and validation to a number of tiles per species; with it off the job uses the whole split. The species field starts with every species. Remove one to leave its tiles out of the subset. Train on flights limits training and validation to the flights you tick. Leave it empty for every flight in the split. Each flight row shows its date, the species labelled there, and the share of non-flowering, flowering, and fruiting pixels. A site name selects every flight of that site. Val F1 is then same-flight and test F1 is the fold's other sites. Train stages starts with all three. Turn one off to ignore that stage: those pixels are not learned as background, and tiles with none of the chosen stages are dropped. The test split stays unfiltered, so the test score still includes the stages left out of training. The W&B name field starts as the name the queue would assign; edit it to choose another. With flights, stages, or Subset narrowed, that default also gains a tag, such as fl_Aarau_3_1-Rueti_1_1, stnonflower, or t10_v10_tbg10_vbg0. The extra lines are `key=value` Hydra overrides with no spaces. The header readout (`GPU 84% · 18/24 GB`) stays visible on Tiles and Map.
 
 The API is bound to `127.0.0.1` because it can start training. Do not expose it on the network.
 
