@@ -25,11 +25,17 @@
   let valFewShotK = $state(null);
   let valFewShotBg = $state(0);
   let valFewShotMode = $state('all');
+  let trainSite = $state('');
+  let speciesOn = $state({});
+  let speciesOpen = $state(false);
+  let speciesRoot = $state(null);
+  let siteNote = $state(false);
   let subsetNote = $state(false);
   let runTest = $state(false);
   let testNote = $state(false);
   let extraNote = $state(false);
   let confirmJob = $state(null);
+  let confirmClear = $state(false);
   let confirmEl = $state(null);
   let showCommand = $state(false);
   let extra = $state('');
@@ -72,12 +78,17 @@
       `data.batch_size_val=${batchVal}`,
       `model.precision=${precision}`,
       `logger=${logger}`,
+      ...siteArgs(),
       ...subsetArgs(),
       ...overrideLines(extra),
       `exp_name=${runName()}`,
     ];
     let text = lines.join(' ');
-    if (runTest) text += `\n.venv/bin/python test.py exp_name=${runName()}`;
+    if (runTest) {
+      let test = `\n.venv/bin/python test.py exp_name=${runName()}`;
+      if (trainSite) test += ` train_site=${trainSite}`;
+      text += test;
+    }
     return text;
   });
 
@@ -104,22 +115,70 @@
     return Number.isFinite(n) ? String(n) : '0';
   }
 
-  // t10_v10_tbg10_vbg0: species counts first, then the background tiles that go with them.
-  function subsetTag() {
-    if (!subsetOn) return '';
+  let sites = $derived(options?.sites_by_data?.[dataName] ?? []);
+
+  $effect(() => {
+    if (trainSite && !sites.includes(trainSite)) trainSite = '';
+  });
+
+  let speciesLocked = $derived(fewShotK == null || fewShotK === '');
+
+  $effect(() => {
+    if (!speciesOpen) return;
+    const close = (event) => {
+      if (speciesRoot && !speciesRoot.contains(event.target)) speciesOpen = false;
+    };
+    const onKey = (event) => {
+      if (event.key === 'Escape') speciesOpen = false;
+    };
+    document.addEventListener('click', close);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('click', close);
+      document.removeEventListener('keydown', onKey);
+    };
+  });
+
+  $effect(() => {
+    if (speciesLocked) speciesOpen = false;
+  });
+
+  function speciesChosen(name) {
+    return speciesOn[name] !== false;
+  }
+
+  function selectedSpecies() {
+    const all = options?.species ?? [];
+    return all.filter((sp) => speciesChosen(sp.stats_name)).map((sp) => sp.stats_name);
+  }
+
+  function speciesRestricted() {
+    const all = options?.species ?? [];
+    if (!subsetOn || !all.length) return false;
+    if (fewShotK == null || fewShotK === '') return false;
+    return selectedSpecies().length < all.length;
+  }
+
+  // siteAarau_1_t10_tbg10_spB_davidii: site, then tile counts, then a species list
+  // only when it is not every species.
+  function nameTag() {
     const parts = [];
-    const trainSet = fewShotK != null && fewShotK !== '';
-    const valSet = valFewShotK != null && valFewShotK !== '';
-    if (trainSet) parts.push(`t${countText(fewShotK)}`);
-    if (valSet) parts.push(`v${countText(valFewShotK)}`);
-    if (trainSet) parts.push(`tbg${countText(fewShotBg)}`);
-    if (valSet) parts.push(`vbg${countText(valFewShotBg)}`);
+    if (trainSite) parts.push(`site${trainSite}`);
+    if (subsetOn) {
+      const trainSet = fewShotK != null && fewShotK !== '';
+      const valSet = valFewShotK != null && valFewShotK !== '';
+      if (trainSet) parts.push(`t${countText(fewShotK)}`);
+      if (valSet) parts.push(`v${countText(valFewShotK)}`);
+      if (trainSet) parts.push(`tbg${countText(fewShotBg)}`);
+      if (valSet) parts.push(`vbg${countText(valFewShotBg)}`);
+      if (speciesRestricted()) parts.push(`sp${selectedSpecies().join('-')}`);
+    }
     return parts.join('_');
   }
 
   function defaultRunName() {
     const base = `${nameStamp}_${dataName}_${modelName}_s${seed}`;
-    const tag = subsetTag();
+    const tag = nameTag();
     return tag ? `${base}_${tag}` : base;
   }
 
@@ -135,7 +194,7 @@
   $effect(() => {
     const key = `${dataName}\0${modelName}\0${seed}`;
     if (expNameCustom) return;
-    const tag = subsetTag();
+    const tag = nameTag();
     if (key !== trackedNameKey) {
       trackedNameKey = key;
       nameStamp = stampNow();
@@ -144,9 +203,16 @@
     expName = tag ? `${base}_${tag}` : base;
   });
 
+  function siteArgs() {
+    return trainSite ? [`data.train_site=${trainSite}`] : [];
+  }
+
   function subsetArgs() {
     const args = [];
     if (!subsetOn) return args;
+    if (speciesRestricted()) {
+      args.push(`data.few_shot_species=[${selectedSpecies().join(',')}]`);
+    }
     if (fewShotK != null && fewShotK !== '') {
       args.push(`data.few_shot_k=${Number(fewShotK)}`);
       args.push(`data.few_shot_bg_k=${Number(fewShotBg)}`);
@@ -297,6 +363,10 @@
             const body = await res.json();
             if (!dead) {
               jobs = body.jobs ?? [];
+              if (openId && !jobs.some((job) => job.id === openId)) {
+                openId = '';
+                logText = '';
+              }
               if (!openId) {
                 const current = jobs.find((job) => job.status === 'running') ?? jobs.at(-1);
                 if (current) openId = current.id;
@@ -392,6 +462,10 @@
 
   async function enqueue() {
     formError = '';
+    if (subsetOn && fewShotK != null && fewShotK !== '' && selectedSpecies().length === 0) {
+      formError = 'Pick at least one species.';
+      return;
+    }
     submitting = true;
     try {
       const res = await fetch('/api/jobs', {
@@ -410,6 +484,8 @@
           logger,
           exp_name: expName.trim(),
           run_test: runTest,
+          train_site: trainSite || null,
+          few_shot_species: speciesRestricted() ? selectedSpecies() : null,
           few_shot_k: subsetOn ? countOrNull(fewShotK) : null,
           few_shot_bg_k: subsetOn ? countOrNull(fewShotBg) : null,
           few_shot_mode: subsetOn ? fewShotMode : null,
@@ -431,8 +507,25 @@
     }
   }
 
+  function finished(job) {
+    return job.status === 'done' || job.status === 'failed' || job.status === 'cancelled';
+  }
+
+  let canClear = $derived(jobs.some((job) => job.status === 'queued' || finished(job)));
+
   function askCancel(job) {
+    confirmClear = false;
     confirmJob = job;
+  }
+
+  function askClear() {
+    confirmJob = null;
+    confirmClear = true;
+  }
+
+  function closeConfirm() {
+    confirmJob = null;
+    confirmClear = false;
   }
 
   async function cancel(id) {
@@ -441,11 +534,44 @@
     if (!res.ok) formError = await readError(res);
   }
 
+  async function hide(id) {
+    const res = await fetch(`/api/jobs/${id}/hide`, { method: 'POST' });
+    if (!res.ok) {
+      formError = await readError(res);
+      return;
+    }
+    jobs = jobs.filter((job) => job.id !== id);
+    if (openId === id) {
+      openId = '';
+      logText = '';
+    }
+  }
+
+  async function clearQueue() {
+    confirmClear = false;
+    const res = await fetch('/api/jobs/clear', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ waiting: true, finished: true }),
+    });
+    if (!res.ok) {
+      formError = await readError(res);
+      return;
+    }
+    const staying = jobs.filter((job) => job.status === 'running');
+    jobs = staying;
+    if (openId && !staying.some((job) => job.id === openId)) {
+      openId = '';
+      logText = '';
+    }
+  }
+
   $effect(() => {
     const el = confirmEl;
+    const open = confirmJob || confirmClear;
     if (!el) return;
-    if (confirmJob && !el.open) el.showModal();
-    if (!confirmJob && el.open) el.close();
+    if (open && !el.open) el.showModal();
+    if (!open && el.open) el.close();
   });
 
   function metric(run, key) {
@@ -564,6 +690,39 @@
       </label>
       <div class="override-field">
         <div class="check-row">
+          <label class="site-field">
+            Train on one site
+            <select bind:value={trainSite}>
+              <option value="">All sites in this split</option>
+              {#each sites as name}
+                <option value={name}>{name}</option>
+              {/each}
+            </select>
+          </label>
+          <span class="note-wrap">
+            <button
+              type="button"
+              class="info"
+              aria-label="What training on one site does"
+              aria-expanded={siteNote}
+              onclick={() => (siteNote = !siteNote)}
+            >i</button>
+            {#if siteNote}
+              <div class="test-note" role="dialog" aria-label="What training on one site does">
+                <p>
+                  Training and validation use only that site. The test split stays the other sites in the fold.
+                </p>
+                <p>
+                  Val F1 in the table is same-site (this site's validation tiles). Test F1 is held-out (the other sites).
+                  test.py writes both to metrics_site_split.json.
+                </p>
+              </div>
+            {/if}
+          </span>
+        </div>
+      </div>
+      <div class="override-field">
+        <div class="check-row">
           <label class="check">
             <input type="checkbox" bind:checked={subsetOn} />
             Subset
@@ -584,8 +743,8 @@
                 </p>
                 <p>
                   The training choice prefers the largest single-species tiles and spreads them over
-                  sites and stages. A validation subset drops empty tiles, so false positives on bare
-                  ground stay out of the score.
+                  sites and stages. Remove a species to skip its tiles. A validation subset drops empty
+                  tiles, so false positives on bare ground stay out of the score.
                 </p>
               </div>
             {/if}
@@ -626,6 +785,59 @@
             </select>
           </label>
         </div>
+        <div class="species-pick" bind:this={speciesRoot}>
+          <span class="override-label" id="species-label">Species</span>
+          <div class="multi" class:locked={speciesLocked} class:open={speciesOpen}>
+            <div class="multi-value">
+              {#each options?.species ?? [] as sp (sp.stats_name)}
+                {#if speciesChosen(sp.stats_name)}
+                  <span class="chip">
+                    {sp.name}
+                    <button
+                      type="button"
+                      disabled={speciesLocked}
+                      aria-label={`Remove ${sp.name}`}
+                      onclick={(event) => {
+                        event.stopPropagation();
+                        speciesOn[sp.stats_name] = false;
+                      }}
+                    >×</button>
+                  </span>
+                {/if}
+              {/each}
+              {#if selectedSpecies().length === 0}
+                <span class="multi-empty">None selected</span>
+              {/if}
+            </div>
+            <button
+              type="button"
+              class="multi-toggle"
+              aria-haspopup="listbox"
+              aria-expanded={speciesOpen}
+              aria-labelledby="species-label"
+              disabled={speciesLocked}
+              onclick={() => (speciesOpen = !speciesOpen)}
+            >▾</button>
+            {#if speciesOpen}
+              <ul class="multi-menu" role="listbox" aria-multiselectable="true" aria-labelledby="species-label">
+                {#each options?.species ?? [] as sp (sp.stats_name)}
+                  <li>
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={speciesChosen(sp.stats_name)}
+                      class:on={speciesChosen(sp.stats_name)}
+                      onclick={(event) => {
+                        event.stopPropagation();
+                        speciesOn[sp.stats_name] = !speciesChosen(sp.stats_name);
+                      }}
+                    >{sp.name}</button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
+        </div>
         {/if}
       </div>
       <div class="check-row">
@@ -644,8 +856,9 @@
           {#if testNote}
             <div class="test-note" role="dialog" aria-label="What test.py does">
               <p>
-                test.py scores the best checkpoint on the matching held-out test split.
-                It writes metrics, plots, and a few prediction figures into the run directory.
+                test.py scores the best checkpoint on this split's held-out sites.
+                A name like neophytes_split_cv3_train_1024 is matched to neophytes_split_cv3_test.
+                With one site selected it also scores that site's validation tiles.
               </p>
               <p>Training already does a short test pass. This checkbox adds that full evaluation in the same tmux session.</p>
             </div>
@@ -735,7 +948,12 @@
       </section>
 
       <section class="card">
-        <h2>Queue</h2>
+        <div class="queue-head">
+          <h2>Queue</h2>
+          {#if canClear}
+            <button type="button" class="cancel" onclick={askClear}>Clear</button>
+          {/if}
+        </div>
         {#if jobs.length}
           <ul class="queue">
             {#each jobs as job (job.id)}
@@ -747,6 +965,8 @@
                   </button>
                   {#if job.status === 'queued' || job.status === 'running'}
                     <button type="button" class="cancel" onclick={() => askCancel(job)}>Cancel</button>
+                  {:else if finished(job)}
+                    <button type="button" class="cancel" onclick={() => hide(job.id)}>Hide</button>
                   {/if}
                 </div>
                 {#if job.progress}
@@ -770,18 +990,25 @@
           aria-labelledby="cancel-title"
           oncancel={(event) => {
             event.preventDefault();
-            confirmJob = null;
+            closeConfirm();
           }}
           onclick={(event) => {
-            if (event.target === event.currentTarget) confirmJob = null;
+            if (event.target === event.currentTarget) closeConfirm();
           }}
         >
           {#if confirmJob}
             <p id="cancel-title">Cancel this run?</p>
             <p class="hint">{confirmJob.exp_name}</p>
             <div class="confirm-actions">
-              <button type="button" class="ghost" onclick={() => (confirmJob = null)}>Keep it</button>
+              <button type="button" class="ghost" onclick={closeConfirm}>Keep it</button>
               <button type="button" class="cancel" onclick={() => cancel(confirmJob.id)}>Cancel run</button>
+            </div>
+          {:else if confirmClear}
+            <p id="cancel-title">Clear the queue?</p>
+            <p class="hint">Waiting jobs are cancelled. Finished jobs are hidden. A running job stays.</p>
+            <div class="confirm-actions">
+              <button type="button" class="ghost" onclick={closeConfirm}>Keep them</button>
+              <button type="button" class="cancel" onclick={clearQueue}>Clear</button>
             </div>
           {/if}
         </dialog>
@@ -949,6 +1176,110 @@
 
   .override-field .check-row { margin-bottom: 0; }
 
+  .site-field { flex: 1; margin: 0; min-width: 0; }
+
+  .species-pick {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+  }
+
+  .multi {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    background: #fff;
+    padding: 4px 4px 4px 6px;
+  }
+
+  .multi.locked { opacity: 0.55; }
+
+  .multi-value {
+    flex: 1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    min-height: 26px;
+    min-width: 0;
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    background: #f4f7f8;
+    color: var(--ink);
+    font-size: 12px;
+    line-height: 1;
+    padding: 3px 2px 3px 6px;
+  }
+
+  .chip button {
+    width: auto;
+    border: 0;
+    background: transparent;
+    color: var(--mist);
+    padding: 0 4px;
+    font-size: 14px;
+    line-height: 1;
+  }
+
+  .chip button:hover:not(:disabled) { color: var(--ink); }
+
+  .multi-empty {
+    color: var(--mist);
+    font-size: 12px;
+    padding: 4px 2px;
+  }
+
+  .multi-toggle {
+    width: auto;
+    flex: none;
+    border: 0;
+    background: transparent;
+    color: var(--ink);
+    padding: 2px 6px;
+    line-height: 1;
+  }
+
+  .multi-menu {
+    position: absolute;
+    z-index: 6;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    margin: 0;
+    padding: 4px;
+    list-style: none;
+    background: var(--sheet);
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    box-shadow: var(--shadow);
+  }
+
+  .multi-menu button {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    border-radius: 2px;
+    text-align: left;
+    color: var(--ink);
+    padding: 6px 8px;
+    font-size: 13px;
+  }
+
+  .multi-menu button.on { background: color-mix(in srgb, var(--canopy) 16%, white); }
+
+  .multi-menu button:hover,
+  .multi-menu button:focus-visible { background: #eef3f4; }
+
   .override-label {
     font-size: 12px;
     color: var(--mist);
@@ -1004,7 +1335,15 @@
     margin-bottom: 10px;
   }
 
-  .log-head h2 { margin: 0; }
+  .log-head h2, .queue-head h2 { margin: 0; }
+
+  .queue-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
 
   .log-window {
     flex-direction: row;

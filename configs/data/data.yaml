@@ -61,6 +61,14 @@ few_shot_mode: 'max_px_site_pheno'  # all, random, max_px, max_px_site, max_px_p
                                     # max_px_site_pheno (most diverse: spreads the k images
                                     # over sites and phenological phases)
 few_shot_bg_k: 1000  # additional background-only images (0 = none)
+# # null = draw k tiles for every species. A list of stats_name values
+# # (B_davidii, R_typhina, ...) draws k tiles only for those species.
+few_shot_species: null
+
+# # null = every site in the split. A site key such as Aarau_1 keeps only that
+# # site's tiles in train and val. The test split stays the fold's other sites,
+# # so val F1 is same-site and test F1 is held-out.
+train_site: null
 
 # # Validation subset. null = validate on the complete val set, which is the honest
 # # setting: filtering the val set down to labelled images removes exactly the

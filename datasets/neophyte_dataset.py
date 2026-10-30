@@ -59,7 +59,7 @@ def _tile_gsd_mm(src):
 
 
 class NeophyteDataset(Dataset):
-    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False):
+    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, few_shot_species=None, train_site=None, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False):
         self.image_dirs = image_dirs if isinstance(image_dirs, ListConfig) or isinstance(image_dirs, list) else [image_dirs]
         self.classes = classes
         self.num_classes = len(classes)
@@ -82,6 +82,8 @@ class NeophyteDataset(Dataset):
         self.few_shot_k = few_shot_k # any number or None (default: None -> full set) (only neophyte classes)
         self.few_shot_mode = few_shot_mode
         self.few_shot_bg_k = few_shot_bg_k # number of fewshot background samples
+        self.few_shot_species = few_shot_species  # stats names, or None for every species
+        self.train_site = train_site or None  # site key such as Aarau_1, or None for every site
         self.load_into_ram = load_into_ram
         self.preload_workers = preload_workers
         
@@ -171,9 +173,15 @@ class NeophyteDataset(Dataset):
                 "Filtered dataset_stats does not match dataset length."
             )
         
+        # # one site only (train and val). The test split is left unfiltered so it
+        # # stays the fold's other sites.
+        if self.train_site:
+            self._keep_train_site(self.train_site)
+
         # # optional few-shot subset of the split
         if few_shot_k is not None:
-            self.apply_few_shot(few_shot_k, few_shot_mode, few_shot_bg_k=few_shot_bg_k)
+            self.apply_few_shot(few_shot_k, few_shot_mode, few_shot_bg_k=few_shot_bg_k,
+                                few_shot_species=few_shot_species)
         
         # # Calculate sample weights
         self.sample_weights = None
@@ -221,16 +229,50 @@ class NeophyteDataset(Dataset):
             self.dtm_files = [self.dtm_files[i] for i in idx]
 
 
+    def _keep_train_site(self, train_site):
+        """Drop every tile whose site key is not ``train_site``."""
+        if self.stats_df is None or "site" not in self.stats_df.columns:
+            raise ValueError("train_site needs the 'site' column from dataset_stats.py")
+        folders = self.stats_df["site"].astype(str)
+        groups = folders.map(site_group)
+        keep = (groups == train_site) | (folders == train_site)
+        available = sorted(set(groups))
+        if not bool(keep.any()):
+            raise ValueError(
+                f"No tiles for site {train_site}. Sites in this split: {available}"
+            )
+        print(f"train_site={train_site}: keeping {int(keep.sum())} of {len(keep)} tiles")
+        self._filter_by(keep)
+
+    def _few_shot_names(self, few_shot_species):
+        """Species the k-tile draw covers. None means every neophyte."""
+        if few_shot_species is None:
+            return list(self.neophytes_stats_names)
+        if isinstance(few_shot_species, str):
+            few_shot_species = [few_shot_species]
+        names = [str(name) for name in few_shot_species]
+        unknown = [name for name in names if name not in self.neophytes_stats_names]
+        if unknown:
+            raise ValueError(
+                f"Unknown few_shot_species {unknown}. Known: {self.neophytes_stats_names}"
+            )
+        if not names:
+            raise ValueError("few_shot_species is empty")
+        return names
+
     def apply_few_shot(
         self,
         few_shot_k,
         few_shot_mode,
         few_shot_bg_k=50,
+        few_shot_species=None,
     ):
         selected = set()
-    
+        species_names = self._few_shot_names(few_shot_species)
+        print(f"Few-shot species: {', '.join(species_names)}")
+
         # --- per-class few-shot selection ---
-        for class_name in self.neophytes_stats_names:
+        for class_name in species_names:
             
             idxs = select_few_shot_for_class(
                 df=self.stats_df,
@@ -707,6 +749,18 @@ def get_normalize_params(compose: Compose) -> Tuple[Optional[float], Optional[fl
     # If no Normalize found
     return None, None
 
+
+
+def site_group(name):
+    """``Aarau_1_1`` (the folder, flight included) -> ``Aarau_1``.
+
+    The last underscore-separated piece is the flight number. A name that does
+    not end in a number is returned unchanged.
+    """
+    head, sep, tail = str(name).rpartition("_")
+    if sep and tail.isdigit():
+        return head
+    return str(name)
 
 
 def class_px_col(class_name):

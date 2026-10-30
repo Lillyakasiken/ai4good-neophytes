@@ -39,6 +39,7 @@ FEW_SHOT_MODES = (
 )
 DATA_DEFAULT = "neophytes_split_cv3_train_1024"
 MODEL_DEFAULT = "model_neophytes_mit_b2"
+_SPLIT_DEFAULT = re.compile(r"^\s*-\s+(split_[A-Za-z0-9_]+)\s*$", re.M)
 # Example command in a model config's header, e.g. the 512 schedule in
 # model_neophytes_mit_b2_ndsm_dev.yaml. The form selects that data config.
 DOCUMENTED_DATA = re.compile(r"#\s*python train\.py data=([A-Za-z0-9_]+)")
@@ -66,6 +67,48 @@ def _save(jobs):
     tmp = JOBS_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps({"jobs": jobs}, indent=2))
     tmp.replace(JOBS_PATH)
+
+
+def _site_group(name):
+    """``Aarau_1_1`` (site folder, flight included) -> ``Aarau_1``."""
+    head, sep, tail = str(name).rpartition("_")
+    if sep and tail.isdigit():
+        return head
+    return str(name)
+
+
+def species_catalog():
+    """Species the few-shot form can tick, in class-index order, background omitted."""
+    path = REPO_ROOT / "configs" / "data" / "neophytes_names_colors.yaml"
+    doc = yaml.safe_load(path.read_text()) or {}
+    items = []
+    for key in sorted(doc.get("classes") or {}, key=lambda item: int(item)):
+        if int(key) == 0:
+            continue
+        entry = doc["classes"][key]
+        items.append({"stats_name": str(entry["stats_name"]), "name": str(entry["name"])})
+    return items
+
+
+def sites_for_data(stem):
+    """Site keys present in a training config's train folders, such as ``Aarau_1``."""
+    path = REPO_ROOT / "configs" / "data" / f"{stem}.yaml"
+    if not path.is_file():
+        return []
+    match = _SPLIT_DEFAULT.search(path.read_text())
+    if not match:
+        return []
+    split_path = REPO_ROOT / "configs" / "data" / f"{match.group(1)}.yaml"
+    if not split_path.is_file():
+        return []
+    split = yaml.safe_load(split_path.read_text()) or {}
+    folders = (split.get("image_dir") or {}).get("train") or []
+    found = []
+    for item in folders:
+        key = _site_group(str(item).rstrip("/").split("/")[-2])
+        if key not in found:
+            found.append(key)
+    return found
 
 
 def data_configs():
@@ -154,6 +197,8 @@ def train_options():
             "val_few_shot_mode": "all",
         },
         "few_shot_modes": list(FEW_SHOT_MODES),
+        "species": species_catalog(),
+        "sites_by_data": {name: sites_for_data(name) for name in data_configs()},
     }
 
 
@@ -170,14 +215,48 @@ def _count(value, name, low, high):
     return count
 
 
-def few_shot_overrides(body):
-    """Hydra args for a per-species subset. Blank counts use the whole split.
+def _train_site(body, data):
+    raw = body.get("train_site")
+    if raw is None or raw == "":
+        return None
+    site = str(raw)
+    allowed = sites_for_data(data)
+    if site not in allowed:
+        raise JobError(f"unknown site for this split: {site}")
+    return site
+
+
+def _species_list(body):
+    """Stats names to draw few-shot tiles for. None means every species."""
+    raw = body.get("few_shot_species")
+    if raw is None or raw == "":
+        return None
+    if not isinstance(raw, list):
+        raise JobError("few_shot_species must be a list")
+    catalog = [item["stats_name"] for item in species_catalog()]
+    names = [str(item) for item in raw]
+    unknown = [name for name in names if name not in catalog]
+    if unknown:
+        raise JobError(f"unknown species: {', '.join(unknown)}")
+    if not names:
+        raise JobError("pick at least one species")
+    ordered = [name for name in catalog if name in set(names)]
+    if ordered == catalog:
+        return None
+    return ordered
+
+
+def few_shot_overrides(body, data):
+    """Hydra args for a per-species subset and an optional single training site.
 
     Background tiles are only sent together with a species count. Otherwise the
     training config would add its own default (1000 background tiles) on top of
     a small species subset.
     """
     args = []
+    site = _train_site(body, data)
+    if site:
+        args.append(f"data.train_site={site}")
     train_k = _count(body.get("few_shot_k"), "images per species", 1, 5000)
     if train_k is not None:
         bg = _count(body.get("few_shot_bg_k"), "background tiles", 0, 5000)
@@ -189,6 +268,9 @@ def few_shot_overrides(body):
             f"data.few_shot_bg_k={0 if bg is None else bg}",
             f"data.few_shot_mode={mode}",
         ]
+        species = _species_list(body)
+        if species:
+            args.append("data.few_shot_species=[" + ",".join(species) + "]")
     val_k = _count(body.get("val_few_shot_k"), "val images per species", 1, 5000)
     if val_k is not None:
         bg = _count(body.get("val_few_shot_bg_k"), "val background tiles", 0, 5000)
@@ -256,11 +338,14 @@ def _reconcile(job):
     return job
 
 
+_FINISHED = {"done", "failed", "cancelled"}
+
+
 def list_jobs():
     with _lock:
         jobs = [_reconcile(job) for job in _load()]
         _save(jobs)
-        return {"jobs": [_public(job) for job in jobs]}
+        return {"jobs": [_public(job) for job in jobs if not job.get("hidden")]}
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -451,13 +536,16 @@ def enqueue(body):
         f"data.batch_size_val={batch_val}",
         f"model.precision={precision}",
         f"logger={logger}",
-        *few_shot_overrides(body),
+        *few_shot_overrides(body, data),
         *overrides,
         f"exp_name={exp_name}",
     ]
     test_argv = None
     if run_test:
         test_argv = [str(python), str(REPO_ROOT / "test.py"), f"exp_name={exp_name}"]
+        site = _train_site(body, data)
+        if site:
+            test_argv.append(f"train_site={site}")
     command = _command_text(train_argv)
     if test_argv:
         command += "\n" + _command_text(test_argv)
@@ -495,12 +583,16 @@ def _trim(jobs):
 
 
 def subset_tag(body):
-    """Short name suffix for a subset, e.g. t10_v10_tbg10_vbg0.
+    """Short name suffix, e.g. siteAarau_1_t10_tbg10_spB_davidii.
 
-    Species counts come first, then the background tiles sent with each of them.
-    A side with no species count is left out.
+    A chosen site comes first. Species counts come next, then the background
+    tiles sent with each of them. A side with no species count is left out.
+    A species list is added only when it is not every species.
     """
     parts = []
+    site = str(body.get("train_site") or "")
+    if site:
+        parts.append(f"site{site}")
     train_k = _count(body.get("few_shot_k"), "images per species", 1, 5000)
     val_k = _count(body.get("val_few_shot_k"), "val images per species", 1, 5000)
     if train_k is not None:
@@ -513,6 +605,10 @@ def subset_tag(body):
     if val_k is not None:
         bg = _count(body.get("val_few_shot_bg_k"), "val background tiles", 0, 5000)
         parts.append(f"vbg{0 if bg is None else bg}")
+    if train_k is not None:
+        species = _species_list(body)
+        if species:
+            parts.append("sp" + "-".join(species))
     return "_".join(parts)
 
 
@@ -535,15 +631,20 @@ def _format_lr(lr):
     return text or "0"
 
 
-def cancel(job_id):
+def _job_id(job_id):
     if not re.fullmatch(r"[0-9]{14,20}", job_id):
         raise JobError("unknown job")
+    return job_id
+
+
+def cancel(job_id):
+    job_id = _job_id(job_id)
     with _lock:
         jobs = _load()
         match = next((job for job in jobs if job["id"] == job_id), None)
         if match is None:
             raise JobError("unknown job")
-        if match["status"] in {"done", "failed", "cancelled"}:
+        if match["status"] in _FINISHED:
             raise JobError("job already finished")
         match["status"] = "cancelled"
         match["finished"] = _now()
@@ -556,6 +657,43 @@ def cancel(job_id):
             check=False,
         )
     return _public(match)
+
+
+def hide(job_id):
+    """Drop a finished job from the queue list. The log file stays on disk."""
+    job_id = _job_id(job_id)
+    with _lock:
+        jobs = _load()
+        match = next((job for job in jobs if job["id"] == job_id), None)
+        if match is None or match.get("hidden"):
+            raise JobError("unknown job")
+        if match["status"] not in _FINISHED:
+            raise JobError("only a finished job can be hidden")
+        match["hidden"] = True
+        _save(jobs)
+    return {"ok": True}
+
+
+def clear_jobs(waiting=False, finished=False):
+    """Cancel jobs still waiting and hide finished ones. A running job stays."""
+    if not waiting and not finished:
+        raise JobError("nothing to clear")
+    cancelled = 0
+    hidden = 0
+    with _lock:
+        jobs = _load()
+        for job in jobs:
+            if waiting and job["status"] == "queued":
+                job["status"] = "cancelled"
+                job["finished"] = _now()
+                job["wait_reason"] = ""
+                job["hidden"] = True
+                cancelled += 1
+            elif finished and job["status"] in _FINISHED and not job.get("hidden"):
+                job["hidden"] = True
+                hidden += 1
+        _save(jobs)
+    return {"cancelled": cancelled, "hidden": hidden}
 
 
 def read_log(job_id, offset, tail=None):

@@ -46,6 +46,11 @@ logger: wandb
 log_name: ai4good-neophytes
 wandb_entity: max-zehnder-university-of-z-rich
 
+# # Set when training used data.train_site. test.py then also scores that site's
+# # validation tiles (same-site) and writes both that score and the held-out
+# # test-split score to quantitative/metrics_site_split.json.
+train_site: null
+
 log_dir: lightning_logs
 log_path: ${log_dir}/${exp_name}
 ckpt_path: ${log_path}/checkpoints

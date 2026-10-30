@@ -4,9 +4,14 @@
     python test.py exp_name=<run> ckpt_type=last
     python test.py exp_name=<run> eval_site=True eval_month=True
 
-The matching test data config is derived from the ``data_name`` embedded in
-``exp_name`` (a cv1 run is tested on ``neophytes_split_cv1_test``); pass
-``data=<config>`` explicitly to override that.
+The matching test data config is derived from the name embedded in
+``exp_name``. A run named ``np_cv3_...`` or ``neophytes_split_cv3_train_...``
+is tested on ``neophytes_split_cv3_test`` (``_ds2`` stays on the half-resolution
+test config). Pass ``data=<config>`` explicitly to override that.
+
+``train_site=Aarau_1`` also scores that site's validation tiles. Those are the
+same-site numbers. The test split is the held-out number. Both are written to
+``quantitative/metrics_site_split.json``.
 
 Results land in ``lightning_logs/<exp_name>/test_<timestamp>_<data>_<ckpt>/``:
     quantitative/  metrics as JSON + score plots + confusion matrices
@@ -18,11 +23,17 @@ from omegaconf import DictConfig, OmegaConf
 
 
 def _auto_data_config(exp_name: str) -> str | None:
-    """Infer the test data config from the data_name embedded in exp_name."""
+    """Infer the test data config from the data name embedded in exp_name.
+
+    Older runs are ``<stamp>_np_cv3_...``. Explorer runs are
+    ``<stamp>_neophytes_split_cv3_train_1024_...``. A 512 crop and a 1024 crop
+    of the same fold share one test config, because the ground sampling distance
+    does not change. A ``_ds2`` run stays on the half-resolution test config.
+    """
     import os
     import re
 
-    # exp_name format: YYYYMMDD_HHMMSS.ffffff_<data_name>_<model_...>
+    # exp_name format: YYYYMMDD_HHMMSS[.ffffff]_<data_name>_<model_...>
     m = re.match(r'^\d{8}_[\d.]+_(.+)$', exp_name)
     if not m:
         return None
@@ -35,6 +46,11 @@ def _auto_data_config(exp_name: str) -> str | None:
         (r'^np_cv(\d+)', lambda m: f'neophytes_split_cv{m.group(1)}_test'),
         (r'^np_loc', lambda _: 'neophytes_split_local_test'),
         (r'^np_debug', lambda _: 'neophytes_split_debug_test'),
+        (r'^neophytes_split_cv(\d+)_.*_ds2(?:_|$)',
+         lambda m: f'neophytes_split_cv{m.group(1)}_test_ds2'),
+        (r'^neophytes_split_cv(\d+)_', lambda m: f'neophytes_split_cv{m.group(1)}_test'),
+        (r'^neophytes_split_local_', lambda _: 'neophytes_split_local_test'),
+        (r'^neophytes_split_debug_', lambda _: 'neophytes_split_debug_test'),
     ]
     for pattern, make_cfg in patterns:
         pm = re.match(pattern, rest)
@@ -42,6 +58,64 @@ def _auto_data_config(exp_name: str) -> str | None:
             test_cfg = make_cfg(pm)
             return test_cfg if os.path.isfile(os.path.join("configs", "data", f"{test_cfg}.yaml")) else None
     return None
+
+
+def _site_split_record(metrics, n_tiles, class_names):
+    """Mean species F1, plus each class, for one group of tiles."""
+    return {
+        "tiles": int(n_tiles),
+        "F1-avg-wo0": float(metrics["semseg"]["F1-avg-wo0"]),
+        "F1": metrics["semseg"]["F1"],
+        "class_names": list(class_names),
+    }
+
+
+def _write_site_split(cfg, model, device, train_site, held_out_metrics, class_names,
+                      metrics_dir, n_held_out):
+    """Score the training site's validation tiles and store both groups.
+
+    Same-site tiles are the val folders of ``train_site``. Held-out tiles are the
+    test split already scored (the fold's other sites). Training did not use the
+    val tiles, and it did not use the held-out sites.
+    """
+    import json
+    import os
+    from torch.utils.data import DataLoader
+
+    from datasets.neophyte_dataset import NeophyteDataset
+    from utils.eval_utils import evaluate_model
+    from utils.transform_utils import get_transforms
+    from utils.utils import convert_ndarray_to_list
+
+    test_transforms = get_transforms(cfg.data.test_transforms, cfg.data.transforms_additional_targets)
+    dsm_transforms = get_transforms(cfg.data.dsm_transforms, toTensor=False)
+    ndsm_transforms = get_transforms(cfg.data.ndsm_transforms, toTensor=False)
+    dataset = NeophyteDataset(
+        cfg.data.image_dir.val, cfg.data.classes, transform=test_transforms,
+        dsm_transform=dsm_transforms, ndsm_transform=ndsm_transforms,
+        dataset_stats=cfg.data.dataset_stats, value_mapping=cfg.data.value_mapping,
+        ignore_index=cfg.data.ignore_index, load_dsm=cfg.data.load_dsm,
+        load_dtm=cfg.data.load_dtm, load_ndsm=cfg.data.load_ndsm,
+        train_site=str(train_site),
+    )
+    print(f"Same-site evaluation: {train_site}, {len(dataset)} validation tiles.")
+    loader = DataLoader(dataset, batch_size=cfg.data.batch_size_test, shuffle=False,
+                        num_workers=cfg.data.num_workers)
+    same = evaluate_model(model, loader, cfg.model.num_classes, device,
+                          ignore_index=cfg.data.ignore_index)
+    record = {
+        "train_site": str(train_site),
+        "same_site": _site_split_record(same, len(dataset), class_names),
+        "held_out": _site_split_record(held_out_metrics, n_held_out, class_names),
+    }
+    path = os.path.join(metrics_dir, "metrics_site_split.json")
+    with open(path, "w") as handle:
+        json.dump(convert_ndarray_to_list(record), handle, indent=4)
+    print(f"same-site ({train_site}) mF1 (wo bg): {record['same_site']['F1-avg-wo0']:.4f}  |  "
+          f"tiles: {len(dataset)}")
+    print(f"held-out mF1 (wo bg): {record['held_out']['F1-avg-wo0']:.4f}  |  "
+          f"tiles: {n_held_out}")
+    print(f"Wrote {path}")
 
 
 def _log_phenology_wandb(cfg, breakdown, heatmap_path, bars_path):
@@ -280,6 +354,11 @@ def main(cfg: DictConfig) -> None:
             print("Worst stage per species (stage recall):")
             print(format_worst_stages(breakdown))
             _log_phenology_wandb(cfg, breakdown, heatmap_path, bars_path)
+
+        train_site = cfg.train_site if cfg.train_site not in (None, "", "null") else None
+        if train_site:
+            _write_site_split(cfg, model, device, train_site, metrics, class_names,
+                              metrics_dir, len(dataModule.test_dataset))
 
     # %% qualitative results for a few picked test tiles
     print('Start qualitative evaluation of some picked samples from the test set.')

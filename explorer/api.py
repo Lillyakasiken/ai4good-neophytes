@@ -1658,10 +1658,33 @@ def get_jobs():
     return train_jobs.list_jobs()
 
 
+class ClearJobsIn(BaseModel):
+    waiting: bool = False
+    finished: bool = False
+
+
+@app.post("/api/jobs/clear")
+def clear_jobs(body: ClearJobsIn):
+    """Cancel waiting jobs and hide finished ones. A running job is left alone."""
+    try:
+        return train_jobs.clear_jobs(waiting=body.waiting, finished=body.finished)
+    except train_jobs.JobError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
     try:
         return train_jobs.cancel(job_id)
+    except train_jobs.JobError as exc:
+        status = 404 if "unknown" in str(exc) else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+@app.post("/api/jobs/{job_id}/hide")
+def hide_job(job_id: str):
+    try:
+        return train_jobs.hide(job_id)
     except train_jobs.JobError as exc:
         status = 404 if "unknown" in str(exc) else 400
         raise HTTPException(status_code=status, detail=str(exc)) from exc

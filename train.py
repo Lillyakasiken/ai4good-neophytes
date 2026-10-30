@@ -85,6 +85,8 @@ def main(cfg: DictConfig) -> None:
                                     few_shot_k=cfg.data.few_shot_k,
                                     few_shot_mode=cfg.data.few_shot_mode,
                                     few_shot_bg_k=cfg.data.few_shot_bg_k,
+                                    few_shot_species=cfg.data.few_shot_species,
+                                    train_site=cfg.data.train_site,
                                     max_nodata_frac=cfg.data.max_nodata_frac,
                                     val_few_shot_k=cfg.data.val_few_shot_k,
                                     val_few_shot_mode=cfg.data.val_few_shot_mode,
