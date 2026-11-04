@@ -46,6 +46,7 @@ from common import (
     load_names,
     resolve_data_path,
     species_columns,
+    tile_id,
 )
 from segment import (
     SegmentFailed,
@@ -55,8 +56,9 @@ from segment import (
 )
 import jobs as train_jobs
 import predict_client
+import run_tiles
 import wandb_query
-from runtime import TrainEnvError, gpu_lock
+from runtime import LOG_DIR, TrainEnvError, gpu_lock
 from vision import catalog, load_source, render
 
 CLASSES, DISPLAY_ORDER, CV_FOLDS = load_names()
@@ -1767,6 +1769,210 @@ def wandb_runs(refresh: bool = False):
     _wandb_cache["body"] = body
     _wandb_cache["until"] = now + (60 if body.get("available") else 10)
     return body
+
+
+RUN_TILES_DIR = CACHE / "run_tiles"
+_run_tile_guard = threading.Lock()
+_run_tile_locks = {}
+
+
+def _run_dir(exp):
+    if not exp or "/" in exp or "\\" in exp or exp in {".", ".."}:
+        raise HTTPException(status_code=400, detail="invalid run")
+    path = (LOG_DIR / exp).resolve()
+    if path.parent != LOG_DIR.resolve() or not path.is_dir():
+        raise HTTPException(status_code=404, detail="run not found")
+    return path
+
+
+def _run_tile_lock(exp):
+    with _run_tile_guard:
+        lock = _run_tile_locks.get(exp)
+        if lock is None:
+            lock = threading.Lock()
+            _run_tile_locks[exp] = lock
+        return lock
+
+
+def _site_covers(site_name, flight, keys):
+    """True when a train_site key keeps this flight. An empty key list keeps every site."""
+    if not keys:
+        return True
+    flight_key = f"{site_name}_{flight}" if flight else site_name
+    return site_name in keys or flight_key in keys
+
+
+def _lookup_tiles(ids):
+    if not ids:
+        return {}
+    rows = _fetch(
+        """
+        SELECT tile_id, labelled, site_name, CAST(flight AS VARCHAR) AS flight
+        FROM read_parquet(?)
+        WHERE tile_id IN (SELECT * FROM UNNEST(?))
+        """,
+        [str(TILES_PARQUET), list(ids)],
+    )
+    return {row["tile_id"]: row for row in rows}
+
+
+def _counts_by_site(groups, lookup):
+    out = {}
+    for name, ids in groups.items():
+        for tid in ids:
+            row = lookup.get(tid)
+            if row is None:
+                continue
+            bucket = out.setdefault(
+                row["site_name"], {"train_labelled": 0, "train_bg": 0, "val": 0}
+            )
+            bucket[name] += 1
+    return out
+
+
+def _counts_by_flight(groups, lookup):
+    """Per flight: how many tiles the run trained on and validated on."""
+    out = {}
+    for name, ids in groups.items():
+        for tid in ids:
+            row = lookup.get(tid)
+            if row is None:
+                continue
+            key = (row["site_name"], row["flight"] or "")
+            bucket = out.setdefault(key, {
+                "site": row["site_name"],
+                "flight": row["flight"] or "",
+                "train_labelled": 0,
+                "train_bg": 0,
+                "val": 0,
+            })
+            bucket[name] += 1
+    return sorted(out.values(), key=lambda item: (item["site"], item["flight"]))
+
+
+def _pool_unused(fold, keys, used_ids):
+    """Train-role tiles of the run's sites that the few-shot pick left out."""
+    if fold not in FOLDS:
+        return None
+    rows = _fetch(
+        f"""
+        SELECT tile_id, site_name, CAST(flight AS VARCHAR) AS flight
+        FROM read_parquet(?)
+        WHERE {fold}_role = 'train'
+        """,
+        [str(TILES_PARQUET)],
+    )
+    used = set(used_ids)
+    key_set = set(keys)
+    count = 0
+    for row in rows:
+        if row["tile_id"] in used:
+            continue
+        if _site_covers(row["site_name"], row["flight"] or "", key_set):
+            count += 1
+    return count
+
+
+def _assemble_run_tiles(payload):
+    train_ids = [tile_id(path) for path in payload["train"]]
+    val_ids = [tile_id(path) for path in payload["val"]]
+    lookup = _lookup_tiles(train_ids + val_ids)
+    train_labelled = []
+    train_bg = []
+    for tid in train_ids:
+        row = lookup.get(tid)
+        if row is not None and row["labelled"]:
+            train_labelled.append(tid)
+        else:
+            train_bg.append(tid)
+    keys = list(payload.get("train_site") or [])
+    fold = run_tiles.fold_of(payload.get("data_name"))
+    return {
+        "exp_name": payload["exp_name"],
+        "fold": fold,
+        "seed": payload.get("seed"),
+        "train_site": keys,
+        "few_shot_k": payload.get("few_shot_k"),
+        "few_shot_bg_k": payload.get("few_shot_bg_k"),
+        "few_shot_mode": payload.get("few_shot_mode"),
+        "data_name": payload.get("data_name"),
+        "source": "rebuilt from config and seed",
+        "train_labelled": train_labelled,
+        "train_bg": train_bg,
+        "val": val_ids,
+        "totals": {
+            "train_labelled": len(train_labelled),
+            "train_bg": len(train_bg),
+            "val": len(val_ids),
+            "pool_unused": _pool_unused(fold, keys, train_ids),
+        },
+        "by_site": _counts_by_site(
+            {"train_labelled": train_labelled, "train_bg": train_bg, "val": val_ids},
+            lookup,
+        ),
+        "by_flight": _counts_by_flight(
+            {"train_labelled": train_labelled, "train_bg": train_bg, "val": val_ids},
+            lookup,
+        ),
+    }
+
+
+def _with_flights(body):
+    """Fill by_flight on a cached body. The tile ids are already there, so this does not replay training."""
+    if body.get("by_flight"):
+        return body, False
+    groups = {
+        "train_labelled": body.get("train_labelled") or [],
+        "train_bg": body.get("train_bg") or [],
+        "val": body.get("val") or [],
+    }
+    lookup = _lookup_tiles(groups["train_labelled"] + groups["train_bg"] + groups["val"])
+    updated = dict(body)
+    updated["by_flight"] = _counts_by_flight(groups, lookup)
+    return updated, True
+
+
+def _write_run_cache(cache, body):
+    RUN_TILES_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(body))
+    tmp.replace(cache)
+
+
+@app.get("/api/runs/tile-sets")
+def run_tile_sets():
+    """Training runs the map can color. Reads saved configs only."""
+    return {"runs": run_tiles.list_runs()}
+
+
+@app.get("/api/runs/{exp}/tiles")
+def run_tile_list(exp: str):
+    """Tiles one run trained on and validated on. The first call rebuilds them."""
+    _run_dir(exp)
+    _require_catalog()
+    cache = RUN_TILES_DIR / f"{exp}.json"
+    if cache.is_file():
+        body, changed = _with_flights(json.loads(cache.read_text()))
+        if changed:
+            _write_run_cache(cache, body)
+        return body
+    with _run_tile_lock(exp):
+        if cache.is_file():
+            body, changed = _with_flights(json.loads(cache.read_text()))
+            if changed:
+                _write_run_cache(cache, body)
+            return body
+        try:
+            payload = run_tiles.fetch(exp)
+        except TrainEnvError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if not payload.get("ok"):
+            raise HTTPException(
+                status_code=500, detail=payload.get("detail") or "tile rebuild failed"
+            )
+        body = _assemble_run_tiles(payload)
+        _write_run_cache(cache, body)
+        return body
 
 
 @app.get("/api/stats")

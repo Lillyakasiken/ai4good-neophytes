@@ -1,5 +1,6 @@
 <script>
   import { tick, untrack } from 'svelte';
+  import MapRuns from './MapRuns.svelte';
 
   let { facets, filters = $bindable(), showLabels = $bindable(), onopen } = $props();
 
@@ -28,6 +29,14 @@
   let imageOpacity = $state(1);
   let showGrid = $state(false);
   let showRoleColors = $state(true);
+  let foldPinned = $state(false);
+  let showRun = $state(false);
+  let runName = $state('');
+  let runList = $state([]);
+  let runsError = $state('');
+  let runTiles = $state(null);
+  let runTilesLoading = $state(false);
+  let runTilesError = $state('');
 
   const MONTHS = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const ROLES = [
@@ -38,11 +47,31 @@
     ['unused', 'Unused'],
   ];
   const ROLE_COLOR = {
-    train: '#1f8a4c',
-    val: '#2b6cb0',
-    test: '#d97706',
-    unused: '#64748b',
+    train: '#0072B2',
+    val: '#E69F00',
+    test: '#CC79A7',
+    unused: '#1e293b',
   };
+  const FOLD_KEY = [
+    ['train', 'Train', false],
+    ['val', 'Validation', false],
+    ['test', 'Test', false],
+    ['unused', 'Unused', true],
+  ];
+  const RUN_KEY = {
+    train_labelled: 'Train - labelled',
+    train_bg: 'Train - background',
+    val: 'Validation',
+    unused: 'Not picked',
+    test: 'Test',
+  };
+  const RUN_MARKS = [
+    ['train_labelled', 'trained, labelled', '#146c36', false],
+    ['train_bg', 'trained, background', '#7dcea0', false],
+    ['val', 'validation', '#2b6cb0', false],
+    ['unused', 'not used', '#64748b', true],
+    ['test', 'test', '#d97706', false],
+  ];
   const IGNORE = [
     { name: 'unlabelled', color: '#737373', binomial: false },
     { name: 'uncertain', color: '#facc15', binomial: false },
@@ -83,6 +112,7 @@
       })),
     })),
   );
+  let heldOut = $derived((facets?.folds?.[filters.fold]?.test_sites ?? []).includes(site));
   let byCell = $derived(
     new Map((mosaic?.tiles ?? []).map((tile) => [`${tile.col},${tile.row}`, tile])),
   );
@@ -106,8 +136,182 @@
     }
     return path;
   });
+  function coversFlight(keys, siteName, flightName) {
+    if (!keys || !keys.length) return true;
+    const flightKey = flightName ? `${siteName}_${flightName}` : siteName;
+    return keys.includes(siteName) || keys.includes(flightKey);
+  }
+
+  async function errorText(res) {
+    const text = await res.text();
+    try {
+      const body = JSON.parse(text);
+      if (body.detail) return String(body.detail);
+    } catch {
+      /* the body is already plain text */
+    }
+    return text || res.statusText;
+  }
+
+  let placedRun = '';
+
+  function siteNameOf(key) {
+    if (sites.includes(key)) return key;
+    return sites.find((name) => String(key).startsWith(`${name}_`)) || '';
+  }
+
+  function selectRun(run) {
+    if (!run) return;
+    if (run.exp_name !== runName) {
+      runTiles = null;
+      runTilesError = '';
+      placedRun = '';
+    }
+    runName = run.exp_name;
+    showGrid = true;
+    showRun = true;
+    foldPinned = false;
+    showRoleColors = false;
+    const keys = run.train_site || [];
+    if (keys.length !== 1) return;
+    const target = siteNameOf(keys[0]);
+    if (target && target !== site) chooseSite(target);
+  }
+
+  function loadRuns() {
+    fetch('/api/runs/tile-sets')
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await errorText(res));
+        return res.json();
+      })
+      .then((data) => {
+        runList = data.runs || [];
+        runsError = '';
+      })
+      .catch((err) => {
+        runsError = String(err.message || err);
+      });
+  }
+
+  function setRoleColors(on) {
+    showRoleColors = on;
+    foldPinned = on;
+  }
+
+  function toggleRun(on) {
+    showRun = on;
+    if (!on) {
+      setRoleColors(true);
+      return;
+    }
+    showGrid = true;
+    if (!runList.length) loadRuns();
+  }
+
+  function runForSite(run, siteName) {
+    const keys = run.train_site || [];
+    if (!keys.length) return false;
+    return keys.includes(siteName) || keys.some((key) => String(key).startsWith(`${siteName}_`));
+  }
+
+  let runsInFold = $derived(runList.filter((run) => run.fold === filters.fold));
+
+  function runCount(siteName) {
+    return runsInFold.filter((run) => runForSite(run, siteName)).length;
+  }
+
+  let mapHelp = $derived(
+    'The map opens with the fold colours from Tiles. Click a run to fill that run. Color roles, or Fold in the legend, brings the fold colours back and keeps them while you change dates. Drag to move, scroll to zoom, click a tile.',
+  );
+
+  function runRoleMarks() {
+    const tileset = runTiles;
+    if (!tileset || tileset.exp_name !== runName || !mosaic) return [];
+    const labelled = new Set(tileset.train_labelled || []);
+    const background = new Set(tileset.train_bg || []);
+    const validation = new Set(tileset.val || []);
+    const keys = tileset.train_site || [];
+    const inRun = coversFlight(keys, mosaic.site, String(mosaic.flight ?? ''));
+    const paths = {};
+    const counts = {};
+    for (const [id] of RUN_MARKS) {
+      paths[id] = '';
+      counts[id] = 0;
+    }
+    for (const tile of mosaic.tiles) {
+      let id = null;
+      if (labelled.has(tile.tile_id)) id = 'train_labelled';
+      else if (background.has(tile.tile_id)) id = 'train_bg';
+      else if (validation.has(tile.tile_id)) id = 'val';
+      else if (tile.cv_role === 'train' && inRun) id = 'unused';
+      else if (tile.cv_role === 'test') id = 'test';
+      if (!id) continue;
+      counts[id] += 1;
+      const x = tile.col * cell;
+      const y = tile.row * cell;
+      paths[id] += `M${x} ${y}h${cell}v${cell}h${-cell}z`;
+    }
+    const totals = tileset.totals || {};
+    const totalOf = {
+      train_labelled: totals.train_labelled,
+      train_bg: totals.train_bg,
+      val: totals.val,
+      unused: totals.pool_unused,
+    };
+    return RUN_MARKS
+      .filter(([id]) => counts[id] || (id !== 'test' && totalOf[id]))
+      .map(([id, label, color, outline]) => ({
+        role: id,
+        label,
+        path: paths[id],
+        color,
+        outline,
+        count: counts[id],
+        countText:
+          totalOf[id] == null
+            ? counts[id].toLocaleString()
+            : `${counts[id].toLocaleString()} (run ${Number(totalOf[id]).toLocaleString()})`,
+      }));
+  }
+
+  let runMarks = $derived.by(() => {
+    if (!showRun || !mosaic || !runName) return [];
+    return runRoleMarks();
+  });
+
+  let runIdSets = $derived.by(() => {
+    const tileset = runTiles;
+    if (!showRun || !tileset || tileset.exp_name !== runName) return null;
+    return {
+      labelled: new Set(tileset.train_labelled || []),
+      background: new Set(tileset.train_bg || []),
+      val: new Set(tileset.val || []),
+    };
+  });
+
+  let flightRoles = $derived.by(() => {
+    const counts = { train: 0, val: 0, test: 0, unused: 0 };
+    if (!mosaic) return counts;
+    for (const tile of mosaic.tiles) {
+      const role = tile.cv_role;
+      if (role in counts) counts[role] += 1;
+    }
+    return counts;
+  });
+
+  function flightUse(flightName) {
+    const tileset = runTiles;
+    if (!showRun || !runName || !tileset || tileset.exp_name !== runName) return null;
+    const row = (tileset.by_flight || []).find(
+      (item) => item.site === site && String(item.flight) === String(flightName),
+    );
+    const trained = (row?.train_labelled || 0) + (row?.train_bg || 0);
+    const val = row?.val || 0;
+    return { trained, val, touched: trained + val > 0 };
+  }
+
   let roleMarks = $derived.by(() => {
-    if (!showGrid || !mosaic) return [];
+    if (!mosaic) return [];
     const wanted = filters.role && filters.role !== 'all' ? filters.role : null;
     const paths = { train: '', val: '', test: '', unused: '' };
     const counts = { train: 0, val: 0, test: 0, unused: 0 };
@@ -123,7 +327,15 @@
     }
     return ['train', 'val', 'test', 'unused']
       .filter((role) => counts[role])
-      .map((role) => ({ role, path: paths[role], color: ROLE_COLOR[role], count: counts[role] }));
+      .map((role) => ({
+        role,
+        label: role,
+        path: paths[role],
+        color: ROLE_COLOR[role],
+        outline: role === 'unused',
+        count: counts[role],
+        countText: counts[role].toLocaleString(),
+      }));
   });
   let chunks = $derived.by(() => {
     if (!mosaic || overview || !viewportW) return [];
@@ -243,6 +455,76 @@
   });
 
   $effect(() => {
+    loadRuns();
+  });
+
+  $effect(() => {
+    const name = runName;
+    const options = runsInFold;
+    if (!name || !runList.length) return;
+    if (!options.some((run) => run.exp_name === name)) {
+      runName = '';
+      runTiles = null;
+      placedRun = '';
+    }
+  });
+
+  $effect(() => {
+    const tiles = runTiles;
+    const name = runName;
+    const here = site;
+    if (!name || !tiles || tiles.exp_name !== name || placedRun === name) return;
+    const trained = (tiles.by_flight || []).filter(
+      (row) => row.site === here && (row.train_labelled || 0) + (row.train_bg || 0) > 0,
+    );
+    placedRun = name;
+    if (!trained.length) return;
+    if (trained.some((row) => String(row.flight) === String(flight))) return;
+    const dated = trained
+      .map((row) => {
+        const info = (facets?.flights ?? []).find(
+          (item) => item.site_name === row.site && String(item.flight) === String(row.flight),
+        );
+        return { flight: String(row.flight), date: info?.acq_date || '' };
+      })
+      .sort((a, b) => a.date.localeCompare(b.date) || a.flight.localeCompare(b.flight));
+    flight = dated[0].flight;
+  });
+
+  $effect(() => {
+    const name = runName;
+    const visible = showRun;
+    if (!name || !visible) {
+      runTilesLoading = false;
+      return;
+    }
+    if (untrack(() => runTiles?.exp_name) === name) return;
+    let dead = false;
+    runTilesLoading = true;
+    runTilesError = '';
+    fetch(`/api/runs/${encodeURIComponent(name)}/tiles`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await errorText(res));
+        return res.json();
+      })
+      .then((data) => {
+        if (!dead) runTiles = data;
+      })
+      .catch((err) => {
+        if (!dead) {
+          runTilesError = String(err.message || err);
+          if (!foldPinned) setRoleColors(true);
+        }
+      })
+      .finally(() => {
+        if (!dead) runTilesLoading = false;
+      });
+    return () => {
+      dead = true;
+    };
+  });
+
+  $effect(() => {
     const node = viewport;
     if (!node) return;
     const observer = new ResizeObserver(() => {
@@ -344,6 +626,11 @@
     return Number.isFinite(day) ? String(day) : '';
   }
 
+  function chooseFlight(value) {
+    flight = String(value);
+    if (runName && !foldPinned) showRoleColors = false;
+  }
+
   function flightDateLabel(row, year, month) {
     const day = dayOf(row.acq_date);
     const when = day ? `${day} ${MONTHS[month]} ${year}` : `${MONTHS[month] ?? month} ${year}`;
@@ -368,7 +655,7 @@
     const next = rows[index + (event.key === 'ArrowRight' ? 1 : -1)];
     if (!next) return;
     event.preventDefault();
-    flight = String(next.flight);
+    chooseFlight(next.flight);
     await tick();
     group?.querySelector('.map-month.on')?.focus();
   }
@@ -480,7 +767,47 @@
       hover = null;
       return;
     }
-    hover = labelAt(event);
+    const label = labelAt(event);
+    const role = phraseFor(tileUnder(event));
+    if (label) {
+      hover = { ...label, role };
+      return;
+    }
+    if (!role || !viewport) {
+      hover = null;
+      return;
+    }
+    const vp = viewport.getBoundingClientRect();
+    let x = event.clientX - vp.left + 14;
+    let y = event.clientY - vp.top + 16;
+    if (x > vp.width - 180) x = event.clientX - vp.left - 170;
+    if (y > vp.height - 32) y = event.clientY - vp.top - 28;
+    hover = { name: '', color: '', binomial: false, role, x, y };
+  }
+
+  function tileUnder(event) {
+    if (!mosaic || !world) return null;
+    const rect = world.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const col = Math.floor((event.clientX - rect.left) / (rect.width / mosaic.ncols));
+    const row = Math.floor((event.clientY - rect.top) / (rect.height / mosaic.nrows));
+    if (col < 0 || row < 0 || col >= mosaic.ncols || row >= mosaic.nrows) return null;
+    return byCell.get(`${col},${row}`) ?? null;
+  }
+
+  function phraseFor(tile) {
+    const sets = runIdSets;
+    if (!sets || !tile || !mosaic) return '';
+    const id = tile.tile_id;
+    if (sets.labelled.has(id)) return 'train - labelled';
+    if (sets.background.has(id)) return 'train - background';
+    if (sets.val.has(id)) return 'validation';
+    const keys = runTiles?.train_site || [];
+    if (tile.cv_role === 'train' && coversFlight(keys, mosaic.site, String(mosaic.flight ?? ''))) {
+      return 'in pool, not picked';
+    }
+    if (tile.cv_role === 'test') return 'test';
+    return '';
   }
 
   function onPointerUp(event) {
@@ -505,13 +832,15 @@
       Site
       <select value={site} onchange={(event) => chooseSite(event.currentTarget.value)}>
         {#each sites as name (name)}
-          <option value={name}>{name}</option>
+          <option value={name}>
+            {name}{runCount(name) ? ` (${runCount(name)} ${runCount(name) === 1 ? 'run' : 'runs'})` : ''}
+          </option>
         {/each}
       </select>
     </label>
     <label class="field">
       Fold
-      <select bind:value={filters.fold}>
+      <select bind:value={filters.fold} onchange={() => setRoleColors(true)}>
         {#each ['cv1', 'cv2', 'cv3', 'cv4', 'cv5'] as fold}
           <option value={fold}>{fold}</option>
         {/each}
@@ -547,19 +876,21 @@
         Show grid
       </label>
       <label class="map-check">
-        <input type="checkbox" bind:checked={showRoleColors} />
+        <input
+          type="checkbox"
+          checked={showRoleColors}
+          onchange={(event) => setRoleColors(event.currentTarget.checked)}
+        />
         Color roles
       </label>
-      {#if showGrid && showRoleColors && roleMarks.length}
-        <p class="map-legend">
-          {#each roleMarks as mark (mark.role)}
-            <span>
-              <i style:background={mark.color}></i>
-              {mark.role} {mark.count.toLocaleString()}
-            </span>
-          {/each}
-        </p>
-      {/if}
+      <label class="map-check">
+        <input
+          type="checkbox"
+          checked={showRun}
+          onchange={(event) => toggleRun(event.currentTarget.checked)}
+        />
+        Show runs
+      </label>
       <label class="map-slider">
         Image
         <input type="range" min="0" max="1" step="0.05" bind:value={imageOpacity} />
@@ -567,31 +898,45 @@
       <button
         type="button"
         class="info"
-        title="Whole flight. The grid marks tiles in this fold and role. Drag to move, scroll to zoom, click a tile."
+        title={mapHelp}
         aria-label="How to read the map"
       >i</button>
     </div>
+    {#if showRun && runTilesLoading}
+      <p class="map-meta run-status">Rebuilding this run's tiles from its config and seed…</p>
+    {:else if showRun && runTilesError}
+      <p class="map-meta run-status">{runTilesError}</p>
+    {:else if showRun && runsError && !runList.length}
+      <p class="map-meta run-status">{runsError}</p>
+    {:else if showRun && runTiles}
+      <p class="map-meta run-status">Rebuilt from config and seed.</p>
+    {/if}
   </div>
 
-  <div class="map-time" role="group" aria-label="Flights of {site} by date">
+  <div class="map-time" class:with-run={showRun && !!runName} role="group" aria-label="Flights of {site} by date">
     {#each timeline as group (group.year)}
       <div class="map-year" class:quiet={group.quiet}>
         <span class="map-year-label">{group.year}</span>
         <div class="map-months">
           {#each group.months as cell (`${group.year}-${cell.month}`)}
             {#if cell.row}
+              {@const use = flightUse(cell.row.flight)}
               <button
                 type="button"
                 class="map-month"
                 class:on={String(cell.row.flight) === String(flight)}
+                class:idle={use && !use.touched}
                 aria-pressed={String(cell.row.flight) === String(flight)}
                 aria-label={flightDateLabel(cell.row, group.year, cell.month)}
-                onclick={() => (flight = String(cell.row.flight))}
+                onclick={() => chooseFlight(cell.row.flight)}
                 onkeydown={onTimelineKey}
               >
                 <span class="map-dot" aria-hidden="true"></span>
                 <span class="map-month-name">{MONTHS[cell.month]}</span>
                 <span class="map-month-day">{dayOf(cell.row.acq_date)}</span>
+                {#if use?.touched}
+                  <span class="map-month-run">{use.trained} trained · {use.val} val</span>
+                {/if}
               </button>
             {:else}
               <span class="map-month off">
@@ -606,6 +951,7 @@
     {/each}
   </div>
 
+  <div class="map-body" class:with-runs={showRun}>
   <div
     class="viewport"
     role="application"
@@ -686,14 +1032,33 @@
             {/if}
           </div>
         {/each}
-        {#if showGrid}
+        {#if showGrid || showRoleColors || (showRun && runName)}
           <svg class="tile-grid" aria-hidden="true">
             {#if showRoleColors}
               {#each roleMarks as mark (mark.role)}
-                <path class="mark" d={mark.path} style:fill={mark.color} style:stroke={mark.color} />
+                <path
+                  class="mark"
+                  class:outline={mark.outline}
+                  d={mark.path}
+                  style:fill={mark.outline ? 'none' : mark.color}
+                  style:stroke={mark.color}
+                />
               {/each}
             {/if}
-            <path class="edge" d={gridPath} />
+            {#if showRun}
+              {#each runMarks as mark (mark.role)}
+                <path
+                  class="mark run-mark"
+                  class:outline={showRoleColors || mark.outline}
+                  d={mark.path}
+                  style:fill={showRoleColors || mark.outline ? 'none' : mark.color}
+                  style:stroke={mark.color}
+                />
+              {/each}
+            {/if}
+            {#if showGrid}
+              <path class="edge" d={gridPath} />
+            {/if}
           </svg>
         {/if}
       </div>
@@ -704,11 +1069,83 @@
         {imagesStarted ? 'Loading tiles' : 'Loading flight'}
       </div>
     {/if}
+    {#if mosaic && (showRoleColors || heldOut || runMarks.some((mark) => mark.count))}
+      {@const runOn = runMarks.some((mark) => mark.count)}
+      {@const canSwitch = runOn}
+      {@const wanted = filters.role && filters.role !== 'all' ? filters.role : null}
+      {@const foldRows = FOLD_KEY.filter(([role]) => flightRoles[role] > 0 && (heldOut || !wanted || role === wanted))}
+      <aside class="map-key" aria-label="Map legend" onpointerdown={(event) => event.stopPropagation()}>
+        {#if heldOut}
+          <p class="held">Held-out site</p>
+        {/if}
+        {#if foldRows.length || heldOut}
+          <section class:off={canSwitch && !showRoleColors}>
+            <h2>
+              {#if canSwitch}
+                <button type="button" class:on={showRoleColors} onclick={() => setRoleColors(true)}>
+                  Fold {filters.fold}
+                </button>
+              {:else}
+                Fold {filters.fold}
+              {/if}
+            </h2>
+            <ul>
+              {#each foldRows as [role, label, outline] (role)}
+                <li>
+                  <i
+                    class:outline
+                    style:background={outline ? 'transparent' : ROLE_COLOR[role]}
+                    style:--swatch={ROLE_COLOR[role]}
+                  ></i>
+                  {label}
+                  <span>{flightRoles[role].toLocaleString()}</span>
+                </li>
+              {/each}
+            </ul>
+          </section>
+        {/if}
+        {#if runOn}
+          <section class:off={showRoleColors}>
+            <h2>
+              <button type="button" class:on={!showRoleColors} onclick={() => setRoleColors(false)}>
+                This run
+              </button>
+            </h2>
+            <ul>
+              {#each runMarks.filter((mark) => mark.count) as mark (mark.role)}
+                <li>
+                  <i
+                    class:outline={mark.outline}
+                    style:background={mark.outline ? 'transparent' : mark.color}
+                    style:--swatch={mark.color}
+                  ></i>
+                  {RUN_KEY[mark.role]}
+                  <span>{mark.count.toLocaleString()}</span>
+                </li>
+              {/each}
+            </ul>
+            <p>
+              Whole run:
+              {(runTiles?.totals?.train_labelled ?? 0).toLocaleString()} train, labelled,
+              {(runTiles?.totals?.train_bg ?? 0).toLocaleString()} train, background,
+              {(runTiles?.totals?.val ?? 0).toLocaleString()} validation
+            </p>
+          </section>
+        {/if}
+      </aside>
+    {/if}
     {#if hover}
       <p class="map-tip" style:left="{hover.x}px" style:top="{hover.y}px">
-        <i class="swatch" style:--swatch={hover.color}></i>
-        {#if hover.binomial}<span class="binomial">{hover.name}</span>{:else}{hover.name}{/if}
+        {#if hover.name}
+          <i class="swatch" style:--swatch={hover.color}></i>
+          {#if hover.binomial}<span class="binomial">{hover.name}</span>{:else}{hover.name}{/if}
+        {/if}
+        {#if hover.role}<span class="tip-role">{hover.role}</span>{/if}
       </p>
     {/if}
+  </div>
+  {#if showRun}
+    <MapRuns runs={runsInFold} selected={runName} onselect={selectRun} />
+  {/if}
   </div>
 </div>
