@@ -2,7 +2,14 @@
   import { tick, untrack } from 'svelte';
   import MapRuns from './MapRuns.svelte';
 
-  let { facets, filters = $bindable(), showLabels = $bindable(), onopen } = $props();
+  let {
+    facets,
+    filters = $bindable(),
+    showLabels = $bindable(),
+    onopen,
+    planTiles = null,
+    onback = null,
+  } = $props();
 
   const OVERVIEW_MAX = 72;
   // Sheet builds are slow and share the browser's connection pool with the
@@ -65,6 +72,16 @@
     unused: 'Not picked',
     test: 'Test',
   };
+  const PLAN_MARKS = [
+    ['novel_train', 'novel training', '#146c36', false],
+    ['replay', 'other species', '#7dcea0', false],
+    ['val', 'validation', '#2b6cb0', false],
+    ['test', 'test', '#d97706', false],
+    ['same_site', 'same site, other date', '#7c3aed', false],
+    ['dropped', 'left out', '#64748b', true],
+    ['excluded', 'not used', '#64748b', true],
+  ];
+  const PLAN_WORD = Object.fromEntries(PLAN_MARKS.map(([id, label]) => [id, label]));
   const RUN_MARKS = [
     ['train_labelled', 'trained, labelled', '#146c36', false],
     ['train_bg', 'trained, background', '#7dcea0', false],
@@ -309,6 +326,34 @@
     const val = row?.val || 0;
     return { trained, val, touched: trained + val > 0 };
   }
+
+  let planMarks = $derived.by(() => {
+    if (!planTiles || !mosaic) return [];
+    const paths = {};
+    const counts = {};
+    for (const [id] of PLAN_MARKS) {
+      paths[id] = '';
+      counts[id] = 0;
+    }
+    for (const tile of mosaic.tiles) {
+      const role = planTiles[tile.tile_id];
+      if (!role || !(role in paths)) continue;
+      counts[role] += 1;
+      const x = tile.col * cell;
+      const y = tile.row * cell;
+      paths[role] += `M${x} ${y}h${cell}v${cell}h${-cell}z`;
+    }
+    return PLAN_MARKS
+      .filter(([id]) => counts[id])
+      .map(([id, label, color, outline]) => ({
+        role: id,
+        label,
+        path: paths[id],
+        color,
+        outline,
+        count: counts[id],
+      }));
+  });
 
   let roleMarks = $derived.by(() => {
     if (!mosaic) return [];
@@ -796,6 +841,10 @@
   }
 
   function phraseFor(tile) {
+    if (planTiles && tile) {
+      const role = planTiles[tile.tile_id];
+      return role ? PLAN_WORD[role] || role : '';
+    }
     const sets = runIdSets;
     if (!sets || !tile || !mosaic) return '';
     const id = tile.tile_id;
@@ -828,6 +877,9 @@
 
 <div class="map">
   <div class="map-bar">
+    {#if onback}
+      <button type="button" class="back" onclick={onback}>Back to plan</button>
+    {/if}
     <label class="field">
       Site
       <select value={site} onchange={(event) => chooseSite(event.currentTarget.value)}>
@@ -1032,9 +1084,19 @@
             {/if}
           </div>
         {/each}
-        {#if showGrid || showRoleColors || (showRun && runName)}
+        {#if showGrid || showRoleColors || (showRun && runName) || planMarks.length}
           <svg class="tile-grid" aria-hidden="true">
-            {#if showRoleColors}
+            {#if planMarks.length}
+              {#each planMarks as mark (mark.role)}
+                <path
+                  class="mark"
+                  class:outline={mark.outline}
+                  d={mark.path}
+                  style:fill={mark.outline ? 'none' : mark.color}
+                  style:stroke={mark.color}
+                />
+              {/each}
+            {:else if showRoleColors}
               {#each roleMarks as mark (mark.role)}
                 <path
                   class="mark"
@@ -1045,7 +1107,7 @@
                 />
               {/each}
             {/if}
-            {#if showRun}
+            {#if showRun && !planMarks.length}
               {#each runMarks as mark (mark.role)}
                 <path
                   class="mark run-mark"
@@ -1069,7 +1131,26 @@
         {imagesStarted ? 'Loading tiles' : 'Loading flight'}
       </div>
     {/if}
-    {#if mosaic && (showRoleColors || heldOut || runMarks.some((mark) => mark.count))}
+    {#if mosaic && planMarks.length}
+      <aside class="map-key" aria-label="Plan legend" onpointerdown={(event) => event.stopPropagation()}>
+        <section>
+          <h2>This plan</h2>
+          <ul>
+            {#each planMarks as mark (mark.role)}
+              <li>
+                <i
+                  class:outline={mark.outline}
+                  style:background={mark.outline ? 'transparent' : mark.color}
+                  style:--swatch={mark.color}
+                ></i>
+                {mark.label}
+                <span>{mark.count.toLocaleString()}</span>
+              </li>
+            {/each}
+          </ul>
+        </section>
+      </aside>
+    {:else if mosaic && (showRoleColors || heldOut || runMarks.some((mark) => mark.count))}
       {@const runOn = runMarks.some((mark) => mark.count)}
       {@const canSwitch = runOn}
       {@const wanted = filters.role && filters.role !== 'all' ? filters.role : null}

@@ -125,7 +125,7 @@ def _tile_gsd_mm(src):
 
 
 class NeophyteDataset(Dataset):
-    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, few_shot_species=None, train_site=None, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False, train_stages=None):
+    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, few_shot_species=None, train_site=None, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False, train_stages=None, novel=None, exclude_flights=None):
         self.image_dirs = image_dirs if isinstance(image_dirs, ListConfig) or isinstance(image_dirs, list) else [image_dirs]
         self.classes = classes
         self.num_classes = len(classes)
@@ -150,6 +150,8 @@ class NeophyteDataset(Dataset):
         self.few_shot_bg_k = few_shot_bg_k # number of fewshot background samples
         self.few_shot_species = few_shot_species  # stats names, or None for every species
         self.train_site = train_site or None  # site or flight keys, or None for every site
+        self.novel = novel
+        self.exclude_flights = exclude_flights
         self.train_stages = _normalize_stages(train_stages)
         if self.train_stages:
             # The stage band has to be loaded so skipped stages can be ignored.
@@ -248,6 +250,14 @@ class NeophyteDataset(Dataset):
         if self.train_site:
             self._keep_train_site(self.train_site)
 
+        # # novel species: drop every other flight of a site that has it
+        if self.novel:
+            self._apply_novel(self.novel)
+
+        # # flights the plan left out: not trained, validated, or tested
+        if self.exclude_flights:
+            self._drop_flights(self.exclude_flights)
+
         # # chosen phenological stages. Labelled tiles with none of them are
         # # dropped. Background-only tiles stay. Pixel masking happens in __getitem__.
         if self.train_stages:
@@ -326,6 +336,137 @@ class NeophyteDataset(Dataset):
         shown = ",".join(keys)
         print(f"train_site={shown}: keeping {int(keep.sum())} of {len(keep)} tiles")
         self._filter_by(keep)
+
+    def _apply_novel(self, novel):
+        """Drop flights of sites that contain the novel species, except the chosen ones.
+
+        Tiles are removed. Their pixels are not relabelled as background, which
+        would teach the model to suppress the plant.
+        """
+        from utils.novel_split import _settings, keep_training_tile, novel_site_groups_from_csv
+
+        species, flights, _test_mode, _stage, _exclude, place = _settings(novel)
+        if not species:
+            return
+        if self.stats_df is None or "site" not in self.stats_df.columns:
+            raise ValueError("novel species needs the 'site' column from dataset_stats.py")
+        if not self.dataset_stats:
+            raise ValueError("novel species needs dataset_stats")
+        groups = novel_site_groups_from_csv(self.dataset_stats, species)
+        folders = self.stats_df["site"].astype(str)
+        keep_placed = {name for name, role in place.items() if role in ("novel_train", "replay", "val")}
+        keep = folders.map(lambda flight: keep_training_tile(flight, flights, groups, keep_placed))
+        dropped = int((~keep).sum())
+        shown = ",".join(flights) if flights else "(none, five-species base)"
+        print(f"novel {species} flights={shown}: dropping {dropped} of {len(keep)} tiles")
+        if not any(keep):
+            raise ValueError(f"novel split left no tiles for {species}")
+        self._filter_by(keep)
+
+    def _drop_flights(self, folders):
+        """Remove every tile from the named flight folders.
+
+        Tiles are removed. Their pixels are not relabelled as background, and
+        they are not scored.
+        """
+        names = [str(name) for name in folders if str(name)]
+        if not names:
+            return
+        if self.stats_df is None or "site" not in self.stats_df.columns:
+            raise ValueError("leaving a flight out needs the 'site' column from dataset_stats.py")
+        keep = ~self.stats_df["site"].astype(str).isin(names)
+        dropped = int((~keep).sum())
+        if dropped == 0:
+            return
+        shown = ",".join(names)
+        print(f"leaving out {shown}: dropping {dropped} of {len(keep)} tiles")
+        if not bool(keep.any()):
+            raise ValueError(f"leaving out {shown} removed every tile")
+        self._filter_by(keep)
+
+    def limit_novel_test(self, species, other_per_flight=20):
+        """Score the new species, not every tile of every flight it occurs on.
+
+        Those flights are whole orthophotos: about twenty thousand tiles at
+        full resolution, and the plant is on a few hundred of them. A full
+        pass is most of a day. Every tile that contains the species stays.
+        Each flight also keeps a short sample of the rest, half of it tiles
+        of the other species and half of it empty ground, so a false positive
+        and the old species are still scored.
+        """
+        if self.stats_df is None or "site" not in self.stats_df.columns:
+            raise ValueError("novel test subset needs dataset_stats")
+        if species not in self.neophytes_stats_names:
+            raise ValueError(f"unknown species {species}")
+        per = int(other_per_flight)
+        if per < 0:
+            raise ValueError("other_per_flight must be >= 0")
+        full = len(self.stats_df)
+        novel = self.stats_df[class_px_col(species)].fillna(0).to_numpy() > 0
+        other = np.zeros(full, dtype=bool)
+        for name in self.neophytes_stats_names:
+            if name == species:
+                continue
+            other |= self.stats_df[class_px_col(name)].fillna(0).to_numpy() > 0
+        sites = self.stats_df["site"].astype(str).to_numpy()
+        keep = novel.copy()
+        groups = {}
+        for index, site in enumerate(sites):
+            if not novel[index]:
+                groups.setdefault(site, []).append(index)
+        half = per // 2
+        for indexes in groups.values():
+            labelled = [i for i in indexes if other[i]]
+            empty = [i for i in indexes if not other[i]]
+            take_labelled = labelled[:half]
+            take_empty = empty[:half]
+            budget = per - len(take_labelled) - len(take_empty)
+            if budget > 0:
+                extra = labelled[len(take_labelled):len(take_labelled) + budget]
+                take_labelled.extend(extra)
+                budget -= len(extra)
+            if budget > 0:
+                take_empty.extend(empty[len(take_empty):len(take_empty) + budget])
+            for index in take_labelled + take_empty:
+                keep[index] = True
+        keep = pd.Series(keep, index=self.stats_df.index)
+        self._filter_by(keep)
+        kept = int(keep.sum())
+        print(
+            f"novel test {species}: scoring {kept} of {full} tiles "
+            f"({int(novel.sum())} with the species, up to {per} others per flight)"
+        )
+        self.novel_test_subset = {
+            "tiles": kept,
+            "tiles_full": full,
+            "novel_tiles": int(novel.sum()),
+            "other_per_flight": per,
+        }
+        return self.novel_test_subset
+
+    def novel_sample_weights(self, species, fraction):
+        """Sampler weights that draw ``fraction`` of the samples from tiles with ``species``.
+
+        A fine-tune has the new species on one flight, a few dozen tiles among
+        twenty thousand. Shuffled, it is about one sample in a thousand.
+        """
+        if self.stats_df is None:
+            raise ValueError("novel_fraction needs dataset_stats")
+        if species not in self.neophytes_stats_names:
+            raise ValueError(f"unknown species {species}")
+        fraction = float(fraction)
+        if not 0 < fraction < 1:
+            raise ValueError("novel_fraction must be between 0 and 1")
+        has = self.stats_df[class_px_col(species)].fillna(0).to_numpy() > 0
+        count = int(has.sum())
+        if count == 0:
+            raise ValueError(f"no training tile contains {species}")
+        if count == len(has):
+            return [1.0] * len(has)
+        weights = np.where(has, fraction / count, (1 - fraction) / (len(has) - count))
+        print(f"novel {species}: {count} of {len(has)} training tiles contain it, "
+              f"drawn as {fraction:.0%} of the samples")
+        return weights.tolist()
 
     def _keep_train_stages(self, stages):
         """Drop labelled tiles that have no pixels in the chosen stages."""

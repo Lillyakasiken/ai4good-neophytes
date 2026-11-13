@@ -202,6 +202,114 @@ def _log_phenology_wandb(cfg, breakdown, heatmap_path, bars_path):
             pass
 
 
+def _json_num(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:
+        return None
+    return number
+
+
+def _trained_channels(exp_name):
+    """Input names the run was trained with. The test config itself is RGB-only."""
+    import os
+
+    root = os.path.join("lightning_logs", exp_name, "hydra")
+    if not os.path.isdir(root):
+        return None
+    found = None
+    for dirpath, _, files in os.walk(root):
+        if "config.yaml" not in files:
+            continue
+        loaded = OmegaConf.load(os.path.join(dirpath, "config.yaml"))
+        channels = OmegaConf.select(loaded, "model.in_channels")
+        encoder = OmegaConf.select(loaded, "model.encoder_name")
+        if channels and encoder:
+            found = set(channels)
+    return found
+
+
+def _write_novel_metrics(cfg, metrics, metrics_dir, subset=None):
+    """Novel-species F1 on the test flights, the other date, and the five old species."""
+    import json
+    import os
+
+    from utils.eval_utils import class_stats_names, metrics_from_confusion
+    from utils.novel_split import _settings, site_group
+
+    species, flights, test_mode, stage, _exclude, place = _settings(cfg.data.novel if "novel" in cfg.data else None)
+    if not species:
+        return
+    names = class_stats_names(cfg.data.classes)
+    index = names.index(species)
+    chosen = set(flights)
+    train_groups = {site_group(flight) for flight in chosen}
+    per_flight = []
+    test_conf = None
+    same_conf = None
+    for flight, block in (metrics.get("semseg_site") or {}).items():
+        group = site_group(flight)
+        placed = place.get(str(flight))
+        if placed in ("test", "same_site", "val", "excluded"):
+            role = placed
+        elif placed in ("novel_train", "replay"):
+            role = "train"
+        elif flight in chosen:
+            role = "train"
+        elif train_groups and group in train_groups:
+            role = "same_site"
+        else:
+            role = "test"
+        scores = block.get("F1")
+        per_flight.append({
+            "flight": str(flight),
+            "role": role,
+            "f1": _json_num(scores[index]) if scores is not None else None,
+        })
+        conf = block.get("conf")
+        if conf is None:
+            continue
+        if role == "same_site":
+            same_conf = conf if same_conf is None else same_conf + conf
+        elif role == "test":
+            test_conf = conf if test_conf is None else test_conf + conf
+
+    def pack(conf):
+        if conf is None:
+            return None, []
+        scored = metrics_from_confusion(conf)
+        old = []
+        for i, name in enumerate(names):
+            if i == 0 or name == species:
+                continue
+            old.append({"species": name, "label": name, "f1": _json_num(scored["F1"][i])})
+        return _json_num(scored["F1"][index]), old
+
+    novel_f1, old = pack(test_conf)
+    same_f1, _same_old = pack(same_conf)
+    record = {
+        "species": species,
+        "stage": stage,
+        "test": test_mode,
+        "flights": list(flights),
+        "novel_f1": novel_f1,
+        "same_site_f1": same_f1,
+        "old_species": old,
+        "per_flight": sorted(per_flight, key=lambda item: item["flight"]),
+    }
+    if subset:
+        record["eval_tiles"] = subset["tiles"]
+        record["eval_tiles_full"] = subset["tiles_full"]
+        record["eval_novel_tiles"] = subset["novel_tiles"]
+        record["eval_other_per_flight"] = subset["other_per_flight"]
+    with open(os.path.join(metrics_dir, "metrics_novel.json"), "w") as handle:
+        json.dump(record, handle, indent=2)
+    shown = "n/a" if novel_f1 is None else f"{novel_f1:.4f}"
+    print(f"novel {species} F1: {shown}")
+
+
 def _require_exp_name(argv, script):
     """Fail early with a readable message instead of a Hydra interpolation error."""
     if not any(a.startswith("exp_name=") for a in argv):
@@ -229,6 +337,7 @@ def main(cfg: DictConfig) -> None:
                                   visualize_phenology_failure_bars, visualize_phenology_recall_heatmap,
                                   visualize_save_confusions, visualize_scores_per_auxiliary,
                                   visualize_scores_per_class, visualize_scores_per_class_cv)
+    from utils.novel_split import _settings, apply_novel_image_dirs
     from utils.transform_utils import get_transforms
     from utils.utils import getListOfFiles, make_dir, natural_keys, shrink_dict
 
@@ -243,6 +352,18 @@ def main(cfg: DictConfig) -> None:
         seed_everything(cfg.pl_seed, workers=True)
 
     # %% data -- no augmentation, no weighted sampling, no few-shot filtering
+    # Flights mode swaps in the novel test flights. Fold mode keeps this split.
+    apply_novel_image_dirs(cfg)
+    novel_species, _novel_flights, _novel_test, _novel_stage, _novel_exclude, _novel_place = _settings(
+        cfg.data.novel if "novel" in cfg.data else None)
+    if novel_species:
+        # The test split turns elevation and the stage bands on for the ordinary
+        # full pass. A novel run only loads the channels the checkpoint was trained with.
+        channels = _trained_channels(cfg.exp_name) or set(cfg.model.in_channels)
+        cfg.data.load_dsm = "dsm" in channels
+        cfg.data.load_dtm = "dtm" in channels
+        cfg.data.load_ndsm = "ndsm" in channels
+        cfg.data.load_auxiliary = False
     test_transforms = get_transforms(cfg.data.test_transforms, cfg.data.transforms_additional_targets)
     dsm_transforms = get_transforms(cfg.data.dsm_transforms, toTensor=False)
     ndsm_transforms = get_transforms(cfg.data.ndsm_transforms, toTensor=False)
@@ -260,9 +381,18 @@ def main(cfg: DictConfig) -> None:
                                     batch_size_train=cfg.data.batch_size_test,
                                     batch_size_val=cfg.data.batch_size_test,
                                     batch_size_test=cfg.data.batch_size_test,
-                                    num_workers=cfg.data.num_workers)
+                                    num_workers=cfg.data.num_workers,
+                                    novel=cfg.data.novel if "novel" in cfg.data else None)
+    if novel_species:
+        dataModule.score_extras = False
     dataModule.prepare_data()
     dataModule.setup()
+    novel_subset = None
+    if novel_species:
+        cap = cfg.novel_other_per_flight if "novel_other_per_flight" in cfg else 20
+        if cap is not None and int(cap) >= 0:
+            novel_subset = dataModule.test_dataset.limit_novel_test(
+                novel_species, other_per_flight=int(cap))
 
     batch = next(iter(dataModule.test_dataloader()))
     print('Image batch shape: ', batch['image'].shape, '\nMask batch shape:  ', batch['mask'].shape)
@@ -298,24 +428,37 @@ def main(cfg: DictConfig) -> None:
 
     # %% quantitative evaluation over the full test set
     if not cfg.qualitative_only:
-        print('Start quantitative evaluation of the full test dataset.')
+        if novel_subset is None:
+            print('Start quantitative evaluation of the full test dataset.')
+        else:
+            print(
+                f"Start quantitative evaluation of {novel_subset['tiles']} "
+                f"of {novel_subset['tiles_full']} test tiles."
+            )
         metrics_dir = make_dir(cfg.test_path, 'quantitative')
         cv_folds = OmegaConf.to_container(cfg.data.cv_folds, resolve=True) if 'cv_folds' in cfg.data else None
         # canopy/phenology only exist in the batch when the data config loads them
         eval_auxiliary = cfg.eval_auxiliary and cfg.data.load_auxiliary
 
         stats_names = class_stats_names(cfg.data.classes)
+        # Twenty thousand full-resolution tiles made this pass take about ten
+        # hours. The subset is a few hundred, and the species F1 does not use
+        # the AUC, stage, month, or fold breakdowns.
+        fast = novel_subset is not None
         metrics = evaluate_model(model, dataModule.test_dataloader(), cfg.model.num_classes, device,
                                  ignore_index=cfg.data.ignore_index,
-                                 eval_auxiliary=eval_auxiliary, eval_site=cfg.eval_site,
-                                 eval_month=cfg.eval_month, eval_cv=cfg.eval_cv, cv_folds=cv_folds,
-                                 compute_auc=cfg.compute_auc, auc_thresholds=cfg.auc_thresholds,
+                                 eval_auxiliary=False if fast else eval_auxiliary,
+                                 eval_site=cfg.eval_site or bool(novel_species),
+                                 eval_month=False if fast else cfg.eval_month,
+                                 eval_cv=False if fast else cfg.eval_cv, cv_folds=cv_folds,
+                                 compute_auc=False if fast else cfg.compute_auc,
+                                 auc_thresholds=cfg.auc_thresholds,
                                  save_dir=metrics_dir, class_names=class_names,
                                  display_order=display_order,
                                  phenology_names=list(cfg.data.phenology_names),
                                  phenology_class_names=stats_names,
                                  phenology_min_px=cfg.phenology_min_px,
-                                 autocast=cfg.autocast)
+                                 autocast=True if fast else cfg.autocast)
 
         score_keys = ['F1', 'IoU', 'Precision', 'Recall']
         visualize_scores_per_class(reorder_scores(shrink_dict(metrics['semseg'], score_keys)),
@@ -368,6 +511,9 @@ def main(cfg: DictConfig) -> None:
             print(format_worst_stages(breakdown))
             _log_phenology_wandb(cfg, breakdown, heatmap_path, bars_path)
 
+        if novel_species:
+            _write_novel_metrics(cfg, metrics, metrics_dir, novel_subset)
+
         train_site = _site_keys(cfg.train_site)
         if train_site:
             _write_site_split(cfg, model, device, train_site, metrics, class_names,
@@ -383,7 +529,7 @@ def main(cfg: DictConfig) -> None:
                            ndsm_mean=float(ndsm_norm.mean) if ndsm_norm else 0.0,
                            ndsm_std=float(ndsm_norm.std) if ndsm_norm else 1.0,
                            entropy_gamma=cfg.entropy_gamma,
-                           autocast=cfg.autocast)
+                           autocast=True if novel_species else cfg.autocast)
 
     hydra.core.global_hydra.GlobalHydra.instance().clear()
 

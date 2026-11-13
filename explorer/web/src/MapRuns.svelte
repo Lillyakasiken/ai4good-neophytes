@@ -1,4 +1,6 @@
 <script>
+  import { tick } from 'svelte';
+
   let { runs = [], selected = '', onselect } = $props();
 
   let kFilter = $state('all');
@@ -16,6 +18,12 @@
 
   function scoreLine(run) {
     if (!run.tested) return 'not tested yet';
+    if (run.novel_species) {
+      const sampled = run.novel_eval_tiles != null && run.novel_eval_tiles_full != null
+        && run.novel_eval_tiles !== run.novel_eval_tiles_full;
+      const tiles = sampled ? ` · ${run.novel_eval_tiles} of ${run.novel_eval_tiles_full} tiles` : '';
+      return `${run.novel_species} F1 ${f1(run.novel_f1)}${tiles} · other date ${f1(run.novel_same_f1)}`;
+    }
     return `same site F1 ${f1(run.same_site_f1)} · held-out F1 ${f1(run.held_out_f1)}`;
   }
 
@@ -59,18 +67,22 @@
     return groups.find(([key]) => key === name)?.[1] ?? flat;
   });
 
-  function step(delta) {
+  async function step(delta, focus = false) {
     const rows = groupRuns;
     if (!rows.length) return;
     const index = rows.findIndex((run) => run.exp_name === selected);
     const next = rows[(index + delta + rows.length) % rows.length];
     onselect?.(next);
+    if (!focus || !panel) return;
+    await tick();
+    const row = panel.querySelector(`[data-run="${CSS.escape(next.exp_name)}"]`);
+    if (row instanceof HTMLElement) row.focus();
   }
 
   function onKey(event) {
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
     event.preventDefault();
-    step(event.key === 'ArrowDown' ? 1 : -1);
+    step(event.key === 'ArrowDown' ? 1 : -1, true);
   }
 
   $effect(() => {
@@ -81,7 +93,7 @@
   });
 </script>
 
-<aside class="map-runs" bind:this={panel} tabindex="0" onkeydown={onKey} aria-label="Training runs">
+<aside class="map-runs" bind:this={panel} aria-label="Training runs">
   <div class="map-runs-head">
     <p class="map-runs-title">Runs in this fold</p>
     <div class="map-runs-chips" role="group" aria-label="Labelled tiles per species">
@@ -116,6 +128,7 @@
             class:on={run.exp_name === selected}
             data-run={run.exp_name}
             aria-pressed={run.exp_name === selected}
+            onkeydown={onKey}
             onclick={() => onselect?.(run)}
           >
             <span class="map-run-line">

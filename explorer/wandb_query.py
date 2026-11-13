@@ -13,7 +13,7 @@ from pathlib import Path
 PROJECT = "ai4good-neophytes"
 # The shared project is on this team, not on a personal entity.
 TEAM = "max-zehnder-university-of-z-rich"
-METRICS = ("val_f1_species", "test_f1_species", "val_f1", "train_loss")
+METRICS = ("val_f1_species", "val_f1_novel", "test_f1_species", "val_f1", "train_loss")
 
 
 def _stamp(value):

@@ -15,6 +15,30 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 
+def _make_model(cfg):
+    from models.semseg_plm import SegmentationModel
+    from utils.eval_utils import class_stats_names
+
+    return SegmentationModel(
+        cfg.model.model_name,
+        cfg.model.encoder_name,
+        cfg.model.img_size,
+        cfg.model.num_classes,
+        cfg.model.lr,
+        in_channels=cfg.model.in_channels,
+        ignore_index=cfg.data.ignore_index,
+        optimizer=cfg.model.optimizer,
+        lr_scheduler=cfg.model.lr_scheduler,
+        loss=cfg.model.loss,
+        weight=cfg.model.weight,
+        patch_2_img_size=cfg.model.patch_2_img_size,
+        fusion_mode=cfg.model.fusion_mode,
+        phenology_names=list(cfg.data.phenology_names) if "phenology_names" in cfg.data else None,
+        class_names=class_stats_names(cfg.data.classes) if "classes" in cfg.data else None,
+        phenology_min_px=cfg.model.phenology_min_px,
+    )
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="train")
 def main(cfg: DictConfig) -> None:
     # # load only the elevation rasters the model actually consumes
@@ -36,9 +60,9 @@ def main(cfg: DictConfig) -> None:
     from pytorch_lightning.loggers import CSVLogger, WandbLogger
 
     from datasets.neophyte_datamodule import NeophyteDataModule
-    from models.semseg_plm import SegmentationModel
     from utils.callback_utils import get_callbacks
     from utils.eval_utils import class_stats_names
+    from utils.novel_split import _settings, apply_novel_image_dirs
     from utils.transform_utils import get_transforms
 
     print('Imports completed.')
@@ -57,6 +81,11 @@ def main(cfg: DictConfig) -> None:
         seed_everything(cfg.pl_seed, workers=True)
 
     # %% data
+    # Rewrites train/val/test dirs when novel.test is "flights". Fold mode is unchanged.
+    apply_novel_image_dirs(cfg)
+    novel = cfg.data.novel if "novel" in cfg.data else None
+    novel_species, _novel_flights, _novel_test, novel_stage, _novel_exclude, _novel_place = _settings(novel)
+    finetune = cfg.get("finetune") if novel_species and novel_stage == "finetune" else None
     train_transforms = get_transforms(cfg.data.train_transforms, cfg.data.transforms_additional_targets)
     val_transforms = get_transforms(cfg.data.val_transforms, cfg.data.transforms_additional_targets)
     test_transforms = get_transforms(cfg.data.test_transforms, cfg.data.transforms_additional_targets)
@@ -95,6 +124,8 @@ def main(cfg: DictConfig) -> None:
                                     val_few_shot_bg_k=cfg.data.val_few_shot_bg_k,
                                     val_subset=cfg.data.val_subset,
                                     load_into_ram=cfg.data.load_into_ram,
+                                    novel=novel,
+                                    novel_fraction=finetune.get("novel_fraction") if finetune else None,
                                     batch_size_train=cfg.data.batch_size_train,
                                     batch_size_val=cfg.data.batch_size_val,
                                     batch_size_test=cfg.data.batch_size_test,
@@ -112,25 +143,33 @@ def main(cfg: DictConfig) -> None:
     print('Image shape: ', tuple(sample['image'].shape), '\nMask shape:  ', tuple(sample['mask'].shape))
 
     # %% model
-    model = SegmentationModel(cfg.model.model_name,
-                              cfg.model.encoder_name,
-                              cfg.model.img_size,
-                              cfg.model.num_classes,
-                              cfg.model.lr,
-                              in_channels=cfg.model.in_channels,
-                              ignore_index=cfg.data.ignore_index,
-                              optimizer=cfg.model.optimizer,
-                              lr_scheduler=cfg.model.lr_scheduler,
-                              loss=cfg.model.loss,
-                              weight=cfg.model.weight,
-                              patch_2_img_size=cfg.model.patch_2_img_size,
-                              fusion_mode=cfg.model.fusion_mode,
-                              phenology_names=list(cfg.data.phenology_names) if "phenology_names" in cfg.data else None,
-                              class_names=class_stats_names(cfg.data.classes) if "classes" in cfg.data else None,
-                              phenology_min_px=cfg.model.phenology_min_px)
+    model = _make_model(cfg)
 
     # %% training
     callbacks = get_callbacks(cfg.model.callbacks)
+    if novel_species:
+        from utils.novel_progress import NovelProgress
+        stats_names = class_stats_names(cfg.data.classes)
+        callbacks.append(NovelProgress(
+            os.path.join(cfg.log_path, "progress.json"),
+            novel_stage,
+            novel_species,
+            stats_names,
+            cfg.model.max_epochs,
+        ))
+        # The five-species base still selects on the mean of those five.
+        # A fine-tune has the new species in val, and that class is what the
+        # saved checkpoint has to improve.
+        if _novel_flights and novel_stage != "base":
+            model.novel_class_index = stats_names.index(novel_species)
+            for callback in callbacks:
+                if getattr(callback, "monitor", None) == "val_f1_species":
+                    callback.monitor = "val_f1_novel"
+            print(f"Checkpoint metric: val_f1_novel ({novel_species})")
+    if finetune and finetune.get("head_lr_mult"):
+        model.head_lr_mult = float(finetune.head_lr_mult)
+        print(f"Fine-tune lr: encoder {cfg.model.lr}, decoder and output layer "
+              f"{cfg.model.lr * model.head_lr_mult:g}")
     if cfg.logger == 'wandb':
         logger = WandbLogger(name=cfg.exp_name, project=cfg.log_name, entity=cfg.wandb_entity)
     else:
@@ -150,6 +189,23 @@ def main(cfg: DictConfig) -> None:
     resume_ckpt_path = last_ckpt_path if os.path.exists(last_ckpt_path) else None
     if resume_ckpt_path:
         print(f'Resuming training from: {resume_ckpt_path}')
+    else:
+        init_ckpt = cfg.init_ckpt if "init_ckpt" in cfg else None
+        if init_ckpt and str(init_ckpt) not in ("", "null", "None"):
+            print(f'Loading weights only from: {init_ckpt}')
+            loaded = torch.load(str(init_ckpt), map_location='cpu', weights_only=False)
+            model.load_state_dict(loaded['state_dict'])
+            head_from = str(finetune.get("head_from") or "mean") if finetune else None
+            if head_from:
+                if head_from not in ("mean", "random"):
+                    raise ValueError("finetune.head_from must be 'mean' or 'random'")
+                stats_names = class_stats_names(cfg.data.classes)
+                index = stats_names.index(novel_species)
+                old_bias, new_bias = model.seed_class_head(index, head_from)
+                shown = ("the average of the other species" if head_from == "mean"
+                         else "random weights, bias 0")
+                print(f"Output layer for {novel_species} restarted from {shown} "
+                      f"(bias {old_bias:.3f} -> {new_bias:.3f})")
 
     start_time = time.time()
     trainer.fit(model, dataModule, ckpt_path=resume_ckpt_path)
@@ -161,6 +217,7 @@ def main(cfg: DictConfig) -> None:
     if cfg.model.run_final_test:
         ckpt_path = trainer.checkpoint_callback.best_model_path
         print('ckpt_path: ', ckpt_path)
+        from models.semseg_plm import SegmentationModel
         model = SegmentationModel.load_from_checkpoint(ckpt_path, weights_only=False).to(device)
         model.eval()
         trainer.test(model=model, dataloaders=dataModule)

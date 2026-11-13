@@ -16,6 +16,11 @@ ckpt_type: best      # 'best' (highest val_f1_species; val_f1 for runs before 20
 pl_seed: 42
 
 qualitative_only: False  # skip the (slow) quantitative pass, only draw prediction figures
+# A novel-species test (data.novel.species) does not score every tile of every
+# other flight. That pass is about twenty thousand full-resolution tiles and
+# takes around ten hours. Every tile that contains the new species is kept,
+# plus this many other tiles from each flight. -1 scores the full flight.
+novel_other_per_flight: 20
 # Forward precision. false (the default) is fp32, which is what every past test.py
 # result used. true runs the forward in bfloat16, matching training's bf16-mixed,
 # and casts probabilities back to fp32 before the metrics. The metric code is

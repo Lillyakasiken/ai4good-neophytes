@@ -1672,6 +1672,28 @@ def train_options():
     return train_jobs.train_options()
 
 
+class FinetuneIn(BaseModel):
+    """Fine-tune controls from the Few-shot tab. Omitted fields keep configs/train.yaml."""
+
+    head_from: str | None = None
+    head_lr_mult: float | None = None
+    novel_fraction: float | None = None
+
+
+class NovelIn(BaseModel):
+    species: str
+    flight: str = ""
+    schedule: str = "two_stage"
+    test: str = "flights"
+    sweep: bool = False
+    base_exp: str = ""
+    ft_epochs: int | None = None
+    ft_lr: float | None = None
+    exclude: list[str] = Field(default_factory=list)
+    place: dict[str, str] = Field(default_factory=dict)
+    finetune: FinetuneIn | None = None
+
+
 class JobIn(BaseModel):
     data: str
     model: str
@@ -1695,6 +1717,7 @@ class JobIn(BaseModel):
     val_few_shot_bg_k: int | None = None
     val_few_shot_mode: str | None = None
     overrides: list[str] = Field(default_factory=list)
+    novel: NovelIn | None = None
 
 
 @app.post("/api/jobs")
@@ -1738,6 +1761,72 @@ def cancel_job(job_id: str):
 def hide_job(job_id: str):
     try:
         return train_jobs.hide(job_id)
+    except train_jobs.JobError as exc:
+        status = 404 if "unknown" in str(exc) else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+class FewShotIn(BaseModel):
+    """Settings for the plan diagram. Training fields match the run form."""
+
+    species: str
+    flight: str = ""
+    schedule: str = "two_stage"
+    test: str = "flights"
+    sweep: bool = False
+    data: str
+    model: str
+    seed: int = 42
+    max_epochs: int = 30
+    ft_epochs: int | None = 10
+    lr: float = 0.0001
+    ft_lr: float | None = None
+    batch_size_train: int = 8
+    precision: str = "bf16-mixed"
+    check_val_every_n_epoch: int = 10
+    base_exp: str = ""
+    exclude: list[str] = Field(default_factory=list)
+    place: dict[str, str] = Field(default_factory=dict)
+
+
+@app.post("/api/fewshot/plan")
+def fewshot_plan(body: FewShotIn):
+    """Flights, roles, and settings for the diagram, before a run is queued."""
+    import novel_plan
+
+    try:
+        plan = novel_plan.build_plan(body.model_dump())
+    except novel_plan.PlanError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body.schedule == "two_stage":
+        plan["bases"] = novel_plan.base_runs(body.species)
+        plan["base_exp"] = novel_plan.resolve_base(
+            body.species, body.data, body.model, body.seed, body.base_exp,
+        )
+    else:
+        plan["bases"] = []
+        plan["base_exp"] = ""
+    return plan
+
+
+@app.post("/api/fewshot/roles")
+def fewshot_roles(body: FewShotIn, folder: str = ""):
+    """Tile roles on one flight, for the map."""
+    import novel_plan
+
+    if not folder:
+        raise HTTPException(status_code=400, detail="folder is required")
+    try:
+        return novel_plan.flight_tile_roles(body.model_dump(), folder)
+    except novel_plan.PlanError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/fewshot/state/{job_id}")
+def fewshot_state(job_id: str):
+    """Plan plus live epoch and scores for a queued few-shot job."""
+    try:
+        return train_jobs.fewshot_state(job_id)
     except train_jobs.JobError as exc:
         status = 404 if "unknown" in str(exc) else 400
         raise HTTPException(status_code=status, detail=str(exc)) from exc

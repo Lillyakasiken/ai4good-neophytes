@@ -306,7 +306,9 @@
   }
 
   function optionLabel(item) {
-    return `test ${f1(item, 'test_f1_species')} · val ${f1(item, 'val_f1_species')} · ${item.kind} · ${titleOf(item)}${item.ds2 ? ' · half res' : ''}`;
+    const novel = f1(item, 'val_f1_novel');
+    const novelText = novel === '—' ? '' : ` · new ${novel}`;
+    return `test ${f1(item, 'test_f1_species')} · val ${f1(item, 'val_f1_species')}${novelText} · ${item.kind} · ${titleOf(item)}${item.ds2 ? ' · half res' : ''}`;
   }
 
   function foldIn(name) {
@@ -794,7 +796,7 @@
         {#if !optionsOpen && running}
           <span class="peek">{runLabel}</span>
         {:else if !optionsOpen && selectedCkpt}
-          <span class="peek">test {f1(selectedCkpt, 'test_f1_species')} · val {f1(selectedCkpt, 'val_f1_species')}</span>
+          <span class="peek">test {f1(selectedCkpt, 'test_f1_species')} · val {f1(selectedCkpt, 'val_f1_species')}{f1(selectedCkpt, 'val_f1_novel') === '—' ? '' : ` · new ${f1(selectedCkpt, 'val_f1_novel')}`}</span>
         {/if}
       </button>
     </h2>
@@ -821,6 +823,9 @@
       <div class="ckpt-score" aria-label="Species F1 for this checkpoint">
         <span>Test<strong>{selectedCkpt ? f1(selectedCkpt, 'test_f1_species') : '—'}</strong></span>
         <span>Val<strong>{selectedCkpt ? f1(selectedCkpt, 'val_f1_species') : '—'}</strong></span>
+        {#if selectedCkpt && f1(selectedCkpt, 'val_f1_novel') !== '—'}
+          <span title="F1 of the new species on the validation tiles that contain it. The checkpoint was chosen by this score.">New<strong>{f1(selectedCkpt, 'val_f1_novel')}</strong></span>
+        {/if}
       </div>
     </div>
     <div class="row">

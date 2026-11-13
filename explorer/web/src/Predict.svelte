@@ -826,6 +826,9 @@
                 {:else}
                   <span>test {f1(item, 'test_f1_species')}</span>
                   <span>val {f1(item, 'val_f1_species')}</span>
+                  {#if f1(item, 'val_f1_novel') !== '—'}
+                    <span title="F1 of the new species on the validation tiles that contain it. The checkpoint was chosen by this score.">new {f1(item, 'val_f1_novel')}</span>
+                  {/if}
                 {/if}
               </span>
             </button>

@@ -100,3 +100,21 @@ val_subset:
   enabled: false
   labelled: all
   bg_k: 300
+
+# # Novel species. null = ordinary training.
+# # species is a stats name (R_typhina). flights lists the only flights whose
+# # labels of that species are kept. Every other flight of a site that has the
+# # species is left out of train and val, not relabelled as background.
+# # test: flights = score the species on its other flights.
+# #       fold    = keep the split's test set.
+# # stage is only a label for the explorer plan: joint, base, or finetune.
+# # exclude lists flight folders left out of train, val, and test.
+# # place moves a flight: folder:role. role is replay, novel_train, val,
+# # test, same_site, or excluded.
+novel:
+  species: null
+  flights: []
+  test: flights
+  stage: joint
+  exclude: []
+  place: []

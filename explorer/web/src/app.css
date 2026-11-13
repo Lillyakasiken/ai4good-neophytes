@@ -414,6 +414,13 @@ label.field span { display: flex; gap: 4px; }
   grid-template-columns: minmax(0, 1fr) 340px;
 }
 
+.map-bar .back {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  padding: 6px 10px;
+}
+
 .map-bar {
   display: flex;
   flex-wrap: wrap;

@@ -90,6 +90,42 @@ def _score(value):
     return float(value)
 
 
+def _count(value):
+    """A tile count from metrics_novel.json. Missing stays missing."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value:
+        return None
+    return int(value)
+
+
+def _novel_scores(exp_dir):
+    """Newest novel-species test record, or None."""
+    best = None
+    best_mtime = -1.0
+    for path in Path(exp_dir).glob("test_*/quantitative/metrics_novel.json"):
+        if not path.is_file():
+            continue
+        try:
+            mtime = path.stat().st_mtime
+            doc = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if mtime < best_mtime:
+            continue
+        best_mtime = mtime
+        best = {
+            "novel_species": doc.get("species"),
+            "novel_f1": _score(doc.get("novel_f1")),
+            "novel_same_f1": _score(doc.get("same_site_f1")),
+            # A fast novel test scores a sample of each flight. Without these
+            # counts the F1 looks like it was measured on every tile.
+            "novel_eval_tiles": _count(doc.get("eval_tiles")),
+            "novel_eval_tiles_full": _count(doc.get("eval_tiles_full")),
+        }
+    return best
+
+
 def _test_scores(exp_dir):
     """Newest finished test that wrote a site split. None when the run has no test yet."""
     best = None
@@ -127,6 +163,8 @@ def describe_run(exp_dir):
     data = doc.get("data") or {}
     model = doc.get("model") or {}
     scores = _test_scores(exp_dir)
+    novel = data.get("novel") or {}
+    novel_scores = _novel_scores(exp_dir)
     described = {
         "exp_name": Path(exp_dir).name,
         "fold": fold_of(data.get("data_name")),
@@ -136,14 +174,22 @@ def describe_run(exp_dir):
         "seed": doc.get("pl_seed"),
         "mode": data.get("few_shot_mode"),
         "max_epochs": model.get("max_epochs"),
-        "tested": scores is not None,
+        "tested": scores is not None or novel_scores is not None,
         "same_site_f1": None,
         "held_out_f1": None,
         "same_site_tiles": None,
+        "novel_species": None if not novel else novel.get("species"),
+        "novel_flights": _names(novel.get("flights")) if novel else [],
+        "novel_f1": None,
+        "novel_same_f1": None,
+        "novel_eval_tiles": None,
+        "novel_eval_tiles_full": None,
         "mtime": config_path.stat().st_mtime,
     }
     if scores:
         described.update(scores)
+    if novel_scores:
+        described.update(novel_scores)
     return described
 
 
@@ -245,6 +291,7 @@ def build(exp_name):
         val_few_shot_mode=cfg.data.val_few_shot_mode,
         val_few_shot_bg_k=cfg.data.val_few_shot_bg_k,
         val_subset=cfg.data.val_subset,
+        novel=cfg.data.novel if "novel" in cfg.data else None,
         load_into_ram=False,
         batch_size_train=cfg.data.batch_size_train,
         batch_size_val=cfg.data.batch_size_val,

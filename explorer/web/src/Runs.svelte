@@ -1,7 +1,13 @@
 <script>
   import { untrack } from 'svelte';
+  import FewShot from './FewShot.svelte';
 
-  let { watchGpu = true, gpu = null } = $props();
+  let { watchGpu = true, gpu = null, onopenflight = () => {} } = $props();
+  let tab = $state(sessionStorage.getItem('runs-tab') === 'few' ? 'few' : 'normal');
+  let resume = $state(null);
+  $effect(() => {
+    sessionStorage.setItem('runs-tab', tab);
+  });
 
   let options = $state(null);
   let optionsError = $state('');
@@ -756,14 +762,214 @@
     return formatDuration(end - start);
   }
 
+  function openPlan(job) {
+    resume = { id: job.id, at: Date.now() };
+    tab = 'few';
+  }
+
   function stateTone(state) {
     if (state === 'running') return 'running';
     if (state === 'failed' || state === 'crashed' || state === 'killed') return 'failed';
     return state || '';
   }
+
+  const EVAL_WEIGHT = 0.9;
+  const TEST_WEIGHT = 0.9;
+
+  function commandLines(job) {
+    return (job.command || '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('#'));
+  }
+
+  function scriptOf(line) {
+    const script = line.split(/\s+/)[1] || '';
+    if (script.endsWith('train.py')) return 'train';
+    if (script.endsWith('test.py')) return 'test';
+    return '';
+  }
+
+  function overrides(line) {
+    const found = {};
+    for (const match of line.matchAll(/(?:^|\s)([\w.]+)=(\S+)/g)) found[match[1]] = match[2];
+    return found;
+  }
+
+  function trainBlocks(epochs, every, phase) {
+    const segments = [];
+    let epoch = 1;
+    const step = Math.max(1, every);
+    while (epoch <= epochs) {
+      let count = 0;
+      let validated = false;
+      while (epoch <= epochs) {
+        count += 1;
+        validated = epoch % step === 0;
+        epoch += 1;
+        if (validated) break;
+      }
+      segments.push({
+        kind: 'train',
+        label: count === 1 ? phase : `${phase} · ${count} epochs`,
+        epochs: count,
+        weight: count,
+      });
+      if (validated) segments.push({ kind: 'val', label: 'Evaluation', weight: EVAL_WEIGHT });
+    }
+    return segments;
+  }
+
+  function jobPhases(job) {
+    const lines = commandLines(job);
+    const trainCount = lines.filter((line) => scriptOf(line) === 'train').length;
+    const phases = [];
+    for (const line of lines) {
+      const script = scriptOf(line);
+      if (script === 'train') {
+        const args = overrides(line);
+        const epochs = Number(args['model.max_epochs'] || 1);
+        const every = Number(args['model.check_val_every_n_epoch'] || 1);
+        const stage = args['data.novel.stage'];
+        let phase = 'Train';
+        if (trainCount > 1) {
+          if (stage === 'base') phase = 'Base';
+          else if (stage === 'finetune') phase = 'Fine-tune';
+        }
+        const segments = trainBlocks(epochs, every, phase);
+        if (args['model.run_final_test'] !== 'false') {
+          segments.push({ kind: 'test', label: 'Test', weight: TEST_WEIGHT });
+        }
+        phases.push({ epochs, segments });
+      } else if (script === 'test') {
+        phases.push({ epochs: 0, segments: [{ kind: 'test', label: 'Test', weight: TEST_WEIGHT }] });
+      }
+    }
+    return phases;
+  }
+
+  function totalWeight(segments) {
+    return segments.reduce((sum, seg) => sum + seg.weight, 0);
+  }
+
+  function weightBefore(segments, index) {
+    let sum = 0;
+    for (let i = 0; i < index; i += 1) sum += segments[i].weight;
+    return sum;
+  }
+
+  function intoTrain(segments, kind, shown, frac) {
+    let epochCursor = 1;
+    let consumed = 0;
+    for (const seg of segments) {
+      if (seg.kind === 'train') {
+        const count = seg.epochs;
+        if (kind === 'training' && epochCursor <= shown && shown < epochCursor + count) {
+          return consumed + (shown - epochCursor) + frac;
+        }
+        consumed += seg.weight;
+        epochCursor += count;
+      } else if (seg.kind === 'val') {
+        if (kind === 'validation' && epochCursor === shown + 1) return consumed + frac * seg.weight;
+        consumed += seg.weight;
+      }
+    }
+    return consumed;
+  }
+
+  function cursorOf(job, phases) {
+    const segments = phases.flatMap((phase) => phase.segments);
+    const total = totalWeight(segments);
+    if (!total) return 0;
+    if (job.status === 'done') return 1;
+    if (job.status !== 'running') return 0;
+    const text = job.progress || '';
+    if (!text) return 0;
+    if (text === 'training finished') {
+      const index = segments.findIndex((seg) => seg.kind === 'test');
+      if (index < 0) return 1;
+      return weightBefore(segments, index) / total;
+    }
+    const epoch = text.match(/epoch (\d+)\/(\d+)/);
+    const steps = [...text.matchAll(/(\d+)\/(\d+)/g)];
+    const lastStep = steps.at(-1);
+    const frac = lastStep ? Number(lastStep[1]) / Math.max(1, Number(lastStep[2])) : 0;
+    const kind = epoch ? text.split(' · ')[1] : text.split(' · ')[0];
+    if (kind === 'testing' || kind === 'evaluating') {
+      const tests = segments.flatMap((seg, index) => (seg.kind === 'test' ? [index] : []));
+      const index = kind === 'evaluating' && tests.length > 1 ? tests.at(-1) : tests[0];
+      if (index == null) return Math.max(0, Math.min(1, frac));
+      return (weightBefore(segments, index) + frac * segments[index].weight) / total;
+    }
+    if (!epoch || (kind !== 'training' && kind !== 'validation')) return 0;
+    const shown = Number(epoch[1]);
+    const epochs = Number(epoch[2]);
+    const phaseIndex = phases.findIndex((phase) => phase.epochs === epochs && phase.segments.some((seg) => seg.kind === 'train'));
+    if (phaseIndex < 0) return 0;
+    let before = 0;
+    for (let i = 0; i < phaseIndex; i += 1) before += totalWeight(phases[i].segments);
+    const into = intoTrain(phases[phaseIndex].segments, kind, shown, frac);
+    return Math.max(0, Math.min(1, (before + into) / total));
+  }
+
+  function stageName(seg) {
+    if (seg.kind === 'val') return 'eval';
+    if (seg.kind === 'test') return 'test';
+    return seg.epochs > 1 ? `train ${seg.epochs}` : 'train';
+  }
+
+  function segFill(segments, index, cursor) {
+    const total = totalWeight(segments);
+    if (!total) return 0;
+    const into = cursor * total - weightBefore(segments, index);
+    return Math.max(0, Math.min(100, (into / segments[index].weight) * 100));
+  }
+
+  function stageSummary(segments) {
+    const parts = [];
+    let index = 0;
+    while (index < segments.length) {
+      const seg = segments[index];
+      const next = segments[index + 1];
+      if (seg.kind === 'train' && next?.kind === 'val') {
+        let count = 1;
+        let cursor = index + 2;
+        while (segments[cursor]?.kind === 'train' && segments[cursor].label === seg.label && segments[cursor + 1]?.kind === 'val') {
+          count += 1;
+          cursor += 2;
+        }
+        parts.push(count > 1 ? `${seg.label}, evaluation × ${count}` : `${seg.label}, evaluation`);
+        index = cursor;
+        continue;
+      }
+      parts.push(seg.kind === 'val' ? 'evaluation' : seg.kind === 'test' ? 'test' : seg.label);
+      index += 1;
+    }
+    return parts.join(' · ');
+  }
+
+  function jobMeta(job) {
+    const shot = job.fewshot || {};
+    const bits = [job.data, job.model];
+    if (shot.species) bits.push(shot.species.replaceAll('_', ' '));
+    if (shot.flight) bits.push(shot.flight);
+    else if (shot.schedule) bits.push(shot.schedule.replaceAll('_', ' '));
+    return bits.filter(Boolean);
+  }
 </script>
 
 <div class="runs">
+  <div class="kind-tabs" role="tablist" aria-label="Run type">
+    <button type="button" role="tab" aria-selected={tab === 'normal'} class:on={tab === 'normal'} onclick={() => (tab = 'normal')}>
+      Normal runs
+    </button>
+    <button type="button" role="tab" aria-selected={tab === 'few'} class:on={tab === 'few'} onclick={() => (tab = 'few')}>
+      Few-shot
+    </button>
+  </div>
+  {#if tab === 'few'}
+    <FewShot {options} {onopenflight} {jobs} {resume} />
+  {:else}
   <div class="top">
     <form class="card" onsubmit={(event) => { event.preventDefault(); enqueue(); }}>
       <h2>New run</h2>
@@ -1211,9 +1417,9 @@
         {/if}
       </section>
 
-      <section class="card">
+      <section class="card queue-card">
         <div class="queue-head">
-          <h2>Queue</h2>
+          <h2>Queue {#if jobs.length}<span class="count">{jobs.length}</span>{/if}</h2>
           {#if canClear}
             <button type="button" class="cancel" onclick={askClear}>Clear</button>
           {/if}
@@ -1221,18 +1427,43 @@
         {#if jobs.length}
           <ul class="queue">
             {#each jobs as job (job.id)}
-              <li class:open={job.id === openId}>
-                <div class="job-row">
-                  <button type="button" class="job" onclick={() => (openId = job.id)}>
-                    <span class="status" data-status={job.status}>{job.status}</span>
-                    <span class="exp">{job.exp_name}</span>
-                  </button>
-                  {#if job.status === 'queued' || job.status === 'running'}
-                    <button type="button" class="cancel" onclick={() => askCancel(job)}>Cancel</button>
-                  {:else if finished(job)}
-                    <button type="button" class="cancel" onclick={() => hide(job.id)}>Hide</button>
-                  {/if}
+              {@const phases = jobPhases(job)}
+              {@const segments = phases.flatMap((phase) => phase.segments)}
+              {@const cursor = cursorOf(job, phases)}
+              <li class="job-card" class:open={job.id === openId} data-status={job.status}>
+                <div class="job-top">
+                  <span class="status" data-status={job.status}>{job.status}</span>
+                  <span class="job-actions">
+                    {#if job.fewshot}
+                      <button type="button" class="open-plan" onclick={() => openPlan(job)}>Open plan</button>
+                    {/if}
+                    {#if job.status === 'queued' || job.status === 'running'}
+                      <button type="button" class="cancel" onclick={() => askCancel(job)}>Cancel</button>
+                    {:else if finished(job)}
+                      <button type="button" class="cancel" onclick={() => hide(job.id)}>Hide</button>
+                    {/if}
+                  </span>
                 </div>
+                <button type="button" class="job" onclick={() => (openId = job.id)}><span class="exp">{job.exp_name}</span><span class="meta">{#each jobMeta(job) as bit, index (bit + index)}<span>{bit}</span>{/each}</span></button>
+                {#if segments.length}
+                  <div
+                    class="stagebar"
+                    role="progressbar"
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                    aria-valuenow={Math.round(cursor * 100)}
+                    aria-label={stageSummary(segments)}
+                  >
+                    {#each segments as seg, index (index)}
+                      <div class="slice {seg.kind}" style:flex={seg.weight} title={seg.label}>
+                        <span class="tag up">{seg.kind === 'val' ? 'eval' : ''}</span>
+                        <div class="lane"><span style:width="{segFill(segments, index, cursor)}%"></span></div>
+                        {#if index > 0}<i class="tick"></i>{/if}
+                        <span class="tag down">{seg.kind === 'val' ? '' : stageName(seg)}</span>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
                 {#if job.progress}
                   <p class="now">{job.progress}</p>
                 {/if}
@@ -1322,6 +1553,7 @@
               <th>Finished</th>
               <th>Duration</th>
               <th>val F1 species</th>
+              <th title="F1 of the species treated as new, on the validation tiles that contain it. The checkpoint is chosen by this score. Empty for an ordinary run.">new species F1</th>
               <th>test F1 species</th>
               <th>Encoder</th>
             </tr>
@@ -1341,6 +1573,7 @@
                 <td>{when(run.finished_at) || '—'}</td>
                 <td class="num">{duration(run)}</td>
                 <td class="num">{metric(run, 'val_f1_species')}</td>
+                <td class="num">{metric(run, 'val_f1_novel')}</td>
                 <td class="num">{metric(run, 'test_f1_species')}</td>
                 <td>{run.encoder ?? '—'}</td>
               </tr>
@@ -1352,9 +1585,31 @@
       <p class="hint">No runs in this project yet.</p>
     {/if}
   </section>
+  {/if}
 </div>
 
 <style>
+  .kind-tabs {
+    display: flex;
+    gap: 0;
+    margin: 16px 16px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .kind-tabs button {
+    background: transparent;
+    color: var(--mist);
+    border: 0;
+    border-bottom: 2px solid transparent;
+    padding: 8px 14px;
+    font-size: 14px;
+  }
+
+  .kind-tabs button.on {
+    color: var(--ink);
+    border-bottom-color: var(--canopy);
+  }
+
   .runs {
     min-height: 0;
     overflow: auto;
@@ -1741,15 +1996,7 @@
     padding: 7px 12px;
   }
 
-  .job-row {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-  }
-
-  .job-row .job { flex: 1; min-width: 0; }
-
-  .cancel {
+  .cancel, .open-plan {
     flex: none;
     align-self: center;
     background: transparent;
@@ -1770,41 +2017,183 @@
   .util-key { color: var(--canopy); }
   .mem-key { color: #b76e44; }
 
-  .procs, .queue { list-style: none; margin: 0; padding: 0; }
-  .procs li, .queue li { padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .procs { list-style: none; margin: 0; padding: 0; }
+  .procs li { padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+
+  .queue-card { background: #e8eef0; }
+
+  .count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.4em;
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: 99px;
+    background: #fff;
+    color: var(--mist);
+    font-family: "Public Sans", sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0;
+    vertical-align: 2px;
+  }
+
+  .queue {
+    list-style: none;
+    display: grid;
+    gap: 8px;
+    margin: 0;
+    padding: 0;
+  }
+
+  .job-card {
+    display: grid;
+    gap: 6px;
+    padding: 10px 12px 12px;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--quiet);
+    border-radius: 6px;
+  }
+
+  .job-card[data-status='queued'] { border-left-color: #8aa0a8; }
+  .job-card[data-status='running'] { border-left-color: var(--canopy); }
+  .job-card[data-status='done'] { border-left-color: #3d7a62; }
+  .job-card[data-status='failed'] { border-left-color: #8c2f2f; }
+  .job-card[data-status='cancelled'] { border-left-color: var(--quiet); }
+
+  .job-card.open {
+    border-color: var(--canopy);
+    box-shadow: 0 0 0 1px var(--canopy);
+  }
+
+  .job-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .job-actions { display: flex; gap: 6px; }
+
+  .job-actions .cancel,
+  .job-actions .open-plan {
+    padding: 3px 8px;
+    font-size: 12px;
+    border-radius: 99px;
+    background: #fff;
+  }
 
   .job {
     display: flex;
-    gap: 8px;
-    align-items: baseline;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
     width: 100%;
     padding: 0;
     border: 0;
     background: transparent;
+    line-height: 1;
     text-align: left;
   }
 
-  .queue li.open .job { font-weight: 600; }
+  .job:hover .exp { text-decoration: underline; }
 
   .status {
     flex: none;
     font-size: 11px;
+    font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--mist);
   }
 
   .status[data-status='running'] { color: var(--canopy); }
+  .status[data-status='done'] { color: #2f6b4f; }
   .status[data-status='failed'] { color: #8c2f2f; }
 
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 0;
+    margin: 0;
+    color: var(--mist);
+    font-size: 12px;
+    line-height: 1.3;
+  }
+
+  .meta span + span::before { content: " · "; }
+
+  .stagebar { display: flex; }
+
+  .slice {
+    position: relative;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .tag {
+    height: 14px;
+    overflow: visible;
+    text-align: center;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 14px;
+    white-space: nowrap;
+  }
+
+  .tag.up { color: #8a5a3a; }
+  .tag.down { color: var(--canopy); }
+  .slice.test .tag.down { color: #3d5875; }
+
+  .lane {
+    height: 10px;
+    background: #d3e3dc;
+    overflow: hidden;
+  }
+
+  .slice.val .lane { background: #efe3d8; }
+  .slice.test .lane { background: #d7e0ea; }
+
+  .lane span {
+    display: block;
+    height: 100%;
+    background: #1b3f36;
+  }
+
+  .slice.val .lane span { background: #5c5344; }
+  .slice.test .lane span { background: #31485c; }
+  .slice:first-child .lane { border-radius: 99px 0 0 99px; }
+  .slice:last-child .lane { border-radius: 0 99px 99px 0; }
+
+  .tick {
+    position: absolute;
+    z-index: 1;
+    left: 0;
+    top: 1px;
+    bottom: 1px;
+    width: 1px;
+    background: rgba(18, 32, 36, 0.55);
+    pointer-events: none;
+  }
+
   .now {
-    margin: 2px 0 0;
+    margin: 0;
     color: var(--canopy);
     font-size: 12px;
     font-variant-numeric: tabular-nums;
   }
 
-  .exp { word-break: break-all; }
+  .exp {
+    color: var(--ink);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.25;
+    word-break: break-all;
+  }
 
   .confirm {
     width: min(420px, 100%);

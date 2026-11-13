@@ -48,6 +48,28 @@
   }
 
   let filters = $state(defaultFilters());
+  let planTiles = $state(null);
+
+  async function openPlanFlight(detail) {
+    const res = await fetch(`/api/fewshot/roles?folder=${encodeURIComponent(detail.folder)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(detail.settings),
+    });
+    if (!res.ok) return;
+    const body = await res.json();
+    const byId = {};
+    for (const tile of body.tiles ?? []) byId[tile.tile_id] = tile.role;
+    planTiles = byId;
+    filters.site = detail.site_name;
+    filters.flight = String(detail.flight ?? '');
+    view = 'map';
+  }
+
+  function leavePlan() {
+    planTiles = null;
+    view = 'runs';
+  }
   let filtersChanged = $derived.by(() => {
     const base = defaultFilters();
     for (const key of Object.keys(base)) {
@@ -321,9 +343,9 @@
     {:else if view === 'batch'}
       <Batch {facets} fold={filters.fold} onopen={openBatchTile} />
     {:else if view === 'runs'}
-      <Runs {watchGpu} {gpu} />
+      <Runs {watchGpu} {gpu} onopenflight={openPlanFlight} />
     {:else if view === 'map'}
-      <Map {facets} bind:filters bind:showLabels onopen={openTile} />
+      <Map {facets} bind:filters bind:showLabels onopen={openTile} {planTiles} onback={planTiles ? leavePlan : null} />
     {:else}
       {#if error}
         <p class="error">{error}</p>

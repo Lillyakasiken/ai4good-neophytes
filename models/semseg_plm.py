@@ -179,6 +179,11 @@ class SegmentationModel(pl.LightningModule):
             raise ValueError(f"class_names has length {len(class_names)}, expected {num_classes}")
         self.phenology_class_names = list(class_names)
         self.phenology_min_px = int(phenology_min_px)
+        # Set for a novel-species fine-tune. The checkpoint then follows this
+        # class instead of the mean of whichever species happen to be in val.
+        self.novel_class_index = None
+        # Decoder and output layer learning rate relative to the encoder.
+        self.head_lr_mult = 1.0
         for split in ("val", "test"):
             setattr(self, f"{split}_pheno_counts",
                     torch.zeros(num_classes, len(self.phenology_stage_names), num_classes, dtype=torch.long))
@@ -190,11 +195,43 @@ class SegmentationModel(pl.LightningModule):
     def set_patch_2_img_size(self, new_patch_2_img_size):
         self.hparams.patch_2_img_size = new_patch_2_img_size
 
+    def seed_class_head(self, index, mode="mean"):
+        """Restart one class of the output layer.
+
+        ``mean`` copies the average of the other species, background excluded.
+        ``random`` draws small weights and sets the bias to 0. Returns the
+        old and new bias.
+        """
+        if mode not in ("mean", "random"):
+            raise ValueError("head init must be 'mean' or 'random'")
+        conv = self.model.segmentation_head[0]
+        with torch.no_grad():
+            old_bias = float(conv.bias[index])
+            if mode == "random":
+                nn.init.kaiming_normal_(conv.weight[index:index + 1], nonlinearity="linear")
+                conv.bias[index] = 0
+            else:
+                rows = [i for i in range(1, conv.out_channels) if i != index]
+                conv.weight[index] = conv.weight[rows].mean(dim=0)
+                conv.bias[index] = conv.bias[rows].mean()
+        return old_bias, float(conv.bias[index])
+
+    def _param_groups(self):
+        lr = self.hparams.learning_rate
+        mult = float(self.head_lr_mult or 1.0)
+        if mult == 1.0:
+            return self.parameters()
+        encoder = list(self.model.encoder.parameters())
+        ids = {id(param) for param in encoder}
+        rest = [param for param in self.parameters() if id(param) not in ids]
+        return [{"params": encoder, "lr": lr}, {"params": rest, "lr": lr * mult}]
+
     def configure_optimizers(self):
+        params = self._param_groups()
         if self.hparams.optimizer == 'Adam':
-            optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+            optimizer = optim.Adam(params, lr=self.hparams.learning_rate)
         elif self.hparams.optimizer == 'AdamW':
-            optimizer = optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
+            optimizer = optim.AdamW(params, lr=self.hparams.learning_rate)
         else:
             raise ValueError(f"Unknown optimizer '{self.hparams.optimizer}'. Available: Adam, AdamW.")
         if self.hparams.lr_scheduler:
@@ -343,8 +380,16 @@ class SegmentationModel(pl.LightningModule):
             f"{stage}_auc": getattr(self, f"{stage}_auc").compute(),
         }, prog_bar=prog_bar)
 
-        for i, f1 in enumerate(getattr(self, f"{stage}_f1_per_class").compute()):
+        per_class = getattr(self, f"{stage}_f1_per_class").compute()
+        for i, f1 in enumerate(per_class):
             self.log(f"{stage}_f1_class_{i}", f1, prog_bar=False)
+        # A class the model never emits scores 0 and is drowned by the other
+        # five inside val_f1_species. The fine-tune checkpoint watches this one.
+        if stage == "val" and self.novel_class_index is not None:
+            score = per_class[self.novel_class_index]
+            if not torch.isfinite(score):
+                score = torch.zeros((), device=score.device, dtype=score.dtype)
+            self.log("val_f1_novel", score, prog_bar=True)
 
         if stage == 'train' and self.elevation_fusion is not None:
             for k, v in self.elevation_fusion.get_fusion_scales().items():

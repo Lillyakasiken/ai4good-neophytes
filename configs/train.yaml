@@ -31,6 +31,26 @@ log_dir: lightning_logs
 log_path: ${log_dir}/${exp_name}
 ckpt_path: ${log_path}/checkpoints
 
+# # Weights to start from, without the optimizer or the epoch. null starts from
+# # the encoder's pretrained weights. A last.ckpt in this run still resumes fully.
+init_ckpt: null
+
+# # Novel-species fine-tune (data.novel.stage=finetune). The five-species base
+# # never predicts the held-out class and pushes its output bias down, and its
+# # tiles are about 0.1% of the training set. Without these the fine-tune keeps
+# # that species at F1 0.
+finetune:
+  # Output row of the new class, after init_ckpt is loaded.
+  # mean averages the other species. random draws small weights and sets the
+  # bias to 0. Neither needs a lookalike species.
+  head_from: mean
+  # Decoder and output layer train at model.lr times this. The encoder stays
+  # at model.lr, which protects the five species.
+  head_lr_mult: 10
+  # Share of the training samples drawn from tiles that contain the new
+  # species. null shuffles the training set as usual.
+  novel_fraction: 0.25
+
 # # LaTeX rendering for the figures. Set text.usetex to false if no TeX is installed.
 matplotlib_style:
   text.usetex: false

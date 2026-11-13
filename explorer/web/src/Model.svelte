@@ -472,7 +472,9 @@
   function optionLabel(item) {
     const val = item.metrics?.val_f1_species;
     const valText = val == null || Number.isNaN(Number(val)) ? '' : ` · val ${Number(val).toFixed(3)}`;
-    return `${titleOf(item)}${item.ds2 ? ' · half res' : ''} · test ${f1(item)}${valText}`;
+    const novel = item.metrics?.val_f1_novel;
+    const novelText = novel == null || Number.isNaN(Number(novel)) ? '' : ` · new ${Number(novel).toFixed(3)}`;
+    return `${titleOf(item)}${item.ds2 ? ' · half res' : ''} · test ${f1(item)}${valText}${novelText}`;
   }
 
   function rankCheckpoints(rows, wandbRuns) {

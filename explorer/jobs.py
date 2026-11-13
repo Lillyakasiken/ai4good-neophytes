@@ -17,7 +17,7 @@ import yaml
 
 from common import DATA_CSV, PHASE_LABELS, TILES_PARQUET, TRAIN_STAGES
 from gpu import compute_busy, snapshot
-from runtime import EXPLORER_ROOT, JOBS_DIR, REPO_ROOT, TrainEnvError, gpu_lock, train_python
+from runtime import EXPLORER_ROOT, JOBS_DIR, LOG_DIR, REPO_ROOT, TrainEnvError, gpu_lock, train_python
 
 JOBS_PATH = JOBS_DIR / "jobs.json"
 _lock = threading.Lock()
@@ -519,6 +519,21 @@ def _session_alive(job_id):
     return proc.returncode == 0
 
 
+def _failure_line(job_id):
+    """One line from the job log, so a crash is not only an exit code."""
+    path = JOBS_DIR / f"{job_id}.log"
+    if not path.is_file():
+        return "the run stopped before it wrote a log"
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return "the run stopped before it wrote a log"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "the run stopped before it wrote a log"
+    return lines[-1][:400]
+
+
 def _reconcile(job):
     if job["status"] != "running":
         return job
@@ -536,6 +551,8 @@ def _reconcile(job):
         code = 1
     job["exit_code"] = code
     job["status"] = "done" if code == 0 else "failed"
+    if code != 0 and not job.get("error"):
+        job["error"] = _failure_line(job["id"])
     return job
 
 
@@ -676,6 +693,344 @@ def _public(job):
         "error": job.get("error"),
         "wait_reason": job.get("wait_reason") or "",
         "progress": _progress_text(job),
+        "fewshot": job.get("fewshot"),
+    }
+
+
+def _exclude_arg(exclude):
+    if not exclude:
+        return "data.novel.exclude=[]"
+    return "data.novel.exclude=[" + ",".join(exclude) + "]"
+
+
+def _place_arg(place):
+    if not place:
+        return "data.novel.place=[]"
+    parts = [f"{folder}:{role}" for folder, role in sorted(place.items())]
+    return "data.novel.place=[" + ",".join(parts) + "]"
+
+
+def _hydra_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def _yaml_finetune():
+    doc = yaml.safe_load((REPO_ROOT / "configs" / "train.yaml").read_text()) or {}
+    return dict(doc.get("finetune") or {})
+
+
+def _finetune_block(raw, _species):
+    """The fine-tune settings a two-stage job passes through, checked against the form."""
+    block = _yaml_finetune()
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise JobError("finetune must be an object")
+    for key in ("head_from", "head_lr_mult", "novel_fraction"):
+        if key in raw and raw[key] is not None:
+            block[key] = raw[key]
+    head_from = str(block.get("head_from") or "mean")
+    if head_from not in ("mean", "random"):
+        raise JobError("the new output starts from the average of the other species, or from random weights")
+    try:
+        novel_fraction = float(block.get("novel_fraction"))
+        head_lr_mult = float(block.get("head_lr_mult") or 1)
+    except (TypeError, ValueError) as exc:
+        raise JobError("fine-tune shares and weights must be numbers") from exc
+    if not 0 < novel_fraction < 1:
+        raise JobError("the new species share must be between 0 and 1")
+    if not 1 <= head_lr_mult <= 100:
+        raise JobError("the decoder learning-rate multiple must be from 1 to 100")
+    return {
+        "head_from": head_from,
+        "head_lr_mult": head_lr_mult,
+        "novel_fraction": novel_fraction,
+    }
+
+
+def _finetune_overrides(block):
+    return [f"finetune.{key}={_hydra_value(block[key])}" for key in (
+        "head_from", "head_lr_mult", "novel_fraction",
+    )]
+
+
+# A fine-tune is short and its first non-zero score of the new species can come
+# at any epoch, so it is validated every epoch.
+FT_VAL_EVERY = 1
+
+
+def _novel_argv(python, data, model, seed, epochs, every, lr, batch_train, batch_val,
+                precision, logger, species, flights, test_mode, stage, exp_name, exclude=None, place=None,
+                finetune=None):
+    flight_arg = "data.novel.flights=[]"
+    if flights:
+        flight_arg = "data.novel.flights=[" + ",".join(flights) + "]"
+    argv = [
+        str(python),
+        str(REPO_ROOT / "train.py"),
+        f"data={data}",
+        f"model={model}",
+        f"pl_seed={seed}",
+        f"model.max_epochs={epochs}",
+        f"model.check_val_every_n_epoch={every}",
+        f"model.lr={_format_lr(lr)}",
+        f"model.lr_scheduler.params.T_max={epochs}",
+        f"data.batch_size_train={batch_train}",
+        f"data.batch_size_val={batch_val}",
+        f"model.precision={precision}",
+        f"logger={logger}",
+        "model.run_final_test=false",
+        f"data.novel.species={species}",
+        flight_arg,
+        f"data.novel.test={test_mode}",
+        f"data.novel.stage={stage}",
+        _exclude_arg(exclude),
+        _place_arg(place),
+    ]
+    if stage == "finetune" and finetune:
+        argv.extend(_finetune_overrides(finetune))
+    argv.append(f"exp_name={exp_name}")
+    return argv
+
+
+def _novel_test_argv(python, exp_name, species, flights, test_mode, stage, exclude=None, place=None,
+                     ckpt_type=None):
+    flight_arg = "data.novel.flights=[]"
+    if flights:
+        flight_arg = "data.novel.flights=[" + ",".join(flights) + "]"
+    argv = [
+        str(python),
+        str(REPO_ROOT / "test.py"),
+        f"exp_name={exp_name}",
+        f"data.novel.species={species}",
+        flight_arg,
+        f"data.novel.test={test_mode}",
+        f"data.novel.stage={stage}",
+        _exclude_arg(exclude),
+        _place_arg(place),
+    ]
+    if ckpt_type:
+        argv.append(f"ckpt_type={ckpt_type}")
+    return argv
+
+
+def _fewshot_name(stamp, data, model, seed, species, flight, kind, test_mode):
+    tag = "fl" if test_mode == "flights" else "fold"
+    if kind == "base":
+        name = f"{stamp}_{data}_{model}_s{seed}_nv{species}_base"
+    else:
+        name = f"{stamp}_{data}_{model}_s{seed}_nv{species}_{flight}_{kind}_{tag}"
+    if not EXP_NAME.fullmatch(name):
+        raise JobError("the generated run name is too long")
+    return name
+
+
+def _enqueue_fewshot(body, python, data, model, seed, epochs, every, lr,
+                     batch_train, batch_val, precision, logger):
+    """Queue one novel-species run, or one per training site when sweeping."""
+    import novel_plan
+
+    raw = body.get("novel") or {}
+    if not isinstance(raw, dict):
+        raise JobError("novel must be an object")
+    species = str(raw.get("species") or "")
+    flight = str(raw.get("flight") or "")
+    schedule = raw.get("schedule") or "two_stage"
+    test_mode = raw.get("test") or "flights"
+    sweep = bool(raw.get("sweep"))
+    exclude = [str(item) for item in (raw.get("exclude") or []) if str(item)]
+    raw_place = raw.get("place") or {}
+    if not isinstance(raw_place, dict):
+        raise JobError("place must be an object")
+    place = {str(folder): str(role) for folder, role in raw_place.items()}
+    ft_epochs = int(raw.get("ft_epochs") or min(epochs, 10))
+    ft_lr = float(raw["ft_lr"]) if raw.get("ft_lr") not in (None, "") else lr / 10
+    if not 1 <= ft_epochs <= 500:
+        raise JobError("fine-tune epochs must be from 1 to 500")
+    if not 1e-8 <= ft_lr <= 1:
+        raise JobError("fine-tune lr must be from 1e-8 to 1")
+    finetune = _finetune_block(raw.get("finetune"), species) if schedule == "two_stage" else None
+    if schedule == "two_stage":
+        base_exp = novel_plan.resolve_base(species, data, model, seed, raw.get("base_exp"))
+    else:
+        base_exp = ""
+    if base_exp and not EXP_NAME.fullmatch(base_exp):
+        raise JobError("unknown base run")
+    if base_exp and not (LOG_DIR / base_exp / "checkpoints").is_dir():
+        raise JobError("that base run has no checkpoint")
+
+    settings = {
+        "species": species,
+        "flight": "" if sweep else flight,
+        "schedule": schedule,
+        "test": test_mode,
+        "sweep": sweep,
+        "data": data,
+        "model": model,
+        "seed": seed,
+        "max_epochs": epochs,
+        "ft_epochs": ft_epochs,
+        "lr": lr,
+        "ft_lr": ft_lr,
+        "batch_size_train": batch_train,
+        "precision": precision,
+        "check_val_every_n_epoch": every,
+        "exclude": exclude,
+        "place": place,
+        "finetune": finetune,
+    }
+    try:
+        plan = novel_plan.build_plan(settings if sweep else {**settings, "flight": flight})
+    except novel_plan.PlanError as exc:
+        raise JobError(str(exc)) from exc
+    flights = plan["candidates"] if sweep else [flight]
+    if not flights or not flights[0]:
+        raise JobError("pick the flight the new species is trained on")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = base_exp or _fewshot_name(stamp, data, model, seed, species, "", "base", test_mode)
+    run_test = bool(body.get("run_test", True))
+    made = []
+    for index, chosen in enumerate(flights):
+        one = dict(settings)
+        one["flight"] = chosen
+        one["sweep"] = False
+        try:
+            one_plan = novel_plan.build_plan(one) if sweep else plan
+        except novel_plan.PlanError as exc:
+            raise JobError(str(exc)) from exc
+        if schedule == "two_stage":
+            one_plan["base_exp"] = base_exp
+        steps = []
+        meta = []
+        scored = None
+        if schedule == "two_stage":
+            if index == 0 and not base_exp:
+                base_argv = _novel_argv(
+                    python, data, model, seed, epochs, every, lr, batch_train, batch_val,
+                    precision, logger, species, [], test_mode, "base", base_name, exclude, place,
+                )
+                steps.append({"argv": base_argv})
+                meta.append({"kind": "base", "exp_name": base_name})
+            stage_epochs, stage_lr, stage = ft_epochs, ft_lr, "finetune"
+            stage_every = FT_VAL_EVERY
+            kind = "ft"
+        else:
+            stage_epochs, stage_lr, stage = epochs, lr, "joint"
+            stage_every = every
+            kind = "joint"
+        exp_name = _fewshot_name(stamp, data, model, seed, species, chosen, kind, test_mode)
+        scored = exp_name
+        novel_flights = [item["folder"] for item in (one_plan.get("columns") or {}).get("novel_train") or []]
+        if not novel_flights:
+            raise JobError("move a flight onto the new species before running")
+        train_step = {
+            "argv": _novel_argv(
+                python, data, model, seed, stage_epochs, stage_every, stage_lr, batch_train, batch_val,
+                precision, logger, species, novel_flights, test_mode, stage, exp_name, exclude, place,
+                finetune=finetune,
+            )
+        }
+        if schedule == "two_stage":
+            train_step["init_from"] = base_name
+        steps.append(train_step)
+        meta.append({"kind": stage, "exp_name": exp_name})
+        if run_test:
+            steps.append({
+                "argv": _novel_test_argv(
+                    python, exp_name, species, novel_flights, test_mode, stage, exclude, place,
+                )
+            })
+        job_id = datetime.now().strftime("%Y%m%d%H%M%S") + f"{index:06d}"
+        command = "\n".join(_command_text(step["argv"]) for step in steps)
+        if any(step.get("init_from") for step in steps):
+            command += f"\n# then load weights from {base_name}"
+        job = {
+            "id": job_id,
+            "status": "queued",
+            "created": _now(),
+            "started": None,
+            "finished": None,
+            "exp_name": scored,
+            "data": data,
+            "model": model,
+            "command": command,
+            "run_test": run_test,
+            "exit_code": None,
+            "error": None,
+            "wait_reason": "",
+            "fewshot": {
+                "species": species,
+                "flight": chosen,
+                "schedule": schedule,
+                "test": test_mode,
+                "data": data,
+                "model": model,
+                "seed": seed,
+                "max_epochs": epochs,
+                "ft_epochs": ft_epochs,
+                "lr": lr,
+                "ft_lr": ft_lr,
+                "batch_size_train": batch_train,
+                "precision": precision,
+                "check_val_every_n_epoch": every,
+                "ft_check_val_every_n_epoch": FT_VAL_EVERY if schedule == "two_stage" else None,
+                "exclude": exclude,
+                "place": place,
+                "finetune": finetune,
+                "steps": meta,
+                "base_exp": base_name if schedule == "two_stage" else None,
+            },
+        }
+        spec = {"steps": steps, "plan": one_plan}
+        made.append((job, spec))
+
+    with _lock:
+        JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        for job, spec in made:
+            (JOBS_DIR / f"{job['id']}.spec.json").write_text(json.dumps(spec))
+        jobs = _load()
+        jobs.extend(job for job, _spec in made)
+        _save(_trim(jobs))
+    first = _public(made[0][0])
+    first["queued"] = [job["id"] for job, _spec in made]
+    return first
+
+
+def fewshot_state(job_id):
+    """Plan, per-step progress, and the novel-species test scores."""
+    import novel_plan
+
+    job_id = _job_id(job_id)
+    with _lock:
+        jobs = [_reconcile(job) for job in _load()]
+        _save(jobs)
+    job = next((item for item in jobs if item["id"] == job_id), None)
+    if job is None or not job.get("fewshot"):
+        raise JobError("unknown few-shot job")
+    spec_path = JOBS_DIR / f"{job_id}.spec.json"
+    try:
+        spec = json.loads(spec_path.read_text()) if spec_path.is_file() else {}
+    except json.JSONDecodeError:
+        spec = {}
+    steps = []
+    for step in job["fewshot"].get("steps") or []:
+        steps.append({
+            "kind": step.get("kind"),
+            "exp_name": step.get("exp_name"),
+            "progress": novel_plan.read_progress(step.get("exp_name") or ""),
+        })
+    return {
+        "job": _public(job),
+        "plan": spec.get("plan"),
+        "steps": steps,
+        "metrics": novel_plan.read_novel_metrics(job["exp_name"]),
     }
 
 
@@ -721,6 +1076,12 @@ def enqueue(body):
     overrides = [_check_override(item) for item in body.get("overrides") or []]
     if len(overrides) > 40:
         raise JobError("too many overrides")
+
+    if body.get("novel"):
+        return _enqueue_fewshot(
+            body, python, data, model, seed, epochs, every, lr,
+            batch_train, batch_val, precision, logger,
+        )
 
     job_id = datetime.now().strftime("%Y%m%d%H%M%S") + f"{datetime.now().microsecond:06d}"
     exp_name = resolve_exp_name(body, data, model, seed)
