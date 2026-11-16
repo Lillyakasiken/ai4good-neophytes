@@ -1,12 +1,13 @@
-"""One figure for the corrected S. inaequidens fine-tunes.
+"""One figure per novel-species fine-tune.
 
-Each run learns the new species from a single flight, then is scored on the
+Each run learns one new species from a single flight, then is scored on the
 other flights. The top panel is that training flight against the pooled test.
 The bottom panel is the same test, one cell per flight.
 
-The 20261109_152445 fine-tunes used a learning rate of 0.001 and collapsed.
-This figure reads only the 20261110_183106 batch. Re-run it as later flights
-finish; a flight with no test yet is left blank.
+Runs are read from lightning_logs. A species is whatever appears in a
+``_nv{species}_{flight}_ft_fl`` directory. For each species only the latest
+stamp is drawn, so an earlier batch that collapsed is left out. Re-run this
+as later flights finish; a flight with no test yet is left blank.
 """
 
 from pathlib import Path
@@ -17,11 +18,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Patch, Rectangle
 
-STAMP = "20261110_183106"
-SPECIES = "S_inaequidens"
-FLIGHT_RE = re.compile(rf"^{STAMP}.*_nv{SPECIES}_(?P<flight>.+)_ft_fl$")
+RUN_RE = re.compile(
+    r"^(?P<stamp>\d{8}_\d{6}).*_nv(?P<species>[A-Za-z]+_[A-Za-z]+)_(?P<flight>.+)_ft_fl$"
+)
 BEST_RE = re.compile(r"New best score:\s*([0-9.]+)")
 EPOCH_RE = re.compile(r"Epoch\s+\d+:\s+100%.*?val_f1_species=([0-9.]+).*?val_f1_novel=([0-9.]+)")
 
@@ -108,18 +109,29 @@ def _epoch_scores(text):
     return species
 
 
-def val_species_f1(root, run, flight):
-    """val_f1_species from the same epoch as the best val_f1_novel."""
-    needle = f"{STAMP}"
-    flight_name = f"_nv{SPECIES}_{flight}_ft_fl"
-    texts = [log.read_text(errors="replace") for log in sorted(run.glob("hydra/*/train_neophyte_semseg.log"))]
+def _job_heads(root):
+    """First slice of each queued-job log, read once for every flight."""
+    cached = getattr(_job_heads, "cache", None)
+    if cached is not None and cached[0] == root:
+        return cached[1]
     jobs = root / "explorer" / "cache" / "jobs"
+    heads = []
     if jobs.is_dir():
         for log in sorted(jobs.glob("*.log")):
-            head = log.read_text(errors="replace")[:40000]
-            if needle not in head or flight_name not in head:
-                continue
-            texts.append(log.read_text(errors="replace"))
+            heads.append((log, log.read_text(errors="replace")[:40000]))
+    _job_heads.cache = (root, heads)
+    return heads
+
+
+def val_species_f1(root, run, flight, species, stamp):
+    """val_f1_species from the same epoch as the best val_f1_novel."""
+    needle = stamp
+    flight_name = f"_nv{species}_{flight}_ft_fl"
+    texts = [log.read_text(errors="replace") for log in sorted(run.glob("hydra/*/train_neophyte_semseg.log"))]
+    for log, head in _job_heads(root):
+        if needle not in head or flight_name not in head:
+            continue
+        texts.append(log.read_text(errors="replace"))
     for text in texts:
         score = _epoch_scores(text)
         if score is not None:
@@ -136,11 +148,27 @@ def val_species_f1(root, run, flight):
     return float(np.mean(finite))
 
 
-def finished_runs(root):
+def latest_batches(root):
+    """Latest fine-tune stamp for each species that has a flight run."""
+    stamps = {}
+    for run in (root / "lightning_logs").iterdir():
+        match = RUN_RE.search(run.name)
+        if not match or not run.is_dir():
+            continue
+        species = match.group("species")
+        stamp = match.group("stamp")
+        if stamp > stamps.get(species, ""):
+            stamps[species] = stamp
+    return [(species, stamps[species]) for species in sorted(stamps)]
+
+
+def finished_runs(root, species, stamp):
     records = []
     for run in sorted((root / "lightning_logs").iterdir()):
-        match = FLIGHT_RE.search(run.name)
+        match = RUN_RE.search(run.name)
         if not match or not run.is_dir():
+            continue
+        if match.group("species") != species or match.group("stamp") != stamp:
             continue
         flight = match.group("flight")
         metrics = novel_metrics(run)
@@ -150,7 +178,7 @@ def finished_runs(root):
             continue
         records.append({
             "flight": flight,
-            "val_species": val_species_f1(root, run, flight),
+            "val_species": val_species_f1(root, run, flight, species, stamp),
             "validation": validation,
             "novel": None if metrics is None else metrics.get("novel_f1"),
             "same": None if metrics is None else metrics.get("same_site_f1"),
@@ -158,6 +186,7 @@ def finished_runs(root):
             "per_flight": [] if metrics is None else list(metrics.get("per_flight") or []),
             "tiles": None if metrics is None else metrics.get("eval_tiles"),
             "tiles_full": None if metrics is None else metrics.get("eval_tiles_full"),
+            "other_per_flight": None if metrics is None else metrics.get("eval_other_per_flight"),
             "progress": progress,
         })
     return records
@@ -178,7 +207,7 @@ def _finite(value):
     return bool(np.isfinite(value))
 
 
-def draw_summary(ax, records):
+def draw_summary(ax, records, label):
     measures = [
         ("val_species", "val_f1_species", "#1d3557", None),
         ("validation", "val_f1_novel", "#08519c", None),
@@ -189,7 +218,7 @@ def draw_summary(ax, records):
     positions = np.arange(len(records))
     height = 0.14
     offsets = np.linspace(-(len(measures) - 1) / 2, (len(measures) - 1) / 2, len(measures)) * 0.16
-    for offset, (key, label, color, hatch) in zip(offsets, measures):
+    for offset, (key, name, color, hatch) in zip(offsets, measures):
         for index, record in enumerate(records):
             value = record[key]
             y = positions[index] + offset
@@ -198,7 +227,7 @@ def draw_summary(ax, records):
                 continue
             ax.barh(
                 y, value, height=height, color=color, hatch=hatch,
-                edgecolor="0.25", linewidth=0.4, label=label if index == 0 else None,
+                edgecolor="0.25", linewidth=0.4,
             )
             ax.text(value + 0.015, y, f"{float(value):.3f}", va="center", ha="left", fontsize=7.5, color="0.15")
     labels = []
@@ -217,10 +246,10 @@ def draw_summary(ax, records):
         0, 1.02,
         "\n".join([
             "val_f1_species is the mean F1 of every species on the training flight.",
-            "val_f1_novel is the F1 of S. inaequidens on that same validation.",
+            f"val_f1_novel is the F1 of {label} on that same validation.",
             "test F1-avg-wo0 is the mean F1 of every species on the test.",
-            "novel_f1 is the F1 of S. inaequidens on flights at other sites.",
-            "same_site_f1 is the F1 of S. inaequidens on another date of the training site.",
+            f"novel_f1 is the F1 of {label} on flights at other sites.",
+            f"same_site_f1 is the F1 of {label} on another date of the training site.",
         ]),
         transform=ax.transAxes, ha="left", va="bottom", fontsize=8, color="0.25", linespacing=1.35,
     )
@@ -228,7 +257,16 @@ def draw_summary(ax, records):
     ax.tick_params(length=0, labelsize=8)
     for spine in ax.spines.values():
         spine.set_visible(False)
-    ax.legend(frameon=False, loc="lower right", fontsize=8)
+    # Always list every measure. Labelling only the first flight drops a series
+    # when that flight has no score (e.g. same_site_f1).
+    handles = [
+        Patch(facecolor=color, edgecolor="0.25", linewidth=0.4, hatch=hatch, label=name)
+        for _, name, color, hatch in measures
+    ]
+    ax.legend(
+        handles=handles, frameon=False, loc="lower right",
+        bbox_to_anchor=(1.0, 1.02), fontsize=8, borderaxespad=0,
+    )
 
 
 def _row_rank(values):
@@ -238,7 +276,7 @@ def _row_rank(values):
     return (0, -max(finite))
 
 
-def draw_flights(ax, records):
+def draw_flights(ax, records, label):
     """Scored flight by training flight. Best row first. Colour is fixed at 0..1."""
     tested = [record for record in records if record["per_flight"]]
     columns = [record["flight"] for record in tested]
@@ -280,21 +318,27 @@ def draw_flights(ax, records):
                 (j - 0.5, i - 0.5), 1, 1,
                 facecolor=cmap(float(value)), edgecolor="white", linewidth=1.2,
             ))
-            same = cell.get("role") == "same_site"
             ax.text(
                 j, i, f"{float(value):.2f}", ha="center", va="center",
                 fontsize=8, color=_ink(float(value)),
-                fontweight="bold" if same else "regular",
             )
+    caps = [record.get("other_per_flight") for record in tested if record.get("other_per_flight") is not None]
+    other_cap = int(caps[0]) if caps else 20
     ax.set_xticks(range(len(columns)), [flight_label(record["flight"]) for record in tested], fontsize=8)
     ax.set_yticks(range(len(rows)), [flight_label(name) for name in rows], fontsize=8)
     ax.set_xlim(-0.5, len(columns) - 0.5)
     ax.set_ylim(len(rows) - 0.5, -0.5)
-    ax.set_title("Per-flight F1 of S. inaequidens", loc="left", fontsize=11, pad=16)
     ax.text(
-        0, 1.012,
-        "F1 of this species on each flight. Grey is the training flight. Bold is another date of that site.",
-        transform=ax.transAxes, ha="left", va="bottom", fontsize=9, color="0.25",
+        0, 1.01,
+        "\n".join([
+            f"Per-flight F1 of {label}",
+            f"F1 of {label} on each flight.",
+            f"Every tile that has {label} in the mask.",
+            f"Plus up to {other_cap} other tiles from that flight (mix of other species and empty), so false positives still count.",
+        ]),
+        transform=ax.transAxes, ha="left", va="bottom",
+        fontsize=8, fontweight="normal", color="0.25", linespacing=1.15,
+        clip_on=False,
     )
     ax.tick_params(length=0)
     for spine in ax.spines.values():
@@ -303,11 +347,12 @@ def draw_flights(ax, records):
     return rows, columns
 
 
-def main():
-    root = repo_root()
-    records = finished_runs(root)
+def plot_species(root, species, stamp):
+    label = species_label(species)
+    records = finished_runs(root, species, stamp)
     if not records:
-        raise SystemExit(f"No {SPECIES} fine-tunes found for {STAMP}.")
+        print(f"skip {label}: no scored fine-tunes for {stamp}")
+        return None
     tested = [record for record in records if record["per_flight"]]
     n_rows = 0
     if tested:
@@ -317,34 +362,34 @@ def main():
             names.update(cell["flight"] for cell in record["per_flight"])
         n_rows = len(names)
     width = max(8.4, 3.2 + 1.35 * max(1, len(tested)))
-    height = 1.7 + 0.72 * len(records) + (0.34 * n_rows if n_rows else 0.4)
+    height = 2.0 + 0.72 * len(records) + (0.34 * n_rows if n_rows else 0.4)
     fig = plt.figure(figsize=(width, height))
-    fig.suptitle(species_label(SPECIES), x=0.01, ha="left", fontsize=13)
+    fig.suptitle(label, x=0.01, ha="left", fontsize=13)
     fig.subplots_adjust(left=0.16, right=0.88, top=0.84, bottom=0.04)
     if n_rows:
         grid = fig.add_gridspec(
-            2, 1, height_ratios=[0.85 * len(records) + 2.3, 0.34 * n_rows], hspace=0.18,
+            2, 1, height_ratios=[0.85 * len(records) + 2.3, 0.34 * n_rows], hspace=0.30,
         )
         ax_bars = fig.add_subplot(grid[0])
         ax_heat = fig.add_subplot(grid[1])
-        draw_summary(ax_bars, records)
-        draw_flights(ax_heat, records)
+        draw_summary(ax_bars, records, label)
+        draw_flights(ax_heat, records, label)
         mappable = ScalarMappable(norm=Normalize(0, 1), cmap=plt.cm.viridis)
         heat_box = ax_heat.get_position()
         cax = fig.add_axes([heat_box.x1 + 0.012, heat_box.y0, 0.014, heat_box.height])
         bar = fig.colorbar(mappable, cax=cax)
-        bar.set_label("S. inaequidens F1", fontsize=9)
+        bar.set_label(f"{label} F1", fontsize=9)
         bar.outline.set_visible(False)
         bar.ax.tick_params(labelsize=8)
     else:
         ax_bars = fig.add_subplot(111)
-        draw_summary(ax_bars, records)
+        draw_summary(ax_bars, records, label)
     out = root / "notebooks" / "few_shot_site_figures"
     out.mkdir(parents=True, exist_ok=True)
-    path = out / "s_inaequidens_finetune.png"
+    path = out / f"{species.lower()}_finetune.png"
     fig.savefig(path, dpi=160)
     plt.close(fig)
-    print(f"wrote {path}")
+    print(f"wrote {path} ({stamp}, {len(records)} flights)")
     for record in records:
         def shown(value):
             return "—" if value is None else f"{value:.3f}"
@@ -355,6 +400,19 @@ def main():
             f"novel_f1 {shown(record['novel'])}, same_site_f1 {shown(record['same'])}"
         )
     return path
+
+
+def main():
+    root = repo_root()
+    batches = latest_batches(root)
+    if not batches:
+        raise SystemExit("No novel-species flight fine-tunes found in lightning_logs/.")
+    paths = []
+    for species, stamp in batches:
+        path = plot_species(root, species, stamp)
+        if path is not None:
+            paths.append(path)
+    return paths
 
 
 if __name__ == "__main__":
