@@ -18,7 +18,7 @@ def _has_elevation(image_dirs):
     return False
 
 class NeophyteDataModule(pl.LightningDataModule):
-    def __init__(self, image_dirs, classes, transform_train, transform_val, transform_test, dsm_transform=False, ndsm_transform=False, dataset_stats=None, weighted_sampling=False, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, val_few_shot_k=None, val_few_shot_mode='all', val_few_shot_bg_k=0, pick_few_shot_k=10, pick_few_shot_mode='max_px_site_pheno', pick_few_shot_bg_k=0, load_into_ram=False, batch_size_train=16, batch_size_val=16, batch_size_test=16, num_workers=4):
+    def __init__(self, image_dirs, classes, transform_train, transform_val, transform_test, dsm_transform=False, ndsm_transform=False, dataset_stats=None, weighted_sampling=False, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, val_few_shot_k=None, val_few_shot_mode='all', val_few_shot_bg_k=0, pick_few_shot_k=10, pick_few_shot_mode='max_px_site_pheno', pick_few_shot_bg_k=0, load_into_ram=False, batch_size_train=16, batch_size_val=16, batch_size_test=16, num_workers=4, few_shot_seed=None):
         super().__init__()
         self.image_dirs = ensure_list_values(image_dirs)
         self.classes = classes
@@ -42,6 +42,7 @@ class NeophyteDataModule(pl.LightningDataModule):
         self.few_shot_k = few_shot_k
         self.few_shot_mode = few_shot_mode
         self.few_shot_bg_k = few_shot_bg_k
+        self.few_shot_seed = few_shot_seed
         self.max_nodata_frac = max_nodata_frac
         self.val_few_shot_k = val_few_shot_k
         self.val_few_shot_mode = val_few_shot_mode
@@ -59,7 +60,7 @@ class NeophyteDataModule(pl.LightningDataModule):
         # Initialize Datasets
         if stage == "fit" and not hasattr(self, "train_dataset") or stage is None:
             # # Train dataset
-            self.train_dataset = NeophyteDataset(self.image_dirs.train, self.classes, transform=self.transform_train, dsm_transform=self.dsm_transform, ndsm_transform=self.ndsm_transform, dataset_stats=self.dataset_stats, weighted_sampling=self.weighted_sampling, cap_quantile=self.cap_quantile, lift_quantile=self.lift_quantile, bg_fraction=self.bg_fraction, min_strat_images=self.min_strat_images, value_mapping=self.value_mapping, ignore_index=self.ignore_index, load_auxiliary=self.load_auxiliary, load_dsm=self.load_dsm, load_dtm=self.load_dtm, load_ndsm=self.load_ndsm, few_shot_k=self.few_shot_k, few_shot_mode=self.few_shot_mode, few_shot_bg_k=self.few_shot_bg_k, max_nodata_frac=self.max_nodata_frac, load_into_ram=self.load_into_ram, preload_workers=self.num_workers)
+            self.train_dataset = NeophyteDataset(self.image_dirs.train, self.classes, transform=self.transform_train, dsm_transform=self.dsm_transform, ndsm_transform=self.ndsm_transform, dataset_stats=self.dataset_stats, weighted_sampling=self.weighted_sampling, cap_quantile=self.cap_quantile, lift_quantile=self.lift_quantile, bg_fraction=self.bg_fraction, min_strat_images=self.min_strat_images, value_mapping=self.value_mapping, ignore_index=self.ignore_index, load_auxiliary=self.load_auxiliary, load_dsm=self.load_dsm, load_dtm=self.load_dtm, load_ndsm=self.load_ndsm, few_shot_k=self.few_shot_k, few_shot_mode=self.few_shot_mode, few_shot_bg_k=self.few_shot_bg_k, few_shot_seed=self.few_shot_seed, max_nodata_frac=self.max_nodata_frac, load_into_ram=self.load_into_ram, preload_workers=self.num_workers)
             # # Val dataset. val_few_shot_k restricts it to labelled images, which makes
             # # validation much faster but also removes every background-only tile -- see
             # # the note in configs/data/data.yaml before switching it on.

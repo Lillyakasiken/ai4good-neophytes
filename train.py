@@ -81,6 +81,7 @@ def main(cfg: DictConfig) -> None:
                                     few_shot_k=cfg.data.few_shot_k,
                                     few_shot_mode=cfg.data.few_shot_mode,
                                     few_shot_bg_k=cfg.data.few_shot_bg_k,
+                                    few_shot_seed=cfg.data.few_shot_seed,
                                     max_nodata_frac=cfg.data.max_nodata_frac,
                                     val_few_shot_k=cfg.data.val_few_shot_k,
                                     val_few_shot_mode=cfg.data.val_few_shot_mode,
@@ -141,18 +142,36 @@ def main(cfg: DictConfig) -> None:
     resume_ckpt_path = last_ckpt_path if os.path.exists(last_ckpt_path) else None
     if resume_ckpt_path:
         print(f'Resuming training from: {resume_ckpt_path}')
+    elif cfg.init_ckpt:
+        # # few-shot fine-tuning: weights only, optimizer and LR schedule start fresh
+        print(f'Initialising the weights from: {cfg.init_ckpt}')
+        model.load_state_dict(torch.load(cfg.init_ckpt, map_location='cpu', weights_only=False)['state_dict'])
+        if cfg.reset_head_classes is not None:
+            classes = cfg.reset_head_classes
+            classes = [classes] if isinstance(classes, int) else list(classes)
+            print(f'Re-initialising the head channels of classes {classes}')
+            model.reset_head_classes(classes)
 
     start_time = time.time()
     trainer.fit(model, dataModule, ckpt_path=resume_ckpt_path)
     print('Training finished. Elapsed Time:', round((time.time() - start_time) / 60, 2), 'min')
 
-    # %% quick test-set pass with the best checkpoint
-    # # (the detailed evaluation lives in test.py)
-    ckpt_path = trainer.checkpoint_callback.best_model_path
-    print('ckpt_path: ', ckpt_path)
-    model = SegmentationModel.load_from_checkpoint(ckpt_path, weights_only=False).to(device)
-    model.eval()
-    trainer.test(model=model, dataloaders=dataModule)
+    # # runs without validation (few-shot fine-tuning) have no best checkpoint
+    if cfg.test_ckpt != 'best':
+        ckpt_path = os.path.join(cfg.ckpt_path, 'final.ckpt')
+        trainer.save_checkpoint(ckpt_path)
+        print('Final weights saved to: ', ckpt_path)
+    if cfg.test_ckpt is None:
+        print('test_ckpt=null: no test pass')
+    else:
+        # %% quick test-set pass with the best (or final) checkpoint
+        # # (the detailed evaluation lives in test.py)
+        if cfg.test_ckpt == 'best':
+            ckpt_path = trainer.checkpoint_callback.best_model_path
+        print('ckpt_path: ', ckpt_path)
+        model = SegmentationModel.load_from_checkpoint(ckpt_path, weights_only=False).to(device)
+        model.eval()
+        trainer.test(model=model, dataloaders=dataModule)
 
     if cfg.logger == 'wandb':
         import wandb

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import warnings
 
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from torch.utils.data import Dataset
 from omegaconf import ListConfig
@@ -43,7 +44,7 @@ def _tile_gsd_mm(src):
 
 
 class NeophyteDataset(Dataset):
-    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False):
+    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False, few_shot_seed=None):
         self.image_dirs = image_dirs if isinstance(image_dirs, ListConfig) or isinstance(image_dirs, list) else [image_dirs]
         self.classes = classes
         self.num_classes = len(classes)
@@ -63,8 +64,9 @@ class NeophyteDataset(Dataset):
             self.load_dsm = True
             self.load_dtm = True
         self.return_dsm_dtm = return_dsm_dtm and load_ndsm  # only meaningful when ndsm is loaded
-        self.few_shot_k = few_shot_k # any number or None (default: None -> full set) (only neophyte classes)
+        self.few_shot_k = few_shot_k # any number or None (default: None -> full set) (only neophyte classes), or {stats_name: k}
         self.few_shot_mode = few_shot_mode
+        self.few_shot_seed = few_shot_seed # fixes the 'random' few-shot draw (None: global numpy RNG)
         self.few_shot_bg_k = few_shot_bg_k # number of fewshot background samples
         self.load_into_ram = load_into_ram
         self.preload_workers = preload_workers
@@ -123,6 +125,10 @@ class NeophyteDataset(Dataset):
         
             # Ensure same ordering as image_files
             self.stats_df = self.stats_df.set_index("img_path").loc[image_files_norm]
+
+            # Classes that value_mapping sends to background count as background here too
+            if self.value_mapping:
+                self._fold_mapped_classes_into_background()
             
             # --- remove images w/o a single pixel in any valid class ---
             total_px = self.stats_df[self.class_px_cols].sum(axis=1)
@@ -183,6 +189,40 @@ class NeophyteDataset(Dataset):
             self._preload_data()
     
     
+    def _fold_mapped_classes_into_background(self):
+        """Count the classes that value_mapping sends to background as background.
+
+        The masks are remapped when a tile is loaded, but weighted sampling and the
+        few-shot selection read the stats CSV, which still lists the original classes.
+        Without this, the tiles of a species held out as background (few-shot
+        evaluation, docs/plantclef2024_vit_analysis_zh.md section 8.3) would still be
+        oversampled as a rare class.
+        """
+        held_out = sorted({int(old) for mapping in self.value_mapping.values() if mapping
+                           for old, new in mapping.items()
+                           if int(new) == 0 and int(old) != 0 and int(old) in self.classes})
+        if not held_out:
+            return
+
+        df = self.stats_df
+        bg_col = class_px_col(self.background_stats_name)
+        for c in held_out:
+            name = self.classes[c]["stats_name"]
+            df[bg_col] += df[class_px_col(name)]
+            df[class_px_col(name)] = 0
+            for col in [*pheno_px_cols(name).values(), f"unknown_{name}_px"]:
+                if col in df.columns:
+                    df[col] = 0
+
+        # # recount which neophytes are left in each tile
+        present = df[[class_px_col(s) for s in self.neophytes_stats_names]].to_numpy() > 0
+        df[only_col(self.background_stats_name)] = (~present.any(axis=1)).astype(int)
+        for j, name in enumerate(self.neophytes_stats_names):
+            df[only_col(name)] = (present[:, j] & (present.sum(axis=1) == 1)).astype(int)
+        print("value_mapping: " + ", ".join(self.classes[c]["name"] for c in held_out)
+              + " counted as background in the dataset stats")
+
+
     def _nodata_frac(self):
         """Per-image fraction of empty (orthophoto-edge) pixels, from the stats CSV."""
         if "nodata_px" not in self.stats_df.columns:
@@ -212,18 +252,26 @@ class NeophyteDataset(Dataset):
         few_shot_bg_k=50,
     ):
         selected = set()
-    
+        counts = {}
+
         # --- per-class few-shot selection ---
+        # # few_shot_k is one k for every class, or {stats_name: k} (unlisted classes: 0),
+        # # e.g. 10 tiles of a new species next to a replay of the known ones
         for class_name in self.neophytes_stats_names:
-            
+            k = few_shot_k.get(class_name, 0) if isinstance(few_shot_k, Mapping) else few_shot_k
+            if not k:
+                continue
+
             idxs = select_few_shot_for_class(
                 df=self.stats_df,
                 class_name=class_name,
-                k=few_shot_k,
+                k=k,
                 mode=few_shot_mode,
+                random_state=self.few_shot_seed,
             )
             selected.update(idxs)
-    
+            counts[class_name] = len(idxs)
+
         # --- optional background-only sampling ---
         if few_shot_bg_k > 0:
             bg_col = f"only_{self.background_stats_name}"
@@ -231,14 +279,18 @@ class NeophyteDataset(Dataset):
                 (self.stats_df[bg_col] == 1) &
                 (~self.stats_df.index.isin(selected))
             ]
-    
+
             if not bg_candidates.empty:
                 bg_selected = bg_candidates.sample(
                     n=min(few_shot_bg_k, len(bg_candidates)),
                     replace=False,
+                    random_state=self.few_shot_seed,
                 ).index.tolist()
-    
+
                 selected.update(bg_selected)
+                counts["background-only"] = len(bg_selected)
+        print("Few-shot subset (" + few_shot_mode + "): "
+              + ", ".join(f"{name} {n}" for name, n in counts.items()))
     
         # --- filter dataset (file lists and stats_df MUST stay in the same order,
         #     otherwise sample_weights get mapped to the wrong images) ---
@@ -708,6 +760,7 @@ def select_few_shot_for_class(
     k,
     mode,
     site_col="site",
+    random_state=None,
 ):
     px_col = class_px_col(class_name)
     only_flag = only_col(class_name)
@@ -724,7 +777,7 @@ def select_few_shot_for_class(
 
     # --- ranking score ---
     if mode == "random":
-        candidates = candidates.sample(frac=1.0)
+        candidates = candidates.sample(frac=1.0, random_state=random_state)
     elif mode == "all":
         candidates = df[df[px_col] > 0].copy() # w/o only_col restriction
     else:

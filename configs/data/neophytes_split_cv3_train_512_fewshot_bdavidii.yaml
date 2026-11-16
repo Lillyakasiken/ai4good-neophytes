@@ -1,0 +1,22 @@
+# Few-shot step of the held-out-species evaluation (docs/plantclef2024_vit_analysis_zh.md
+# section 8.3): fine-tune (train.py init_ckpt=...) or probe (fewshot_probe.py) a model
+# of neophytes_split_cv3_train_512_holdout_bdavidii on k = 10 tiles of B. davidii, now
+# labelled again, next to a replay of the five known species and of background-only
+# tiles. All of them are 'only_*' tiles (a single species, or none), so no tile with
+# an unlabelled B. davidii enters. few_shot_seed picks the draw; the same seed gives
+# the same tiles to every method.
+defaults:
+  - neophytes_split_cv3_train_512
+
+data_name: 'np_cv3_fs1'
+few_shot_k:
+  B_davidii: 10      # the new species
+  R_typhina: 50      # replay of the known ones
+  R_japonica: 50
+  B_orientalis: 50
+  S_inaequidens: 50
+  A_altissima: 50
+few_shot_mode: 'random'
+few_shot_bg_k: 200
+few_shot_seed: 1
+cap_quantile: null   # keep the new species (10 tiles) the most sampled class

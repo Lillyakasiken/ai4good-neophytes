@@ -187,6 +187,22 @@ class SegmentationModel(pl.LightningModule):
     def set_patch_2_img_size(self, new_patch_2_img_size):
         self.hparams.patch_2_img_size = new_patch_2_img_size
 
+    def reset_head_classes(self, classes):
+        """Re-initialise the output channels of ``classes`` in the segmentation head.
+
+        Few-shot fine-tuning: a species that was background in the base training has
+        an output channel trained to lose everywhere, which small fine-tuning steps
+        cannot undo. A fresh channel starts it neutral (same init as SMP's heads).
+        """
+        conv = self.model.segmentation_head[0]
+        fresh = torch.empty_like(conv.weight)
+        nn.init.xavier_uniform_(fresh)
+        with torch.no_grad():
+            for c in classes:
+                conv.weight[c] = fresh[c]
+                if conv.bias is not None:
+                    conv.bias[c] = 0
+
     def configure_optimizers(self):
         params = self.parameters()
         if self.vit is not None and self.hparams.layer_decay:

@@ -17,6 +17,14 @@ defaults:
 exp_name: ${now:%Y%m%d}_${now:%H%M%S.%f}_${data.data_name}_${model.name}_${data.crop_size_train}_s${pl_seed}
 # # To resume a crashed run, set exp_name to its directory: training picks up last.ckpt.
 
+# # Few-shot fine-tuning (fewshot_probe.py, scripts/queues/queue_2026-10-29_fewshot.sh)
+init_ckpt: null  # start from the weights of this checkpoint (new optimizer and LR schedule)
+reset_head_classes: null  # with init_ckpt: re-initialise these output channels (a class or a
+                          # list, e.g. 1) for a species that was background in the base run
+test_ckpt: best  # weights for train.py's test pass: best (val_f1_species), final (end of
+                 # training, saved as checkpoints/final.ckpt) or null (save final.ckpt, no
+                 # test pass). final/null are for runs without validation.
+
 # # Reproducibility
 pl_seed: 42               # False or a seed number
 deterministic_train: False  # True forces deterministic kernels (slower)
