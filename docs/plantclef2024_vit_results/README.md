@@ -10,9 +10,9 @@ Results of [queue_2026-10-20_vit_pc24.sh](../../scripts/queues/queue_2026-10-20_
 
 - **PlantCLEF vs b2:** mean paired ΔF1 −0.072 over the 4 pairs; A. altissima −0.187. The adoption rule fails, so MiT-b2 stays the encoder.
 - **PlantCLEF vs DINOv2 (s42):** +0.026 on cv3, +0.002 on cv1, within b2's seed noise (~0.04).
-- **Frozen features:** at the last validation with a frozen ViT (epoch 5), PlantCLEF reaches 0.63–0.68 and DINOv2 0.46–0.47. Fine-tuning closes this gap.
+- **Frozen features:** at the last validation with a frozen ViT (epoch 5), PlantCLEF reaches 0.62–0.68 and DINOv2 0.46–0.47. Fine-tuning closes this gap.
 - **Val vs test:** PlantCLEF nearly matches b2 on validation (best 0.79–0.81 vs 0.81–0.82) but drop more on the test sites.
-- **Error type:** almost all ViT errors are species pixels predicted as background (lower recall). Confusion between species is near zero for all three encoders.
+- **Error type:** the ViT's extra errors are species pixels predicted as background (PlantCLEF vs b2: species recall 0.57 vs 0.77, precision 0.76 vs 0.67). Confusion between species does not grow; it is mainly A. altissima → R. typhina in all encoders (b2 9%, PlantCLEF 5% of A. altissima pixels), which makes up 39% of PlantCLEF's R. typhina predictions (b2 32%).
 - Each training run took 6.2–7.5 h and peaked at 8–9 GiB of GPU memory.
 
 ## Figures

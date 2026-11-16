@@ -33,6 +33,10 @@ ENC = {'mit_b2': ('MiT-b2', 'C0'),
        'vitb14_pc24': ('PlantCLEF', 'C1'),
        'vitb14_dinov2': ('DINOv2', 'C2')}
 SPECIES = ['A. altissima', 'R. typhina', 'B. davidii', 'R. japonica', 'B. orientalis', 'S. inaequidens']
+# metrics_semseg.json stores per-class scores in SPECIES (display) order, but
+# confusion_matrix.npy is in class-index order: these are the rows of SPECIES
+# (display_order in configs/data/neophytes_names_colors.yaml)
+CONF_ROWS = [6, 2, 1, 3, 4, 5]
 
 
 def load_runs():
@@ -135,7 +139,8 @@ def plot_missed(runs, out):
     x, w = np.arange(len(SPECIES)), 0.26
     for i, (enc, (name, col)) in enumerate(ENC.items()):
         conf = sum(r['conf'] for r in by_enc(runs, enc))
-        ax.bar(x + (i - 1) * w, 100 * conf[1:, 0] / conf[1:].sum(1), w * 0.92, color=col, label=name)
+        ax.bar(x + (i - 1) * w, 100 * conf[CONF_ROWS, 0] / conf[CONF_ROWS].sum(1), w * 0.92,
+               color=col, label=name)
     ax.set_xticks(x, SPECIES, fontsize=9.5)
     ax.set_ylabel('Missed (%)')
     ax.set_ylim(0, 100)
