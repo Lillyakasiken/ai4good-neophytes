@@ -4,11 +4,10 @@
 # #   python train.py model.lr=0.0002 data.batch_size_train=4
 defaults:
   - _self_
-  - data: data
-  - model: model
-  # cv3 is the fold to iterate on, see README section 5
-  - override /data: neophytes_split_cv3_train_1024
-  - override /model: model_neophytes_mit_b2
+  # cv3 is the fold to iterate on, see README section 5. Chosen directly rather than
+  # with 'override' entries, so an experiment config (+experiment=...) can replace them.
+  - data: neophytes_split_cv3_train_1024
+  - model: model_neophytes_mit_b2
 
 # # Run directory name. The timestamp keeps repeated runs of the same config apart,
 # # the seed suffix keeps the runs of a seed sweep apart (a multirun resolves ${now}
