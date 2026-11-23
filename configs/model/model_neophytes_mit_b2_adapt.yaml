@@ -1,0 +1,36 @@
+# Few-shot site adaption (task 1): continue training a received model on the k
+# labelled tiles of one held-out flight. Recipe after Prabhakar et al. 2026
+# (few-shot fine-tuning on target labels only): all layers trained, half the source
+# learning rate, a fixed number of steps, and the final weights are kept. There is no
+# validation on the target (it would need more target labels), so no model selection.
+#
+# Use with train.py init_ckpt=<received checkpoint> data=neophytes_split_cv3_adapt_512,
+# see scripts/queues/queue_2026-11-24_adapt_cv3.sh.
+defaults:
+  - model_neophytes_mit_b2
+  - _self_
+
+lr: 0.00005               # half the received lr (1e-4)
+max_steps: 500            # ends the run; fixed on cv3, then kept for the other folds
+max_epochs: 100000        # never reached: an "epoch" is one pass over the few k tiles
+check_val_every_n_epoch: 100000  # no validation (see above)
+
+lr_scheduler:
+  type: CosineAnnealingLR
+  interval: step          # decay over the steps of the run, not over epochs
+  params:
+    T_max: ${model.max_steps}
+    eta_min: 1e-6
+
+# # No EarlyStopping and no monitored metric: one checkpoint, written at the last step.
+# # test.py picks it with ckpt_type=final.
+callbacks:
+  - type: LearningRateMonitor
+    params:
+      log_momentum: False
+  - type: ModelCheckpoint
+    params:
+      dirpath: ${ckpt_path}
+      filename: final_{step}
+      every_n_train_steps: ${model.max_steps}
+      save_top_k: 1

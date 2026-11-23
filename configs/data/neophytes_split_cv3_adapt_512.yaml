@@ -1,0 +1,41 @@
+# Few-shot site adaption (task 1), fold 3: the training set is k labelled tiles per
+# species, drawn from ONE flight of a held-out site.
+#
+# The k tiles come from the /test and /val folders of that flight. Those folders are
+# not part of the cv3 test set (which uses the /train folders of the held-out sites,
+# see split_cv3.yaml), so the unchanged test set -- and the received model's scores on
+# it -- can serve as the evaluation of the adapted model: the flight's /train tiles
+# are "the rest of the flight", the other flights and sites are the transfer checks.
+#
+# Draw: few_shot_mode=random takes, per species, k random tiles that contain that
+# species alone (select_few_shot_for_class). The shuffle uses the numpy seed set from
+# pl_seed, so pl_seed selects the draw, and with the same seed k=1 is a subset of
+# k=3 is a subset of k=10. A species with fewer candidate tiles than k gets all of them.
+#
+#   python train.py data=neophytes_split_cv3_adapt_512 model=model_neophytes_mit_b2_adapt \
+#       data.adapt_year=2025 data.adapt_flight=Rivera_1_1 data.few_shot_k=3 pl_seed=1 \
+#       init_ckpt=<received cv3 checkpoint>
+defaults:
+  - neophytes_split_cv3_train_512
+  - _self_
+
+adapt_year: 2025
+adapt_flight: Rivera_1_1
+
+# # keeps the np_cv3 prefix, so test.py picks neophytes_split_cv3_test for the run
+data_name: np_cv3_adapt_${data.adapt_flight}_k${data.few_shot_k}
+
+# # train: the flight's tiles outside the cv3 test set; test: the rest of the flight
+# # (only for the quick test pass at the end of train.py); val stays as in split_cv3
+# # and is not run (model_neophytes_mit_b2_adapt.yaml)
+image_dir:
+  train:
+    - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/test
+    - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/val
+  test:
+    - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/train
+
+few_shot_k: 3
+few_shot_mode: random
+few_shot_bg_k: 0          # no background-only tiles (add only if false positives rise)
+weighted_sampling: False  # a handful of tiles: plain shuffling instead of the stratified sampler

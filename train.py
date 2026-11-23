@@ -97,6 +97,12 @@ def main(cfg: DictConfig) -> None:
     print('# Val imgs:   ', len(dataModule.val_dataset))
     print('# Test imgs:  ', len(dataModule.test_dataset))
 
+    # # few-shot runs: record which tiles were drawn (with few_shot_mode=random the draw
+    # # depends on pl_seed), so the draw can be checked and reported per species
+    if cfg.data.few_shot_k is not None:
+        with open(os.path.join(cfg.log_path, 'train_tiles.txt'), 'w') as f:
+            f.write('\n'.join(dataModule.train_dataset.image_files) + '\n')
+
     # # sanity check: one batch through the pipeline before the model is built
     batch = next(iter(dataModule.train_dataloader()))
     print('Image batch shape: ', batch['image'].shape, '\nMask batch shape:  ', batch['mask'].shape)
@@ -123,6 +129,7 @@ def main(cfg: DictConfig) -> None:
     else:
         logger = CSVLogger(cfg.log_dir, name=cfg.exp_name)
     trainer = pl.Trainer(max_epochs=cfg.model.max_epochs,
+                         max_steps=cfg.model.max_steps,
                          precision=cfg.model.precision,
                          callbacks=callbacks,
                          logger=logger,
@@ -137,6 +144,11 @@ def main(cfg: DictConfig) -> None:
     resume_ckpt_path = last_ckpt_path if os.path.exists(last_ckpt_path) else None
     if resume_ckpt_path:
         print(f'Resuming training from: {resume_ckpt_path}')
+    elif cfg.init_ckpt:
+        # # few-shot adaption: continue from a trained model's weights (not a resume)
+        print(f'Initialising weights from: {cfg.init_ckpt}')
+        state_dict = torch.load(cfg.init_ckpt, map_location='cpu', weights_only=False)['state_dict']
+        model.load_state_dict(state_dict)
 
     start_time = time.time()
     trainer.fit(model, dataModule, ckpt_path=resume_ckpt_path)

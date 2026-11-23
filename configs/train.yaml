@@ -17,6 +17,11 @@ defaults:
 exp_name: ${now:%Y%m%d}_${now:%H%M%S.%f}_${data.data_name}_${model.name}_${data.crop_size_train}_s${pl_seed}
 # # To resume a crashed run, set exp_name to its directory: training picks up last.ckpt.
 
+# # Start from the weights of a trained checkpoint (few-shot adaption) instead of the
+# # pretrained encoder. Only the weights are taken: optimizer, LR schedule and epoch
+# # counter start fresh with this run's settings. null = normal training.
+init_ckpt: null
+
 # # Reproducibility
 pl_seed: 42               # False or a seed number
 deterministic_train: False  # True forces deterministic kernels (slower)

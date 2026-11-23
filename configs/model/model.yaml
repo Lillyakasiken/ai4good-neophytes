@@ -31,6 +31,7 @@ fusion_mode: concat
 patch_2_img_size: False
 
 max_epochs: 50
+max_steps: -1         # -1 = no step limit (max_epochs ends the run); a few-shot run sets a step count
 lr: 0.0001
 optimizer: AdamW      # AdamW or Adam
 loss: Focal           # Focal (down-weights the dominant background) or CE
