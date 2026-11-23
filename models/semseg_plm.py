@@ -276,6 +276,16 @@ class SegmentationModel(pl.LightningModule):
         for i, f1 in enumerate(getattr(self, f"{stage}_f1_per_class").compute()):
             self.log(f"{stage}_f1_class_{i}", f1, prog_bar=False)
 
+        # # precision and recall per class, to tell false positives from missed plants;
+        # # a class that is never predicted (precision) or never present (recall) is skipped
+        stats = getattr(self, f"{stage}_stats").compute()
+        tp, fp, fn = stats[:, 0].float(), stats[:, 1].float(), stats[:, 3].float()
+        for i in range(stats.shape[0]):
+            if tp[i] + fp[i] > 0:
+                self.log(f"{stage}_precision_class_{i}", tp[i] / (tp[i] + fp[i]), prog_bar=False)
+            if tp[i] + fn[i] > 0:
+                self.log(f"{stage}_recall_class_{i}", tp[i] / (tp[i] + fn[i]), prog_bar=False)
+
         if stage == 'train' and self.elevation_fusion is not None:
             for k, v in self.elevation_fusion.get_fusion_scales().items():
                 self.log(k, v, prog_bar=False)
