@@ -31,6 +31,7 @@ CAL_STEPS=${CAL_STEPS:-"250 500 1000 2000"}
 FLIGHTS=${FLIGHTS:-"2024/Basel_2_3 2025/Dornach_1_1 2025/Rivera_1_1 2024/Waltenschwil_1_1"}
 KS=${KS:-"1 3 10"}
 SEEDS=${SEEDS:-"1 2 3"}
+EXPERIMENT=${EXPERIMENT:-adapt_cv3_finetune}   # training config in configs/experiment/
 
 # # the received cv3 model (512 crops, seed 42), as named in adapt_cv3_finetune.yaml
 RECEIVED=20261013_002801.261406_np_cv3_Unet_mit_b2_512_s42
@@ -86,11 +87,11 @@ test_received() {
 # adapt <year/flight> <k> <seed> <steps> <flight|site>: fine-tune, then score
 adapt() {
     local year=${1%%/*} flight=${1##*/} k=$2 seed=$3 steps=$4 scope=$5
-    local name=${flight}_k${k}_steps${steps}_s${seed}
-    run_job "train_$name" python train.py +experiment=adapt_cv3_finetune \
+    local name=${flight}_k${k}_${EXPERIMENT}_steps${steps}_s${seed}
+    run_job "train_$name" python train.py +experiment="$EXPERIMENT" \
         data.adapt_year="$year" data.adapt_flight="$flight" data.few_shot_k="$k" \
         model.max_steps="$steps" pl_seed="$seed" || return 1
-    local run_dir; run_dir=$(ls -d lightning_logs/*_np_cv3_adapt_${flight}_k${k}_steps${steps}_Unet_mit_b2_512_s${seed} | sort | tail -n 1)
+    local run_dir; run_dir=$(ls -d lightning_logs/*_np_cv3_adapt_${flight}_k${k}_*steps${steps}_Unet_mit_b2_512_s${seed} | sort | tail -n 1)
     run_job "test_$name" python test.py +experiment=adapt_eval exp_name="$(basename "$run_dir")" \
         "$(test_dirs "$1" "$scope")"
 }
@@ -100,7 +101,7 @@ case "$MODE" in
         adapt "$QUICK_FLIGHT" "$QUICK_K" 1 "$MAX_STEPS" site
         test_received "$QUICK_FLIGHT" site
         python adapt_report.py --out "$QUEUE_DIR/report_quick" \
-            --runs "*np_cv3_adapt_${QUICK_FLIGHT##*/}_k${QUICK_K}_steps${MAX_STEPS}_*_s1" \
+            --runs "*np_cv3_adapt_${QUICK_FLIGHT##*/}_k${QUICK_K}_*steps${MAX_STEPS}_*_s1" \
             --baseline "$(ls -d lightning_logs/$RECEIVED/test_*/quantitative | sort | tail -n 1)/metrics_semseg_site.json"
         ;;
     baseline)

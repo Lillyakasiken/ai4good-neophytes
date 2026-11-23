@@ -22,7 +22,7 @@ adapted site) is skipped for that run.
 
 Outputs (--out): runs.csv, one row per run x set x species (F1, precision, recall of
 both models, number of tiles with the species, number of k tiles with it), and
-summary.csv, the mean and std over the draws (seeds) per flight x k x set x species.
+summary.csv, the mean and std over the draws (seeds) per variant x flight x k x set x species.
 """
 
 import argparse
@@ -37,8 +37,9 @@ import yaml
 
 from utils.eval_utils import metrics_from_confusion
 
-# # run directory name: <date>_<time>_np_cv3_adapt_<flight>_k<k>_<model>_<crop>_s<seed>
-RUN_RE = re.compile(r'_np_cv\d+_adapt_(?P<flight>.+)_k(?P<k>\d+)_.*_s(?P<seed>\d+)$')
+# # run directory name: <date>_<time>_np_cv3_adapt_<flight>_k<k>_<variant>_Unet_<encoder>_<crop>_s<seed>,
+# # where <variant> is e.g. steps500 (plain fine-tuning) or tp05_steps500 (an experiment variant)
+RUN_RE = re.compile(r'_np_cv\d+_adapt_(?P<flight>.+)_k(?P<k>\d+)_(?P<variant>.+?)_Unet_.*_s(?P<seed>\d+)$')
 
 
 def site_of(flight):
@@ -102,7 +103,7 @@ def main():
         if m is None or not adapted:
             print(f'  skipped (no adaption run name or no test.py pass of the final checkpoint): {name}')
             continue
-        flight, k, seed = m['flight'], int(m['k']), int(m['seed'])
+        flight, k, seed, variant = m['flight'], int(m['k']), int(m['seed']), m['variant']
 
         # # which species the k tiles contain (train.py writes the drawn tiles)
         with open(os.path.join(run_dir, 'train_tiles.txt')) as f:
@@ -124,7 +125,7 @@ def main():
             for c, s in species.items():
                 if n_tiles[c] < args.min_tiles:
                     continue
-                rows.append({'run': name, 'flight': flight, 'k': k, 'seed': seed, 'set': set_name,
+                rows.append({'run': name, 'variant': variant, 'flight': flight, 'k': k, 'seed': seed, 'set': set_name,
                              'species': s, 'n_tiles': n_tiles[c], 'k_tiles': k_tiles[c],
                              'F1_base': base['F1'][c], 'F1_adapt': adapt['F1'][c],
                              'P_base': base['Precision'][c], 'P_adapt': adapt['Precision'][c],
@@ -135,8 +136,8 @@ def main():
     runs = pd.DataFrame(rows)
     runs['dF1'] = runs['F1_adapt'] - runs['F1_base']
 
-    # %% mean and std over the draws (seeds), per flight x k x set x species
-    keys = ['flight', 'k', 'set', 'species']
+    # %% mean and std over the draws (seeds), per variant x flight x k x set x species
+    keys = ['variant', 'flight', 'k', 'set', 'species']
     summary = runs.groupby(keys).agg(
         n_draws=('seed', 'nunique'), n_tiles=('n_tiles', 'first'), k_tiles=('k_tiles', 'mean'),
         F1_base=('F1_base', 'first'), F1_adapt=('F1_adapt', 'mean'), F1_adapt_std=('F1_adapt', 'std'),

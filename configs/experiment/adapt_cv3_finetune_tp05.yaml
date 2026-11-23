@@ -1,0 +1,48 @@
+# @package _global_
+# Task 1, phase 1, variant (b): as adapt_cv3_finetune, but only half of the training
+# crops are anchored on a plant (targeted_prob 0.5 instead of 0.95). The other half are
+# random windows of the k tiles, so the plant-free parts of the k tiles -- the site's own
+# background -- appear more often. Aim: fewer false positives after fine-tuning.
+#
+#   python train.py +experiment=adapt_cv3_finetune_tp05 \
+#       data.adapt_year=2024 data.adapt_flight=Basel_2_3 data.few_shot_k=10 pl_seed=1
+defaults:
+  - adapt_cv3_finetune
+  - _self_
+
+data:
+  train_transforms:
+    - type: TargetedRandomResizedCrop
+      params:
+        p: 1.0
+        size: ${data.crop_size_train_tuple}
+        scale: [0.050, 0.075]
+        ratio: [0.95, 1.05]
+        interpolation: ${data.interpolation}
+        targeted_prob: 0.5
+        anchor_mode: spatial
+        ignore_index: ${data.ignore_index}
+    - type: ColorJitter
+      params:
+        p: 0.5
+        brightness: 0.2
+        contrast: 0.2
+        saturation: 0.2
+        hue: 0.1
+    - type: CLAHE
+      params:
+        p: 0.5
+        clip_limit: 2
+    - type: RandomRotate90
+      params:
+        p: 1.0
+    - type: HorizontalFlip
+      params:
+        p: 0.5
+    - type: Normalize
+      params:
+        mean: ${data.norm_mean}
+        std: ${data.norm_std}
+
+# # the variant tag goes into the run name, so adapt_report.py keeps the runs apart
+exp_name: ${now:%Y%m%d}_${now:%H%M%S.%f}_${data.data_name}_tp05_steps${model.max_steps}_${model.name}_${data.crop_size_train}_s${pl_seed}
