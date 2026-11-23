@@ -195,7 +195,7 @@ class NeophyteDataset(Dataset):
         The masks are remapped when a tile is loaded, but weighted sampling and the
         few-shot selection read the stats CSV, which still lists the original classes.
         Without this, the tiles of a species held out as background (few-shot
-        evaluation, docs/plantclef2024_vit_analysis_zh.md section 8.3) would still be
+        evaluation, docs/plantclef2024_fewshot_en.md section 2.3) would still be
         oversampled as a rare class.
         """
         held_out = sorted({int(old) for mapping in self.value_mapping.values() if mapping
@@ -261,12 +261,16 @@ class NeophyteDataset(Dataset):
             k = few_shot_k.get(class_name, 0) if isinstance(few_shot_k, Mapping) else few_shot_k
             if not k:
                 continue
+            # # few_shot_mode is one mode for every class, or {stats_name: mode} (unlisted
+            # # classes: random), e.g. a new species drawn from one flight (random_flight)
+            # # next to a random replay of the known ones
+            mode = few_shot_mode.get(class_name, "random") if isinstance(few_shot_mode, Mapping) else few_shot_mode
 
             idxs = select_few_shot_for_class(
                 df=self.stats_df,
                 class_name=class_name,
                 k=k,
-                mode=few_shot_mode,
+                mode=mode,
                 random_state=self.few_shot_seed,
             )
             selected.update(idxs)
@@ -289,7 +293,7 @@ class NeophyteDataset(Dataset):
 
                 selected.update(bg_selected)
                 counts["background-only"] = len(bg_selected)
-        print("Few-shot subset (" + few_shot_mode + "): "
+        print("Few-shot subset (" + str(few_shot_mode) + "): "
               + ", ".join(f"{name} {n}" for name, n in counts.items()))
     
         # --- filter dataset (file lists and stats_df MUST stay in the same order,
@@ -754,6 +758,11 @@ def pheno_px_cols(class_name):
         "fruiting": f"fruiting_{class_name}_px",
     }
 
+def _tile_flight(path):
+    """Flight (e.g. ``Basel_4_2``) of a tile path ``.../<flight>/<split>/images/<tile>``."""
+    return os.path.normpath(path).split(os.sep)[-4]
+
+
 def select_few_shot_for_class(
     df,
     class_name,
@@ -774,6 +783,41 @@ def select_few_shot_for_class(
 
     if candidates.empty:
         return []
+
+    # --- all k tiles from ONE flight (the <site>_<flight> folder of a tile) ---
+    # A new species is first labelled where it was found, not at k places at once.
+    # Flights with at least k candidate tiles are eligible (none: the largest one);
+    # random_state picks among them in turn, so seeds 1, 2, 3 are three different
+    # flights whenever three are eligible.
+    if mode == "random_flight":
+        flights = candidates.index.map(_tile_flight)
+        counts = flights.value_counts()
+        eligible = sorted(counts.index[counts >= k]) or [counts.idxmax()]
+        if random_state is None:
+            flight = eligible[np.random.randint(len(eligible))]
+        else:
+            flight = eligible[(int(random_state) - 1) % len(eligible)]
+        candidates = candidates[flights == flight].sample(frac=1.0, random_state=random_state)
+        return candidates.head(k).index.tolist()
+
+    # --- k tiles spread over n flights, about k/n from each (random_flights<n>) ---
+    # The labelling-budget question of docs/plantclef2024_fewshot_en.md section 6.5:
+    # n = 1 is one flight, n >= k one tile per flight. Flights with at least ceil(k/n)
+    # candidate tiles are eligible; random_state picks n of them. With fewer eligible
+    # flights, all of them are used and give more tiles each.
+    m = re.fullmatch(r"random_flights(\d+)", str(mode))
+    if m:
+        n = int(m.group(1))
+        flights = candidates.index.map(_tile_flight)
+        counts = flights.value_counts()
+        per = int(np.ceil(k / n))
+        eligible = sorted(counts.index[counts >= per]) or sorted(counts.index)
+        rng = np.random.RandomState(None if random_state is None else int(random_state))
+        chosen = list(rng.choice(eligible, size=min(n, len(eligible)), replace=False))
+        shuffled = candidates.sample(frac=1.0, random_state=random_state)
+        shuffled_flights = shuffled.index.map(_tile_flight)
+        groups = {f: shuffled.index[shuffled_flights == f].tolist() for f in chosen}
+        return fair_sample(groups, k)
 
     # --- ranking score ---
     if mode == "random":

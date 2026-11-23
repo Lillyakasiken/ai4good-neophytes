@@ -1,6 +1,6 @@
 # Fold 3, 512 crops, with B. davidii held out: its pixels become background, as for a
 # species nobody has annotated yet. Base training of the few-shot evaluation, see
-# docs/plantclef2024_vit_analysis_zh.md section 8.3; the few-shot step then uses
+# docs/plantclef2024_fewshot_en.md section 2.3; the few-shot step then uses
 # neophytes_split_cv3_train_512_fewshot_bdavidii. The dataset stats follow the mapping
 # (NeophyteDataset._fold_mapped_classes_into_background), so the sampler does not
 # oversample the held-out tiles. train.py's own test pass applies the same mapping,

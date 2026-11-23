@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Queue of Thu 2026-10-29 (docs/plantclef2024_vit_analysis_zh.md, sections 8.3 and 9,
-# step 4): the few-shot benchmark on one held-out species. B. davidii (cv3: the most
+# Queue of Thu 2026-10-29 (docs/plantclef2024_fewshot_en.md, section 1.3):
+# the few-shot benchmark on one held-out species. B. davidii (cv3: the most
 # test pixels and test sites of all species, full-data b2 F1 0.84) is background in the
 # base training of the five other species; then each method gets k = 10 labelled
 # B. davidii tiles (+ a replay of the known species), three draws (few_shot_seed 1/2/3,

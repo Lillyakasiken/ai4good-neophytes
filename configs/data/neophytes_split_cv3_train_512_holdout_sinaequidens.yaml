@@ -1,0 +1,12 @@
+# Fold 3, 512 crops, with S. inaequidens held out: its pixels become background, as for a
+# species nobody has annotated yet. Base training of the few-shot evaluation for this
+# species (docs/plantclef2024_fewshot_en.md sections 2.3 and 6.1), the same as
+# neophytes_split_cv3_train_512_holdout_bdavidii for B. davidii. The few-shot step uses
+# the overrides of fewshot_probe.py (scripts/queues/queue_2026-11-23_fewshot_next.sh).
+defaults:
+  - neophytes_split_cv3_train_512
+
+data_name: 'np_cv3_ho5'
+value_mapping:
+  Neophytes:
+    5: 0  # S. inaequidens -> background

@@ -1,5 +1,5 @@
-# Few-shot step of the held-out-species evaluation (docs/plantclef2024_vit_analysis_zh.md
-# section 8.3): fine-tune (train.py init_ckpt=...) or probe (fewshot_probe.py) a model
+# Few-shot step of the held-out-species evaluation (docs/plantclef2024_fewshot_en.md
+# section 2.3): fine-tune (train.py init_ckpt=...) or probe (fewshot_probe.py) a model
 # of neophytes_split_cv3_train_512_holdout_bdavidii on k = 10 tiles of B. davidii, now
 # labelled again, next to a replay of the five known species and of background-only
 # tiles. All of them are 'only_*' tiles (a single species, or none), so no tile with
