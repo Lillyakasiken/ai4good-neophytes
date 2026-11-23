@@ -4,7 +4,7 @@
 # Settings: configs/experiment/adapt_cv3_finetune.yaml (training) and
 # configs/experiment/adapt_eval.yaml (scoring); results: adapt_report.py.
 #
-#   MODE=quick      one run (QUICK_FLIGHT, k=3, seed 1, MAX_STEPS) and the received model,
+#   MODE=quick      one run (QUICK_FLIGHT, QUICK_K, seed 1, MAX_STEPS) and the received model,
 #                   both scored on the rest of that flight only, then the report.
 #   MODE=baseline   the received model (k = 0) scored on the whole cv3 test set.
 #   MODE=calibrate  one flight (QUICK_FLIGHT), k=3, seed 1, for each step count in
@@ -25,6 +25,7 @@ MODE=${MODE:?set MODE=quick, baseline, calibrate or grid}
 MIN_FREE_GIB=${MIN_FREE_GIB:-36}
 MAX_STEPS=${MAX_STEPS:-500}
 QUICK_FLIGHT=${QUICK_FLIGHT:-2025/Rivera_1_1}
+QUICK_K=${QUICK_K:-10}
 CAL_STEPS=${CAL_STEPS:-"250 500 1000 2000"}
 FLIGHTS=${FLIGHTS:-"2024/Basel_2_3 2025/Dornach_1_1 2025/Rivera_1_1 2024/Waltenschwil_1_1"}
 KS=${KS:-"1 3 10"}
@@ -95,10 +96,10 @@ adapt() {
 
 case "$MODE" in
     quick)
-        adapt "$QUICK_FLIGHT" 3 1 "$MAX_STEPS" flight
+        adapt "$QUICK_FLIGHT" "$QUICK_K" 1 "$MAX_STEPS" flight
         test_received "$QUICK_FLIGHT" flight
         python adapt_report.py --out "$QUEUE_DIR/report_quick" \
-            --runs "*np_cv3_adapt_${QUICK_FLIGHT##*/}_k3_steps${MAX_STEPS}_*_s1" \
+            --runs "*np_cv3_adapt_${QUICK_FLIGHT##*/}_k${QUICK_K}_steps${MAX_STEPS}_*_s1" \
             --baseline "$(ls -d lightning_logs/$RECEIVED/test_*/quantitative | sort | tail -n 1)/metrics_semseg_site.json"
         ;;
     baseline)
