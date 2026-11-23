@@ -1,0 +1,106 @@
+New species: F1 at the argmax, AP threshold-free; known_F1 = mean F1 of the other species.
+Means over the draws (n), F1 also with its min and max.
+
+fold   draw  k        species       method  n    F1  F1_min  F1_max  recall  precision    AP  known_F1
+ cv1 random 10     B. davidii probe_dinov2  3 0.450   0.348   0.560   0.313      0.833 0.509     0.395
+ cv1 random 10     B. davidii   probe_pc24  3 0.637   0.567   0.722   0.507      0.868 0.706     0.448
+ cv1 random 10     R. typhina probe_dinov2  3 0.075   0.051   0.092   0.313      0.043 0.064     0.495
+ cv1 random 10     R. typhina   probe_pc24  3 0.111   0.097   0.132   0.328      0.067 0.085     0.568
+ cv1 random 10    R. japonica probe_dinov2  3 0.895   0.853   0.918   0.868      0.932 0.967     0.334
+ cv1 random 10    R. japonica   probe_pc24  3 0.931   0.895   0.954   0.931      0.937 0.986     0.383
+ cv1 random 10  B. orientalis probe_dinov2  3 0.427   0.278   0.609   0.312      0.743 0.537     0.424
+ cv1 random 10  B. orientalis   probe_pc24  3 0.366   0.233   0.578   0.257      0.744 0.550     0.504
+ cv1 random 10 S. inaequidens probe_dinov2  3 0.109   0.077   0.156   0.101      0.146 0.083     0.480
+ cv1 random 10 S. inaequidens   probe_pc24  3 0.121   0.060   0.152   0.106      0.161 0.069     0.546
+ cv1 random 10   A. altissima probe_dinov2  3 0.233   0.143   0.382   0.353      0.319 0.246     0.453
+ cv1 random 10   A. altissima   probe_pc24  3 0.361   0.154   0.488   0.397      0.468 0.408     0.498
+ cv3 flight 10     B. davidii   probe_pc24  6 0.256   0.138   0.529   0.174      0.610 0.305     0.417
+ cv3 flight 10     R. typhina   probe_pc24  6 0.196   0.009   0.457   0.287      0.154 0.145     0.457
+ cv3 flight 10    R. japonica   probe_pc24  6 0.657   0.423   0.762   0.618      0.712 0.685     0.428
+ cv3 flight 10  B. orientalis   probe_pc24  6 0.195   0.019   0.436   0.135      0.419 0.183     0.465
+ cv3 flight 10 S. inaequidens   probe_pc24  6 0.012   0.000   0.029   0.006      0.198 0.036     0.533
+ cv3 flight 10   A. altissima   probe_pc24  6 0.403   0.226   0.576   0.350      0.534 0.377     0.403
+ cv3 random  1     B. davidii probe_dinov2  6 0.045   0.000   0.141   0.029      0.254 0.069     0.354
+ cv3 random  1     B. davidii   probe_pc24  6 0.070   0.000   0.179   0.040      0.359 0.129     0.420
+ cv3 random  1     R. typhina probe_dinov2  6 0.005   0.000   0.014   0.004      0.016 0.006     0.431
+ cv3 random  1     R. typhina   probe_pc24  6 0.006   0.000   0.017   0.005      0.014 0.006     0.465
+ cv3 random  1    R. japonica probe_dinov2  6 0.412   0.009   0.680   0.334      0.776 0.446     0.358
+ cv3 random  1    R. japonica   probe_pc24  6 0.477   0.007   0.746   0.402      0.789 0.540     0.426
+ cv3 random  1  B. orientalis probe_dinov2  6 0.085   0.000   0.347   0.053      0.377 0.095     0.399
+ cv3 random  1  B. orientalis   probe_pc24  6 0.074   0.000   0.280   0.044      0.356 0.092     0.459
+ cv3 random  1 S. inaequidens probe_dinov2  6 0.006   0.000   0.025   0.003      0.151 0.019     0.440
+ cv3 random  1 S. inaequidens   probe_pc24  6 0.006   0.000   0.029   0.003      0.102 0.013     0.512
+ cv3 random  1   A. altissima probe_dinov2  6 0.034   0.000   0.119   0.018      0.404 0.077     0.361
+ cv3 random  1   A. altissima   probe_pc24  6 0.064   0.000   0.243   0.036      0.399 0.108     0.398
+ cv3 random  3     B. davidii probe_dinov2  6 0.157   0.010   0.301   0.100      0.543 0.192     0.358
+ cv3 random  3     B. davidii   probe_pc24  6 0.235   0.004   0.533   0.161      0.593 0.316     0.418
+ cv3 random  3     R. typhina probe_dinov2  6 0.032   0.009   0.072   0.035      0.035 0.019     0.409
+ cv3 random  3     R. typhina   probe_pc24  6 0.116   0.013   0.307   0.163      0.099 0.101     0.482
+ cv3 random  3    R. japonica probe_dinov2  6 0.628   0.586   0.695   0.605      0.698 0.671     0.355
+ cv3 random  3    R. japonica   probe_pc24  6 0.704   0.652   0.753   0.671      0.757 0.749     0.423
+ cv3 random  3  B. orientalis probe_dinov2  6 0.134   0.002   0.238   0.085      0.470 0.156     0.393
+ cv3 random  3  B. orientalis   probe_pc24  6 0.146   0.005   0.291   0.090      0.482 0.170     0.467
+ cv3 random  3 S. inaequidens probe_dinov2  6 0.017   0.001   0.069   0.010      0.172 0.031     0.422
+ cv3 random  3 S. inaequidens   probe_pc24  6 0.017   0.001   0.040   0.009      0.222 0.038     0.508
+ cv3 random  3   A. altissima probe_dinov2  6 0.172   0.009   0.439   0.123      0.678 0.236     0.365
+ cv3 random  3   A. altissima   probe_pc24  6 0.242   0.004   0.543   0.168      0.710 0.308     0.407
+ cv3 random 10     B. davidii  ft_P_frozen  3 0.574   0.556   0.605   0.517      0.646 0.550     0.500
+ cv3 random 10     B. davidii      ft_P_r3  3 0.591   0.486   0.644   0.561      0.650 0.604     0.507
+ cv3 random 10     B. davidii      probe_P  3 0.584   0.495   0.646   0.641      0.550 0.591     0.582
+ cv3 random 10     B. davidii probe_dinov2  6 0.513   0.379   0.574   0.492      0.570 0.500     0.348
+ cv3 random 10     B. davidii probe_mit_b2  3 0.070   0.038   0.127   0.054      0.152 0.057     0.208
+ cv3 random 10     B. davidii   probe_pc24  6 0.628   0.506   0.674   0.617      0.647 0.657     0.408
+ cv3 random 10     R. typhina probe_dinov2  6 0.215   0.091   0.289   0.453      0.148 0.158     0.400
+ cv3 random 10     R. typhina probe_mit_b2  3 0.073   0.027   0.154   0.135      0.050 0.028     0.216
+ cv3 random 10     R. typhina   probe_pc24  6 0.325   0.267   0.411   0.656      0.221 0.301     0.459
+ cv3 random 10    R. japonica probe_dinov2  6 0.630   0.539   0.712   0.667      0.621 0.699     0.350
+ cv3 random 10    R. japonica probe_mit_b2  3 0.366   0.322   0.419   0.425      0.337 0.344     0.185
+ cv3 random 10    R. japonica   probe_pc24  6 0.711   0.694   0.755   0.701      0.728 0.762     0.437
+ cv3 random 10  B. orientalis probe_dinov2  6 0.360   0.255   0.446   0.265      0.602 0.347     0.401
+ cv3 random 10  B. orientalis probe_mit_b2  3 0.279   0.200   0.347   0.189      0.570 0.246     0.173
+ cv3 random 10  B. orientalis   probe_pc24  6 0.402   0.287   0.454   0.312      0.599 0.382     0.473
+ cv3 random 10 S. inaequidens probe_dinov2  6 0.081   0.029   0.167   0.051      0.294 0.088     0.455
+ cv3 random 10 S. inaequidens probe_mit_b2  3 0.044   0.032   0.062   0.029      0.095 0.037     0.240
+ cv3 random 10 S. inaequidens   probe_pc24  6 0.086   0.029   0.141   0.053      0.328 0.102     0.527
+ cv3 random 10   A. altissima probe_dinov2  6 0.396   0.336   0.444   0.326      0.614 0.399     0.374
+ cv3 random 10   A. altissima probe_mit_b2  3 0.186   0.079   0.271   0.179      0.213 0.094     0.191
+ cv3 random 10   A. altissima   probe_pc24  6 0.484   0.429   0.565   0.386      0.713 0.475     0.411
+ cv3 random 30     B. davidii probe_dinov2  6 0.570   0.537   0.617   0.634      0.527 0.576     0.378
+ cv3 random 30     B. davidii   probe_pc24  6 0.648   0.608   0.678   0.729      0.589 0.703     0.428
+ cv3 random 30     R. typhina probe_dinov2  6 0.273   0.237   0.328   0.788      0.166 0.284     0.421
+ cv3 random 30     R. typhina   probe_pc24  6 0.358   0.253   0.423   0.852      0.229 0.452     0.491
+ cv3 random 30    R. japonica probe_dinov2  6 0.598   0.558   0.645   0.712      0.519 0.708     0.350
+ cv3 random 30    R. japonica   probe_pc24  6 0.676   0.595   0.747   0.745      0.625 0.777     0.437
+ cv3 random 30  B. orientalis probe_dinov2  6 0.403   0.389   0.425   0.334      0.516 0.380     0.391
+ cv3 random 30  B. orientalis   probe_pc24  6 0.444   0.412   0.455   0.378      0.542 0.429     0.461
+ cv3 random 30 S. inaequidens probe_dinov2  6 0.132   0.099   0.202   0.084      0.306 0.119     0.447
+ cv3 random 30 S. inaequidens   probe_pc24  6 0.159   0.110   0.195   0.106      0.337 0.143     0.515
+ cv3 random 30   A. altissima probe_dinov2  6 0.509   0.473   0.544   0.516      0.515 0.504     0.386
+ cv3 random 30   A. altissima   probe_pc24  6 0.604   0.559   0.628   0.598      0.615 0.604     0.434
+
+mean F1 of the new species, cv1, random draws (mean: all listed species)
+species          B. davidii  R. typhina  R. japonica  B. orientalis  S. inaequidens  A. altissima  mean
+k  method                                                                                              
+10 probe_dinov2       0.450       0.075        0.895          0.427           0.109         0.233 0.365
+   probe_pc24         0.637       0.111        0.931          0.366           0.121         0.361 0.421
+
+mean F1 of the new species, cv3, flight draws (mean: all listed species)
+species        B. davidii  R. typhina  R. japonica  B. orientalis  S. inaequidens  A. altissima  mean
+k  method                                                                                            
+10 probe_pc24       0.256       0.196        0.657          0.195           0.012         0.403 0.287
+
+mean F1 of the new species, cv3, random draws (mean: all listed species)
+species          B. davidii  R. typhina  R. japonica  B. orientalis  S. inaequidens  A. altissima  mean
+k  method                                                                                              
+1  probe_dinov2       0.045       0.005        0.412          0.085           0.006         0.034 0.098
+   probe_pc24         0.070       0.006        0.477          0.074           0.006         0.064 0.116
+3  probe_dinov2       0.157       0.032        0.628          0.134           0.017         0.172 0.190
+   probe_pc24         0.235       0.116        0.704          0.146           0.017         0.242 0.243
+10 ft_P_frozen        0.574           -            -              -               -             -     -
+   ft_P_r3            0.591           -            -              -               -             -     -
+   probe_P            0.584           -            -              -               -             -     -
+   probe_dinov2       0.513       0.215        0.630          0.360           0.081         0.396 0.366
+   probe_mit_b2       0.070       0.073        0.366          0.279           0.044         0.186 0.169
+   probe_pc24         0.628       0.325        0.711          0.402           0.086         0.484 0.439
+30 probe_dinov2       0.570       0.273        0.598          0.403           0.132         0.509 0.414
+   probe_pc24         0.648       0.358        0.676          0.444           0.159         0.604 0.481

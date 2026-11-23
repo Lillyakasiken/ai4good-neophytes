@@ -1,0 +1,6 @@
+PlantCLEF - DINOv2, linear probes, paired by draw (same tiles)
+cv1 k=10: new-species F1 +0.056, PlantCLEF better in 14/18 pairs (Wilcoxon p = 0.009); known-species F1 +0.061
+cv3 k= 1: new-species F1 +0.018, PlantCLEF better in 19/36 pairs (Wilcoxon p = 0.061); known-species F1 +0.056
+cv3 k= 3: new-species F1 +0.053, PlantCLEF better in 28/36 pairs (Wilcoxon p = 6.7e-06); known-species F1 +0.067
+cv3 k=10: new-species F1 +0.074, PlantCLEF better in 32/36 pairs (Wilcoxon p = 1.9e-08); known-species F1 +0.065
+cv3 k=30: new-species F1 +0.068, PlantCLEF better in 35/36 pairs (Wilcoxon p = 5.8e-11); known-species F1 +0.065
