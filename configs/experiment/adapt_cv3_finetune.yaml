@@ -15,7 +15,9 @@ defaults:
 # # the received cv3 model (512 crops, seed 42)
 init_ckpt: /zfs/ai4good/groups/neophytes/lightning_logs/20261013_002801.261406_np_cv3_Unet_mit_b2_512_s42/checkpoints/best_epoch=29.ckpt
 
-logger: csv
+# # W&B: train and rest-of-flight curves (train_f1_species, val_f1_species, *_f1_class_<i>);
+# # needs `wandb login` once on the node, or logger=csv
+logger: wandb
 
 # # e.g. <date>_<time>_np_cv3_adapt_Rivera_1_1_k3_steps500_Unet_mit_b2_512_s1;
 # # the np_cv3 prefix lets test.py pick the cv3 test config, adapt_report.py parses the rest

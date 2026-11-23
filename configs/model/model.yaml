@@ -37,6 +37,8 @@ optimizer: AdamW      # AdamW or Adam
 loss: Focal           # Focal (down-weights the dominant background) or CE
 weight: null          # optional per-class loss weights, length = num_classes
 check_val_every_n_epoch: 1
+val_check_interval: 1.0  # 1.0 = once per epoch; an int N = every N training steps
+                         # (then check_val_every_n_epoch: null)
 precision: 'bf16-mixed'  # 'bf16-mixed' (recommended), '16-mixed' (older GPUs), '32-true'
 
 lr_scheduler:

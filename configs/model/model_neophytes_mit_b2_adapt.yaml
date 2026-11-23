@@ -2,7 +2,8 @@
 # labelled tiles of one held-out flight. Recipe after Prabhakar et al. 2026
 # (few-shot fine-tuning on target labels only): all layers trained, half the source
 # learning rate, a fixed number of steps, and the final weights are kept. There is no
-# validation on the target (it would need more target labels), so no model selection.
+# model selection on the target: the final weights are kept. Validation runs on the rest
+# of the flight every val_check_interval steps, only to watch the curves (overfitting).
 #
 # Used through configs/experiment/adapt_cv3_finetune.yaml.
 defaults:
@@ -12,7 +13,8 @@ defaults:
 lr: 0.00005               # half the received lr (1e-4)
 max_steps: 500            # ends the run; fixed on cv3, then kept for the other folds
 max_epochs: 100000        # never reached: an "epoch" is one pass over the few k tiles
-check_val_every_n_epoch: 100000  # no validation (see above)
+check_val_every_n_epoch: null    # validate by steps, not epochs:
+val_check_interval: 100           # rest-of-flight F1 every 100 steps
 
 lr_scheduler:
   type: CosineAnnealingLR

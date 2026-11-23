@@ -25,13 +25,15 @@ adapt_flight: Rivera_1_1
 # # keeps the np_cv3 prefix, so test.py picks neophytes_split_cv3_test for the run
 data_name: np_cv3_adapt_${data.adapt_flight}_k${data.few_shot_k}
 
-# # train: the flight's tiles outside the cv3 test set; test: the rest of the flight
-# # (only for the quick test pass at the end of train.py); val stays as in split_cv3
-# # and is not run (model_neophytes_mit_b2_adapt.yaml)
+# # train: the flight's tiles outside the cv3 test set. val and test: the rest of the
+# # flight, i.e. its /train tiles. val gives the rest-of-flight curve during training
+# # (monitoring only, the final weights are kept); test is the quick test pass at the end.
 image_dir:
   train:
     - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/test
     - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/val
+  val:
+    - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/train
   test:
     - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/train
 

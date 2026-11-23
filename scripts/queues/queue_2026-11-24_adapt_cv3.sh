@@ -7,6 +7,8 @@
 #   MODE=quick      one run (QUICK_FLIGHT, QUICK_K, seed 1, MAX_STEPS) and the received model,
 #                   both scored on the flight's site (rest of the flight + the site's other
 #                   flights), then the report.
+#   MODE=curve      one run (QUICK_FLIGHT, QUICK_K, seed 1, MAX_STEPS), training only: the
+#                   train and rest-of-flight F1 curves go to W&B (validation every 100 steps).
 #   MODE=baseline   the received model (k = 0) scored on the whole cv3 test set.
 #   MODE=calibrate  one flight (QUICK_FLIGHT), k=3, seed 1, for each step count in
 #                   CAL_STEPS: picks the number of fine-tuning steps (rest-of-flight F1).
@@ -22,7 +24,7 @@
 
 set -u
 
-MODE=${MODE:?set MODE=quick, baseline, calibrate or grid}
+MODE=${MODE:?set MODE=curve, quick, baseline, calibrate or grid}
 MIN_FREE_GIB=${MIN_FREE_GIB:-36}
 MAX_STEPS=${MAX_STEPS:-500}
 QUICK_FLIGHT=${QUICK_FLIGHT:-2025/Rivera_1_1}
@@ -97,6 +99,11 @@ adapt() {
 }
 
 case "$MODE" in
+    curve)
+        run_job "curve_${QUICK_FLIGHT##*/}_k${QUICK_K}_${EXPERIMENT}_steps${MAX_STEPS}_s1" python train.py \
+            +experiment="$EXPERIMENT" data.adapt_year="${QUICK_FLIGHT%%/*}" data.adapt_flight="${QUICK_FLIGHT##*/}" \
+            data.few_shot_k="$QUICK_K" model.max_steps="$MAX_STEPS" pl_seed=1
+        ;;
     quick)
         adapt "$QUICK_FLIGHT" "$QUICK_K" 1 "$MAX_STEPS" site
         test_received "$QUICK_FLIGHT" site

@@ -134,7 +134,8 @@ def main(cfg: DictConfig) -> None:
                          callbacks=callbacks,
                          logger=logger,
                          deterministic=cfg.deterministic_train,
-                         check_val_every_n_epoch=cfg.model.check_val_every_n_epoch)
+                         check_val_every_n_epoch=cfg.model.check_val_every_n_epoch,
+                         val_check_interval=cfg.model.val_check_interval)
 
     # # resume an interrupted run: same exp_name -> same folder -> picks up last.ckpt.
     # # Passing it as ckpt_path restores the full training state (optimizer, epoch,
