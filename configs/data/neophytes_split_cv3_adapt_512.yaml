@@ -12,9 +12,9 @@
 # pl_seed, so pl_seed selects the draw, and with the same seed k=1 is a subset of
 # k=3 is a subset of k=10. A species with fewer candidate tiles than k gets all of them.
 #
-#   python train.py data=neophytes_split_cv3_adapt_512 model=model_neophytes_mit_b2_adapt \
-#       data.adapt_year=2025 data.adapt_flight=Rivera_1_1 data.few_shot_k=3 pl_seed=1 \
-#       init_ckpt=<received cv3 checkpoint>
+# Used through configs/experiment/adapt_cv3_finetune.yaml:
+#   python train.py +experiment=adapt_cv3_finetune \
+#       data.adapt_year=2025 data.adapt_flight=Rivera_1_1 data.few_shot_k=3 pl_seed=1
 defaults:
   - neophytes_split_cv3_train_512
   - _self_

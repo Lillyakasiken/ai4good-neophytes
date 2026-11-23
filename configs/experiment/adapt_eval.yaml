@@ -1,0 +1,22 @@
+# @package _global_
+# Evaluation of the few-shot adaption runs (and of the received model they are compared
+# with): one confusion matrix per flight (eval_site), read by adapt_report.py. The
+# other breakdowns, AUC and the elevation rasters are off (the model is RGB only), which
+# makes a pass much faster. Restrict the test set to the flights that should be scored:
+#
+#   python test.py +experiment=adapt_eval exp_name=<run> \
+#       "data.image_dir.test=['../data/Neophytes/2025/Rivera_1_1/train']"
+#
+# For the received model add ckpt_type=best.
+ckpt_type: final
+eval_site: True
+eval_cv: False
+eval_month: False
+eval_auxiliary: False
+compute_auc: False
+
+data:
+  load_auxiliary: False
+  load_dsm: False
+  load_dtm: False
+  load_ndsm: False

@@ -4,8 +4,7 @@
 # learning rate, a fixed number of steps, and the final weights are kept. There is no
 # validation on the target (it would need more target labels), so no model selection.
 #
-# Use with train.py init_ckpt=<received checkpoint> data=neophytes_split_cv3_adapt_512,
-# see scripts/queues/queue_2026-11-24_adapt_cv3.sh.
+# Used through configs/experiment/adapt_cv3_finetune.yaml.
 defaults:
   - model_neophytes_mit_b2
   - _self_

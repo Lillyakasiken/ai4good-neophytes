@@ -281,11 +281,14 @@ at a held-out site, then compare it with the received model on the same tiles.
 
 - `train.py init_ckpt=<checkpoint>` starts from a trained model's weights;
   `model.max_steps` ends a run after a fixed number of steps.
+- One experiment config per method, the draw on the command line:
+  `python train.py +experiment=adapt_cv3_finetune data.adapt_year=2025 data.adapt_flight=Rivera_1_1 data.few_shot_k=3 pl_seed=1`,
+  scored with `python test.py +experiment=adapt_eval exp_name=<run> "data.image_dir.test=[...]"`.
 - `configs/data/neophytes_split_cv3_adapt_512.yaml`: the k tiles come from the
   flight's `/test` and `/val` folders, so the unchanged cv3 test set scores the result.
 - `configs/model/model_neophytes_mit_b2_adapt.yaml`: half the learning rate, fixed
   steps, final weights, no validation.
-- `scripts/queues/queue_2026-11-24_adapt_cv3.sh`: baseline, step calibration and grid.
+- `scripts/queues/queue_2026-11-24_adapt_cv3.sh`: quick check, baseline, step calibration and grid.
 - `adapt_report.py`: per species F1 / precision / recall of adapted vs. received model
   on the rest of the flight, the other flights of the site and the other sites.
 
