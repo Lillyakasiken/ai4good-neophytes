@@ -71,7 +71,8 @@ def tiles_with_species(stats, species):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--baseline', required=True, help="metrics_semseg_site.json of the received model's test.py run")
+    parser.add_argument('--baseline', required=True, nargs='+',
+                        help="metrics_semseg_site.json of the received model's test.py run(s), merged per flight")
     parser.add_argument('--runs', nargs='+', default=['*np_cv3_adapt_*'], help='glob patterns of run directories')
     parser.add_argument('--log-dir', default='lightning_logs')
     parser.add_argument('--stats', default='../data/Neophytes/stats_imagewise.csv')
@@ -86,7 +87,9 @@ def main():
     species = {int(c): v['stats_name'] for c, v in classes.items() if int(c) > 0}
     stats = pd.read_csv(args.stats)
     stats['tile'] = stats['img_path'].map(os.path.basename)
-    baseline = load_site_confs(args.baseline)
+    baseline = {}
+    for path in args.baseline:
+        baseline.update(load_site_confs(path))
 
     run_dirs = sorted({d for p in args.runs for d in glob.glob(os.path.join(args.log_dir, p)) if os.path.isdir(d)})
 
