@@ -725,6 +725,15 @@ def select_few_shot_for_class(
     # --- ranking score ---
     if mode == "random":
         candidates = candidates.sample(frac=1.0)
+    elif mode == "random_nonflower":
+        # # non-flowering plants first: tiles where >= 90% of the species' pixels are
+        # # non-flowering, in random order; if fewer than k, fill up with the remaining
+        # # tiles, most non-flowering first. Same shuffle as "random", so pl_seed picks the draw.
+        candidates = candidates.sample(frac=1.0)
+        frac = candidates[pheno_cols["nonflower"]] / candidates[px_col]
+        tier = (frac < 0.9).astype(int)
+        candidates = candidates.assign(_tier=tier, _rank=np.where(tier == 1, -frac, 0.0))
+        candidates = candidates.sort_values(["_tier", "_rank"], kind="stable")
     elif mode == "all":
         candidates = df[df[px_col] > 0].copy() # w/o only_col restriction
     else:
@@ -732,7 +741,7 @@ def select_few_shot_for_class(
         
 
     # --- no constraint ---
-    if mode in {"all", "random", "max_px"}:
+    if mode in {"all", "random", "random_nonflower", "max_px"}:
         return candidates.head(k).index.tolist()
 
     # --- define grouping key ---

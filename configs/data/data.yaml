@@ -55,7 +55,7 @@ load_into_ram: False
 # # Few-shot training subset: k images per class, chosen by few_shot_mode.
 # # null = use the full split.
 few_shot_k: null
-few_shot_mode: 'max_px_site_pheno'  # all, random, max_px, max_px_site, max_px_pheno,
+few_shot_mode: 'max_px_site_pheno'  # all, random, random_nonflower, max_px, max_px_site, max_px_pheno,
                                     # max_px_site_pheno (most diverse: spreads the k images
                                     # over sites and phenological phases)
 few_shot_bg_k: 1000  # additional background-only images (0 = none)

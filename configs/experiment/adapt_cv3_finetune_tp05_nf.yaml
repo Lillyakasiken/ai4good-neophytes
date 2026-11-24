@@ -1,0 +1,18 @@
+# @package _global_
+# Task 1, phase 1, variant (b) with non-flowering tiles: as adapt_cv3_finetune_tp05, but
+# the k tiles per species are chosen non-flowering first (few_shot_mode random_nonflower:
+# tiles where >= 90% of the species' pixels are non-flowering, then the most
+# non-flowering of the rest). The received model misses non-flowering plants far more
+# often than flowering ones (cv3 test recall, metrics_phenology.json).
+#
+#   python train.py +experiment=adapt_cv3_finetune_tp05_nf \
+#       data.adapt_year=2024 data.adapt_flight=Basel_2_3 data.few_shot_k=10 pl_seed=1
+defaults:
+  - adapt_cv3_finetune_tp05
+  - _self_
+
+data:
+  few_shot_mode: random_nonflower
+
+# # the variant tag goes into the run name, so adapt_report.py keeps the runs apart
+exp_name: ${now:%Y%m%d}_${now:%H%M%S.%f}_${data.data_name}_tp05nf_steps${model.max_steps}_${model.name}_${data.crop_size_train}_s${pl_seed}
