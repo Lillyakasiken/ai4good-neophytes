@@ -15,6 +15,10 @@
 # resumes the queue. A failed job does not stop the queue. Logs and status:
 # lightning_logs/queue_2026-11-24_overnight/.
 
+# # ~/.bashrc (WANDB_API_KEY) and conda use unset variables: source them before set -u
+source ~/.bashrc
+source /zfs/ai4good/groups/neophytes/miniforge3/etc/profile.d/conda.sh
+conda activate /zfs/ai4good/groups/neophytes/miniforge3/envs/ai4good-neophytes
 set -u
 
 PARTS=${PARTS:-"lora novel"}
@@ -26,9 +30,6 @@ LORA_FLIGHTS=${LORA_FLIGHTS:-"2024/Basel_2_3 2025/Rivera_1_1 2024/Waltenschwil_1
 # # model on the GPU; asking it to unload frees the memory (saved predictions stay)
 EXPLORER_API=${EXPLORER_API:-http://127.0.0.1:8010}
 
-source ~/.bashrc   # WANDB_API_KEY
-source /zfs/ai4good/groups/neophytes/miniforge3/etc/profile.d/conda.sh
-conda activate /zfs/ai4good/groups/neophytes/miniforge3/envs/ai4good-neophytes
 cd "$(dirname "$0")/../.."
 QUEUE_DIR=lightning_logs/queue_2026-11-24_overnight
 mkdir -p "$QUEUE_DIR"
