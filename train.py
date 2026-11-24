@@ -89,7 +89,8 @@ def main(cfg: DictConfig) -> None:
                                     batch_size_train=cfg.data.batch_size_train,
                                     batch_size_val=cfg.data.batch_size_val,
                                     batch_size_test=cfg.data.batch_size_test,
-                                    num_workers=cfg.data.num_workers)
+                                    num_workers=cfg.data.num_workers,
+                                    few_shot_classes=cfg.data.get('few_shot_classes'))
 
     dataModule.prepare_data()
     dataModule.setup()
@@ -120,7 +121,10 @@ def main(cfg: DictConfig) -> None:
                               loss=cfg.model.loss,
                               weight=cfg.model.weight,
                               patch_2_img_size=cfg.model.patch_2_img_size,
-                              fusion_mode=cfg.model.fusion_mode)
+                              fusion_mode=cfg.model.fusion_mode,
+                              lora_rank=cfg.model.get('lora_rank', 0),
+                              lora_alpha=cfg.model.get('lora_alpha', 16),
+                              lora_lr=cfg.model.get('lora_lr'))
 
     # %% training
     callbacks = get_callbacks(cfg.model.callbacks)
@@ -135,7 +139,8 @@ def main(cfg: DictConfig) -> None:
                          logger=logger,
                          deterministic=cfg.deterministic_train,
                          check_val_every_n_epoch=cfg.model.check_val_every_n_epoch,
-                         val_check_interval=cfg.model.val_check_interval)
+                         val_check_interval=cfg.model.val_check_interval,
+                         limit_val_batches=cfg.model.get('limit_val_batches'))
 
     # # resume an interrupted run: same exp_name -> same folder -> picks up last.ckpt.
     # # Passing it as ckpt_path restores the full training state (optimizer, epoch,
@@ -149,7 +154,21 @@ def main(cfg: DictConfig) -> None:
         # # few-shot adaption: continue from a trained model's weights (not a resume)
         print(f'Initialising weights from: {cfg.init_ckpt}')
         state_dict = torch.load(cfg.init_ckpt, map_location='cpu', weights_only=False)['state_dict']
-        model.load_state_dict(state_dict)
+        # # with LoRA the adapters are new: they are the only keys allowed to be missing
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        bad = [k for k in missing if 'lora_' not in k] + list(unexpected)
+        if bad:
+            raise RuntimeError(f'init_ckpt does not match the model: {bad[:10]}')
+        if cfg.get('init_new_class') is not None:
+            # # species adaption: the new species' row starts as the mean of the other
+            # # species' rows (background, row 0, is left out of the mean)
+            c = int(cfg.init_new_class)
+            conv = model.model.segmentation_head[0]
+            others = [i for i in range(1, cfg.model.num_classes) if i != c]
+            with torch.no_grad():
+                conv.weight[c] = conv.weight[others].mean(0)
+                conv.bias[c] = conv.bias[others].mean(0)
+            print(f'Output row {c} reset to the mean of rows {others}')
 
     start_time = time.time()
     trainer.fit(model, dataModule, ckpt_path=resume_ckpt_path)

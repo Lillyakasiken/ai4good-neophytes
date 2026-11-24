@@ -20,6 +20,10 @@ exp_name: ${now:%Y%m%d}_${now:%H%M%S.%f}_${data.data_name}_${model.name}_${data.
 # # pretrained encoder. Only the weights are taken: optimizer, LR schedule and epoch
 # # counter start fresh with this run's settings. null = normal training.
 init_ckpt: null
+# # Species adaption (task 2): class id whose output row is reset to the mean of the
+# # other species' rows after init_ckpt is loaded. The base never saw that species, so
+# # its row was only ever trained to say "absent". null = keep every row.
+init_new_class: null
 
 # # Reproducibility
 pl_seed: 42               # False or a seed number

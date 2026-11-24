@@ -39,6 +39,13 @@ weight: null          # optional per-class loss weights, length = num_classes
 check_val_every_n_epoch: 1
 val_check_interval: 1.0  # 1.0 = once per epoch; an int N = every N training steps
                          # (then check_val_every_n_epoch: null)
+limit_val_batches: null  # 0 = no validation at all (e.g. few-shot runs scored only by the test pass)
+
+# # LoRA (models/lora.py): rank > 0 adds adapters to every Linear layer of the encoder
+# # and trains only them and the segmentation head. 0 = train all weights.
+lora_rank: 0
+lora_alpha: 16
+lora_lr: null            # adapters' lr; null = lr
 precision: 'bf16-mixed'  # 'bf16-mixed' (recommended), '16-mixed' (older GPUs), '32-true'
 
 lr_scheduler:

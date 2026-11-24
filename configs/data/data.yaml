@@ -59,6 +59,7 @@ few_shot_mode: 'max_px_site_pheno'  # all, random, random_nonflower, max_px, max
                                     # max_px_site_pheno (most diverse: spreads the k images
                                     # over sites and phenological phases)
 few_shot_bg_k: 1000  # additional background-only images (0 = none)
+few_shot_classes: null  # stats names to draw the k images for, e.g. [S_inaequidens]; null = every species
 
 # # Validation subset. null = validate on the complete val set, which is the honest
 # # setting: filtering the val set down to labelled images removes exactly the

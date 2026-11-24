@@ -25,6 +25,7 @@ from torchmetrics.classification import (
     MulticlassStatScores,
 )
 
+from models.lora import add_lora, is_lora_param
 from utils.scheduler_utils import get_scheduler
 
 
@@ -99,11 +100,18 @@ class SegmentationModel(pl.LightningModule):
         patch_2_img_size: if True, inputs larger than ``img_size`` are split into
             overlapping patches, pushed through the model and stitched back
             together. Needed for encoders with a fixed positional embedding.
+        lora_rank: > 0 adds LoRA adapters of this rank to every Linear layer of the
+            encoder (see models/lora.py) and freezes everything else except the
+            segmentation head. 0 (default) trains the whole network as before.
+        lora_alpha: LoRA scaling numerator (update scaled by ``lora_alpha / lora_rank``).
+        lora_lr: learning rate of the adapters; the head keeps ``learning_rate``.
+            None = ``learning_rate`` for both.
     """
 
     def __init__(self, model, encoder_name, img_size, num_classes, learning_rate,
                  in_channels=None, ignore_index=-1, optimizer='AdamW', lr_scheduler=None,
-                 loss='CE', weight=None, patch_2_img_size=False, fusion_mode='concat'):
+                 loss='CE', weight=None, patch_2_img_size=False, fusion_mode='concat',
+                 lora_rank=0, lora_alpha=16, lora_lr=None):
         super().__init__()
         self.save_hyperparameters()
         self.in_channels = in_channels
@@ -136,6 +144,14 @@ class SegmentationModel(pl.LightningModule):
         if fusion_mode == 'stem' and aux_channels > 0:
             self.elevation_fusion = ElevationFusion(aux_channels, self.model.encoder.out_channels)
 
+        # # LoRA: adapters in the encoder; only they and the segmentation head train
+        if lora_rank:
+            n = add_lora(self.model.encoder, lora_rank, lora_alpha)
+            for name, param in self.named_parameters():
+                param.requires_grad = is_lora_param(name) or name.startswith('model.segmentation_head.')
+            print(f'LoRA rank {lora_rank} on {n} encoder Linear layers; trainable params: '
+                  f'{sum(p.numel() for p in self.parameters() if p.requires_grad):,}')
+
         # # Loss
         if weight:
             weight = torch.tensor(weight)
@@ -163,11 +179,30 @@ class SegmentationModel(pl.LightningModule):
     def set_patch_2_img_size(self, new_patch_2_img_size):
         self.hparams.patch_2_img_size = new_patch_2_img_size
 
+    def train(self, mode=True):
+        # # with LoRA the frozen BatchNorm layers (decoder) stay in eval mode, so their
+        # # running statistics are not overwritten by the few target tiles
+        super().train(mode)
+        if mode and self.hparams.get('lora_rank'):
+            for module in self.modules():
+                if isinstance(module, nn.modules.batchnorm._BatchNorm) and \
+                        not any(p.requires_grad for p in module.parameters()):
+                    module.eval()
+        return self
+
     def configure_optimizers(self):
+        params = [p for p in self.parameters() if p.requires_grad]
+        lora_lr = self.hparams.get('lora_lr')
+        if self.hparams.get('lora_rank') and lora_lr:
+            # # adapters start at zero and need a larger lr than the pretrained head
+            params = [
+                {'params': [p for n, p in self.named_parameters() if p.requires_grad and is_lora_param(n)], 'lr': lora_lr},
+                {'params': [p for n, p in self.named_parameters() if p.requires_grad and not is_lora_param(n)]},
+            ]
         if self.hparams.optimizer == 'Adam':
-            optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+            optimizer = optim.Adam(params, lr=self.hparams.learning_rate)
         elif self.hparams.optimizer == 'AdamW':
-            optimizer = optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
+            optimizer = optim.AdamW(params, lr=self.hparams.learning_rate)
         else:
             raise ValueError(f"Unknown optimizer '{self.hparams.optimizer}'. Available: Adam, AdamW.")
         if self.hparams.lr_scheduler:

@@ -1,0 +1,42 @@
+# @package _global_
+# Task 2, species adaption (Alexandru's split): the five-species base that never saw
+# data.novel_species (every site with it was left out of its training) is fine-tuned
+# on k labelled tiles of that species from ONE flight of such a site. Same recipe as
+# task 1 variant (b), adapt_cv3_finetune_tp05: all weights, lr 5e-5, 500 steps, cosine,
+# final weights, half the crops plant-anchored and half random windows, no replay.
+# The new species' output row starts as the mean of the other species' rows.
+#
+# Tiles as in task 1: the k tiles come from the flight's /test + /val folders and
+# contain the new species alone; the score is the flight's /train tiles (the rest of
+# the flight), so k = 3, 5, 10 are scored on the same tiles. Only the new species is
+# drawn (few_shot_classes); no validation during training, the test pass scores it.
+#
+#   python train.py +experiment=adapt_novel_finetune_tp05 data.novel_species=S_inaequidens \
+#       data.adapt_year=2024 data.adapt_flight=Basel_2_3 data.few_shot_k=10 pl_seed=1
+defaults:
+  - adapt_cv3_finetune_tp05
+  - _self_
+
+data:
+  novel_species: S_inaequidens
+  few_shot_classes: ['${data.novel_species}']
+  data_name: np_nv${data.novel_species}_adapt_${data.adapt_flight}_k${data.few_shot_k}
+
+model:
+  limit_val_batches: 0
+
+# # Alexandru's bases (branch explorer, data.novel.stage=base on the cv3 train list,
+# # best checkpoint on the five species' val F1). A. altissima: the later of his two runs.
+novel_bases:
+  A_altissima: /zfs/ai4good/groups/neophytes/lightning_logs/20261108_180106_neophytes_split_cv3_train_512_model_neophytes_mit_b2_s42_nvA_altissima_base/checkpoints/best_epoch=29.ckpt
+  R_typhina: /zfs/ai4good/groups/neophytes/lightning_logs/20261114_004031_neophytes_split_cv3_train_512_model_neophytes_mit_b2_s42_nvR_typhina_base/checkpoints/best_epoch=29.ckpt
+  B_davidii: /zfs/ai4good/groups/neophytes/lightning_logs/20261114_004041_neophytes_split_cv3_train_512_model_neophytes_mit_b2_s42_nvB_davidii_base/checkpoints/best_epoch=29.ckpt
+  R_japonica: /zfs/ai4good/groups/neophytes/lightning_logs/20261113_100425_neophytes_split_cv3_train_512_model_neophytes_mit_b2_s42_nvR_japonica_base/checkpoints/best_epoch=29.ckpt
+  B_orientalis: /zfs/ai4good/groups/neophytes/lightning_logs/20261114_004058_neophytes_split_cv3_train_512_model_neophytes_mit_b2_s42_nvB_orientalis_base/checkpoints/best_epoch=29.ckpt
+  S_inaequidens: /zfs/ai4good/groups/neophytes/lightning_logs/20261109_152445_neophytes_split_cv3_train_512_model_neophytes_mit_b2_s42_nvS_inaequidens_base/checkpoints/best_epoch=19.ckpt
+novel_class_ids: {B_davidii: 1, R_typhina: 2, R_japonica: 3, B_orientalis: 4, S_inaequidens: 5, A_altissima: 6}
+
+init_ckpt: ${novel_bases.${data.novel_species}}
+init_new_class: ${novel_class_ids.${data.novel_species}}
+
+exp_name: ${now:%Y%m%d}_${now:%H%M%S.%f}_${data.data_name}_tp05_steps${model.max_steps}_${model.name}_${data.crop_size_train}_s${pl_seed}

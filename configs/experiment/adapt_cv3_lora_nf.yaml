@@ -1,0 +1,22 @@
+# @package _global_
+# Task 1, phase 1, LoRA variant: as adapt_cv3_finetune_tp05_nf (k non-flowering-first
+# tiles per species, half the crops plant-anchored, half random windows), but instead of
+# training all weights, LoRA adapters (rank 8) are added to every Linear layer of the
+# MiT-b2 encoder (attention q/kv/proj + MLP); only they and the segmentation head train.
+# The decoder stays frozen, its BatchNorm statistics included. Aim: fix the hard cases
+# with a small change, so what the received model already gets right is kept.
+# No validation during training (scored by the test pass at the end only).
+#
+#   python train.py +experiment=adapt_cv3_lora_nf \
+#       data.adapt_year=2024 data.adapt_flight=Basel_2_3 data.few_shot_k=10 pl_seed=1
+defaults:
+  - adapt_cv3_finetune_tp05_nf
+  - _self_
+
+model:
+  lora_rank: 8
+  lora_alpha: 16
+  lora_lr: 0.0005          # adapters start at zero: 10x the head's lr (5e-5)
+  limit_val_batches: 0
+
+exp_name: ${now:%Y%m%d}_${now:%H%M%S.%f}_${data.data_name}_tp05nf_lora${model.lora_rank}_steps${model.max_steps}_${model.name}_${data.crop_size_train}_s${pl_seed}
