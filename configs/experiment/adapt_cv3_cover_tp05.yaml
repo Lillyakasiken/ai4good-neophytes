@@ -1,0 +1,48 @@
+# @package _global_
+# Task 1, phase 1, "cover" variant: the generic fine-tune (adapt_cv3_finetune_tp05: all
+# weights, lr 5e-5, 500 steps, half the crops plant-anchored, half random windows), but
+#   - draw: exactly k tiles per species from the WHOLE adapted flight (all three folders),
+#     tiles may hold several species (few_shot_mode=cover, select_few_shot_cover); a
+#     species with fewer than k tiles in the flight is not drawn for;
+#   - score: the OTHER flights of the site (their /train folders, i.e. their part of the
+#     cv3 test set), so the received model's per-flight scores on the same tiles are the
+#     baseline. The adapted flight itself is not scored.
+# No validation during training; the train.py test pass at the end scores the other
+# flights, pooled over them.
+#
+#   python train.py +experiment=adapt_cv3_cover_tp05 \
+#       data.adapt_year=2024 data.adapt_flight=Basel_2_3 data.few_shot_k=10 pl_seed=1
+defaults:
+  - adapt_cv3_finetune_tp05
+  - _self_
+
+data:
+  few_shot_mode: cover
+  data_name: np_cv3_adapt_${data.adapt_flight}_k${data.few_shot_k}cover
+  image_dir:
+    train:
+      - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/train
+      - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/test
+      - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/val
+    val: ${site_other_flights.${data.adapt_flight}}    # unused (limit_val_batches: 0)
+    test: ${site_other_flights.${data.adapt_flight}}
+
+model:
+  limit_val_batches: 0
+
+# # the other flights of each cv3 held-out site, keyed by the adapted flight
+site_other_flights:
+  Basel_2_3:
+    - ../data/Neophytes/2024/Basel_2_1/train
+    - ../data/Neophytes/2024/Basel_2_2/train
+    - ../data/Neophytes/2024/Basel_2_4/train
+    - ../data/Neophytes/2024/Basel_2_5/train
+    - ../data/Neophytes/2024/Basel_2_6/train
+  Rivera_1_1:
+    - ../data/Neophytes/2025/Rivera_1_2/train
+  Waltenschwil_1_1:
+    - ../data/Neophytes/2024/Waltenschwil_1_2/train
+  Dornach_1_1:
+    - ../data/Neophytes/2025/Dornach_1_2/train
+
+exp_name: ${now:%Y%m%d}_${now:%H%M%S.%f}_${data.data_name}_tp05_steps${model.max_steps}_${model.name}_${data.crop_size_train}_s${pl_seed}

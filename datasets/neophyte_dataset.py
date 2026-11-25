@@ -213,18 +213,23 @@ class NeophyteDataset(Dataset):
         few_shot_bg_k=50,
     ):
         selected = set()
-    
-        # --- per-class few-shot selection (only few_shot_classes when set, e.g. the
-        #     new species of a species-adaption run) ---
-        for class_name in (self.few_shot_classes or self.neophytes_stats_names):
-            
-            idxs = select_few_shot_for_class(
-                df=self.stats_df,
-                class_name=class_name,
-                k=few_shot_k,
-                mode=few_shot_mode,
-            )
-            selected.update(idxs)
+        class_names = self.few_shot_classes or self.neophytes_stats_names
+
+        if few_shot_mode == "cover":
+            # # joint draw: every species ends up in >= k selected tiles (tiles may hold
+            # # several species), see select_few_shot_cover
+            selected.update(select_few_shot_cover(self.stats_df, class_names, few_shot_k))
+        else:
+            # --- per-class few-shot selection (only few_shot_classes when set, e.g. the
+            #     new species of a species-adaption run) ---
+            for class_name in class_names:
+                idxs = select_few_shot_for_class(
+                    df=self.stats_df,
+                    class_name=class_name,
+                    k=few_shot_k,
+                    mode=few_shot_mode,
+                )
+                selected.update(idxs)
     
         # --- optional background-only sampling ---
         if few_shot_bg_k > 0:
@@ -703,6 +708,43 @@ def pheno_px_cols(class_name):
         "flower": f"flower_{class_name}_px",
         "fruiting": f"fruiting_{class_name}_px",
     }
+
+def select_few_shot_cover(df, class_names, k):
+    """Joint k-tile draw over all species: each species ends up in at least k selected
+    tiles, and tiles may hold several species (unlike select_few_shot_for_class, which
+    only takes tiles with the species alone).
+
+    The pool is shuffled once (numpy seed, i.e. pl_seed selects the draw). Species are
+    served rarest first: for each, the selected tiles that already contain it count
+    towards its k, and shuffled tiles containing it are added until it has k. So rare
+    species get exactly k tiles; a common one can get a few more, when tiles drawn for
+    other species also contain it. Labels stay complete: a selected tile keeps all its
+    labels. A species with fewer than k tiles in the pool is not drawn for at all and
+    is reported (its labels can still enter through tiles drawn for other species).
+    """
+    has = {c: df[class_px_col(c)] > 0 for c in class_names}
+    n_pool = {c: int(h.sum()) for c, h in has.items()}
+    order = df.sample(frac=1.0).index
+    selected = []
+    for c in sorted(class_names, key=lambda c: n_pool[c]):
+        if n_pool[c] == 0:
+            continue
+        if n_pool[c] < k:
+            print(f"few-shot cover: {c} has only {n_pool[c]} tiles (< k={k}), not drawn")
+            continue
+        n = int(has[c].loc[selected].sum())
+        for idx in order:
+            if n >= k:
+                break
+            if has[c].loc[idx] and idx not in selected:
+                selected.append(idx)
+                n += 1
+    for c in class_names:
+        if n_pool[c]:
+            print(f"few-shot cover: {c} in {int(has[c].loc[selected].sum())} of "
+                  f"{len(selected)} selected tiles (pool: {n_pool[c]} tiles)")
+    return selected
+
 
 def select_few_shot_for_class(
     df,
