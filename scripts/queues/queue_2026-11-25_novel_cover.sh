@@ -8,8 +8,9 @@
 #       learning-rate check on two cells that never learned the new class overnight
 #       (A. altissima at Basel_2_3, B. orientalis at Dornach_1_1): base lr everywhere,
 #       head 10x, head + decoder 10x
-#   PART=all HEAD_LR=... DECODER_LR=... bash scripts/queues/queue_2026-11-25_novel_cover.sh
-#       the 9 cells with the chosen learning rates
+#   PART=all HEAD_LR=0.0005 DECODER_LR=0.0005 bash scripts/queues/queue_2026-11-25_novel_cover.sh
+#       the 9 cells; head + decoder at 10x the base lr, as in Alexandru's new-species
+#       fine-tune (set beforehand, not tuned on the scored flights)
 #
 # A job whose log already holds the test results is skipped, so rerunning the script
 # resumes the queue. Logs and status: lightning_logs/queue_2026-11-25_novel_cover/.
@@ -27,10 +28,11 @@ K=${K:-10}
 SEED=${SEED:-1}
 MIN_FREE_GIB=${MIN_FREE_GIB:-36}
 EXPLORER_API=${EXPLORER_API:-http://127.0.0.1:8010}
-# # species x flight cells of the task 1 table (>= 10 tiles in the flight, >= 5 scored)
-CELLS_ALL="B_davidii:2024/Basel_2_3 S_inaequidens:2024/Basel_2_3 A_altissima:2024/Basel_2_3
-B_davidii:2025/Rivera_1_1 R_japonica:2024/Waltenschwil_1_1
-B_davidii:2025/Dornach_1_1 R_japonica:2025/Dornach_1_1 B_orientalis:2025/Dornach_1_1 A_altissima:2025/Dornach_1_1"
+# # species x flight cells of the task 1 table (>= 10 tiles in the flight, >= 5 scored);
+# # the two species that never learned the new class overnight first, as an early check
+CELLS_ALL="A_altissima:2024/Basel_2_3 B_orientalis:2025/Dornach_1_1
+B_davidii:2024/Basel_2_3 S_inaequidens:2024/Basel_2_3 B_davidii:2025/Rivera_1_1 R_japonica:2024/Waltenschwil_1_1
+B_davidii:2025/Dornach_1_1 R_japonica:2025/Dornach_1_1 A_altissima:2025/Dornach_1_1"
 CELLS_LRTEST="A_altissima:2024/Basel_2_3 B_orientalis:2025/Dornach_1_1"
 
 cd "$(dirname "$0")/../.."
