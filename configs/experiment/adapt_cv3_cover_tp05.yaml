@@ -24,25 +24,10 @@ data:
       - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/train
       - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/test
       - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/val
-    val: ${site_other_flights.${data.adapt_flight}}    # unused (limit_val_batches: 0)
-    test: ${site_other_flights.${data.adapt_flight}}
+    val: ${data.site_other_flights.${data.adapt_flight}}    # unused (limit_val_batches: 0)
+    test: ${data.site_other_flights.${data.adapt_flight}}
 
 model:
   limit_val_batches: 0
-
-# # the other flights of each cv3 held-out site, keyed by the adapted flight
-site_other_flights:
-  Basel_2_3:
-    - ../data/Neophytes/2024/Basel_2_1/train
-    - ../data/Neophytes/2024/Basel_2_2/train
-    - ../data/Neophytes/2024/Basel_2_4/train
-    - ../data/Neophytes/2024/Basel_2_5/train
-    - ../data/Neophytes/2024/Basel_2_6/train
-  Rivera_1_1:
-    - ../data/Neophytes/2025/Rivera_1_2/train
-  Waltenschwil_1_1:
-    - ../data/Neophytes/2024/Waltenschwil_1_2/train
-  Dornach_1_1:
-    - ../data/Neophytes/2025/Dornach_1_2/train
 
 exp_name: ${now:%Y%m%d}_${now:%H%M%S.%f}_${data.data_name}_tp05_steps${model.max_steps}_${model.name}_${data.crop_size_train}_s${pl_seed}

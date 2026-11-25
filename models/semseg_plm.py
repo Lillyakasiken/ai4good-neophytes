@@ -106,12 +106,14 @@ class SegmentationModel(pl.LightningModule):
         lora_alpha: LoRA scaling numerator (update scaled by ``lora_alpha / lora_rank``).
         lora_lr: learning rate of the adapters; the head keeps ``learning_rate``.
             None = ``learning_rate`` for both.
+        head_lr, decoder_lr: learning rates of the segmentation head and the decoder
+            (None = ``learning_rate``), e.g. 10x for a newly initialised output row.
     """
 
     def __init__(self, model, encoder_name, img_size, num_classes, learning_rate,
                  in_channels=None, ignore_index=-1, optimizer='AdamW', lr_scheduler=None,
                  loss='CE', weight=None, patch_2_img_size=False, fusion_mode='concat',
-                 lora_rank=0, lora_alpha=16, lora_lr=None):
+                 lora_rank=0, lora_alpha=16, lora_lr=None, head_lr=None, decoder_lr=None):
         super().__init__()
         self.save_hyperparameters()
         self.in_channels = in_channels
@@ -191,14 +193,28 @@ class SegmentationModel(pl.LightningModule):
         return self
 
     def configure_optimizers(self):
-        params = [p for p in self.parameters() if p.requires_grad]
-        lora_lr = self.hparams.get('lora_lr')
-        if self.hparams.get('lora_rank') and lora_lr:
-            # # adapters start at zero and need a larger lr than the pretrained head
-            params = [
-                {'params': [p for n, p in self.named_parameters() if p.requires_grad and is_lora_param(n)], 'lr': lora_lr},
-                {'params': [p for n, p in self.named_parameters() if p.requires_grad and not is_lora_param(n)]},
-            ]
+        # # parameter groups with their own lr (None = learning_rate): LoRA adapters start
+        # # at zero and need a larger lr than the pretrained head; a new output row (species
+        # # adaption) needs a larger lr on the head / decoder to rise above background
+        lrs = {'lora': self.hparams.get('lora_lr') if self.hparams.get('lora_rank') else None,
+               'head': self.hparams.get('head_lr'), 'decoder': self.hparams.get('decoder_lr')}
+
+        def group(name):
+            if is_lora_param(name):
+                return 'lora'
+            if name.startswith('model.segmentation_head.'):
+                return 'head'
+            if name.startswith('model.decoder.'):
+                return 'decoder'
+            return 'rest'
+
+        groups = {}
+        for n, p in self.named_parameters():
+            if p.requires_grad:
+                g = group(n)
+                groups.setdefault(g if lrs.get(g) else 'rest', []).append(p)
+        params = [{'params': ps, 'lr': lrs[g]} if g != 'rest' else {'params': ps}
+                  for g, ps in groups.items()]
         if self.hparams.optimizer == 'Adam':
             optimizer = optim.Adam(params, lr=self.hparams.learning_rate)
         elif self.hparams.optimizer == 'AdamW':

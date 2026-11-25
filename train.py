@@ -90,7 +90,8 @@ def main(cfg: DictConfig) -> None:
                                     batch_size_val=cfg.data.batch_size_val,
                                     batch_size_test=cfg.data.batch_size_test,
                                     num_workers=cfg.data.num_workers,
-                                    few_shot_classes=cfg.data.get('few_shot_classes'))
+                                    few_shot_classes=cfg.data.get('few_shot_classes'),
+                                    few_shot_tiles=cfg.data.get('few_shot_tiles'))
 
     dataModule.prepare_data()
     dataModule.setup()
@@ -124,7 +125,9 @@ def main(cfg: DictConfig) -> None:
                               fusion_mode=cfg.model.fusion_mode,
                               lora_rank=cfg.model.get('lora_rank', 0),
                               lora_alpha=cfg.model.get('lora_alpha', 16),
-                              lora_lr=cfg.model.get('lora_lr'))
+                              lora_lr=cfg.model.get('lora_lr'),
+                              head_lr=cfg.model.get('head_lr'),
+                              decoder_lr=cfg.model.get('decoder_lr'))
 
     # %% training
     callbacks = get_callbacks(cfg.model.callbacks)

@@ -43,7 +43,7 @@ def _tile_gsd_mm(src):
 
 
 class NeophyteDataset(Dataset):
-    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False, few_shot_classes=None):
+    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False, few_shot_classes=None, few_shot_tiles=None):
         self.image_dirs = image_dirs if isinstance(image_dirs, ListConfig) or isinstance(image_dirs, list) else [image_dirs]
         self.classes = classes
         self.num_classes = len(classes)
@@ -67,6 +67,7 @@ class NeophyteDataset(Dataset):
         self.few_shot_mode = few_shot_mode
         self.few_shot_bg_k = few_shot_bg_k # number of fewshot background samples
         self.few_shot_classes = list(few_shot_classes) if few_shot_classes else None # stats names to draw k tiles for (None = every species)
+        self.few_shot_tiles = few_shot_tiles # few_shot_mode=list: file with the tiles to draw from (one path per line)
         self.load_into_ram = load_into_ram
         self.preload_workers = preload_workers
         
@@ -219,6 +220,10 @@ class NeophyteDataset(Dataset):
             # # joint draw: every species ends up in >= k selected tiles (tiles may hold
             # # several species), see select_few_shot_cover
             selected.update(select_few_shot_cover(self.stats_df, class_names, few_shot_k))
+        elif few_shot_mode == "list":
+            # # reuse an earlier draw (e.g. a task 1 run's train_tiles.txt): its tiles that
+            # # contain the species, at most k per species
+            selected.update(select_few_shot_list(self.stats_df, class_names, few_shot_k, self.few_shot_tiles))
         else:
             # --- per-class few-shot selection (only few_shot_classes when set, e.g. the
             #     new species of a species-adaption run) ---
@@ -708,6 +713,23 @@ def pheno_px_cols(class_name):
         "flower": f"flower_{class_name}_px",
         "fruiting": f"fruiting_{class_name}_px",
     }
+
+def select_few_shot_list(df, class_names, k, tiles_file):
+    """Draw from a given tile list (matched by file name): for each species, the listed
+    tiles that contain it, at most k (a random k of them if the list holds more; numpy
+    seed). Labels stay complete. Used by species adaption (task 2) to train on the same
+    tiles of the new species as the site adaption run (task 1) of that flight."""
+    listed = {os.path.basename(line.strip()) for line in open(tiles_file) if line.strip()}
+    pool = df[[os.path.basename(i) in listed for i in df.index]]
+    selected = []
+    for c in class_names:
+        cand = pool[pool[class_px_col(c)] > 0]
+        idxs = cand.sample(frac=1.0).index[:k].tolist()
+        print(f"few-shot list: {c} in {len(idxs)} tiles (of {len(cand)} listed tiles with it; "
+              f"{len(listed)} listed, {len(pool)} found)")
+        selected.extend(i for i in idxs if i not in selected)
+    return selected
+
 
 def select_few_shot_cover(df, class_names, k):
     """Joint k-tile draw over all species: each species ends up in at least k selected

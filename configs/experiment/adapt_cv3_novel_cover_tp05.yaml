@@ -1,0 +1,38 @@
+# @package _global_
+# Task 2 (species adaption) at the cv3 held-out sites, mirroring task 1's cover runs
+# (adapt_cv3_cover_tp05): the base that never saw data.novel_species (Alexandru's, see
+# adapt_novel_finetune_tp05; the species' output row reset to the mean of the others) is
+# fine-tuned with the generic recipe (all weights, lr 5e-5, 500 steps, tp05 crops) on
+# the SAME tiles of that species as the task 1 run of the flight: the tiles of its
+# train_tiles.txt that contain the species (few_shot_mode=list, at most k). Tiles keep
+# all their labels. Scored on the other flights of the site (their /train tiles);
+# only the new species' F1 / P / R count.
+#
+#   python train.py +experiment=adapt_cv3_novel_cover_tp05 data.novel_species=A_altissima \
+#       data.adapt_year=2024 data.adapt_flight=Basel_2_3 data.few_shot_k=10 pl_seed=1 \
+#       data.few_shot_tiles=lightning_logs/<task 1 cover run of Basel_2_3>/train_tiles.txt
+#
+# model.head_lr / model.decoder_lr (default: the base lr) lift the new output row faster;
+# with 5e-5 everywhere it often never rose above background (overnight run of 24 Nov).
+defaults:
+  - adapt_novel_finetune_tp05
+  - _self_
+
+data:
+  few_shot_mode: list
+  few_shot_tiles: ???
+  data_name: np_nv${data.novel_species}_adapt_${data.adapt_flight}_k${data.few_shot_k}list
+  image_dir:
+    train:
+      - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/train
+      - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/test
+      - ../data/Neophytes/${data.adapt_year}/${data.adapt_flight}/val
+    val: ${data.site_other_flights.${data.adapt_flight}}    # unused (limit_val_batches: 0)
+    test: ${data.site_other_flights.${data.adapt_flight}}
+
+model:
+  limit_val_batches: 0
+  head_lr: null
+  decoder_lr: null
+
+exp_name: ${now:%Y%m%d}_${now:%H%M%S.%f}_${data.data_name}_tp05_hlr${model.head_lr}_dlr${model.decoder_lr}_steps${model.max_steps}_${model.name}_${data.crop_size_train}_s${pl_seed}

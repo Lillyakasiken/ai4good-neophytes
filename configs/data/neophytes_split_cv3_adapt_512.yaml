@@ -41,3 +41,19 @@ few_shot_k: 3
 few_shot_mode: random
 few_shot_bg_k: 0          # no background-only tiles (add only if false positives rise)
 weighted_sampling: False  # a handful of tiles: plain shuffling instead of the stratified sampler
+
+# # the other flights of each cv3 held-out site, keyed by the adapted flight; their /train
+# # folders are the test set of the cover runs (adapt_cv3_cover_tp05, adapt_cv3_novel_cover_tp05)
+site_other_flights:
+  Basel_2_3:
+    - ../data/Neophytes/2024/Basel_2_1/train
+    - ../data/Neophytes/2024/Basel_2_2/train
+    - ../data/Neophytes/2024/Basel_2_4/train
+    - ../data/Neophytes/2024/Basel_2_5/train
+    - ../data/Neophytes/2024/Basel_2_6/train
+  Rivera_1_1:
+    - ../data/Neophytes/2025/Rivera_1_2/train
+  Waltenschwil_1_1:
+    - ../data/Neophytes/2024/Waltenschwil_1_2/train
+  Dornach_1_1:
+    - ../data/Neophytes/2025/Dornach_1_2/train
