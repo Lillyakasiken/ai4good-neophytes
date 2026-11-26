@@ -43,7 +43,7 @@ def _tile_gsd_mm(src):
 
 
 class NeophyteDataset(Dataset):
-    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False, few_shot_classes=None, few_shot_tiles=None):
+    def __init__(self, image_dirs, classes, transform=None, dsm_transform=None, ndsm_transform=None, dataset_stats=None, geo=False, weighted_sampling=None, cap_quantile=None, lift_quantile=None, bg_fraction=None, min_strat_images=10, value_mapping=None, ignore_index=-1, load_auxiliary=False, load_dsm=False, load_dtm=False, load_ndsm=False, few_shot_k=None, few_shot_mode='max_px_site_pheno', few_shot_bg_k=100, max_nodata_frac=None, load_into_ram=False, preload_workers=None, return_dsm_dtm=False, few_shot_classes=None, few_shot_tiles=None, exclude_tiles=None):
         self.image_dirs = image_dirs if isinstance(image_dirs, ListConfig) or isinstance(image_dirs, list) else [image_dirs]
         self.classes = classes
         self.num_classes = len(classes)
@@ -151,6 +151,15 @@ class NeophyteDataset(Dataset):
                 print(f"Dropping {int((~keep).sum())} of {len(keep)} tiles with "
                       f"nodata_frac > {max_nodata_frac} (orthophoto edges); "
                       f"kept {int((edge & labelled).sum())} edge tiles that carry real labels")
+                self._filter_by(keep)
+
+            # --- drop the tiles listed in exclude_tiles (e.g. a run's train_tiles.txt),
+            #     so a flight can be scored without the tiles the model was adapted on ---
+            if exclude_tiles is not None:
+                with open(exclude_tiles) as f:
+                    excluded = {os.path.normpath(l.strip()) for l in f if l.strip()}
+                keep = ~self.stats_df.index.isin(excluded)
+                print(f"Excluding {int((~keep).sum())} of {len(keep)} tiles listed in {exclude_tiles}")
                 self._filter_by(keep)
 
             assert len(self.stats_df) == len(self.image_files), (

@@ -99,7 +99,8 @@ def main(cfg: DictConfig) -> None:
                                     batch_size_train=cfg.data.batch_size_test,
                                     batch_size_val=cfg.data.batch_size_test,
                                     batch_size_test=cfg.data.batch_size_test,
-                                    num_workers=cfg.data.num_workers)
+                                    num_workers=cfg.data.num_workers,
+                                    exclude_tiles=cfg.data.get('exclude_tiles'))
     dataModule.prepare_data()
     dataModule.setup()
 
