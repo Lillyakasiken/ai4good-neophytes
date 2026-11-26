@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Queue of 26 Nov: score the cover runs of 25 Nov on the REST OF THEIR ADAPTED FLIGHT.
+# Queue of 26 Nov: score the task 2 cover runs of 25 Nov on the REST OF THEIR ADAPTED FLIGHT.
 # The cover runs (task 1 adapt_cv3_cover_tp05, task 2 adapt_cv3_novel_cover_tp05) drew
 # their tiles from all three folders of the flight and were scored only on the other
 # flights of the site. Here each checkpoint is scored on the whole adapted flight minus
 # the tiles of the flight's task 1 train_tiles.txt (data.exclude_tiles). The task 2 runs
 # trained on a subset of those tiles, so all models are scored on identical tiles:
-#   - received cv3 model (s42, best checkpoint): the baseline, 4 flights
-#   - task 1 cover runs (final checkpoint): 4 flights
+#   - received cv3 model (s42, best checkpoint): the reference, 4 flights
 #   - task 2 cover runs, head/decoder lr 5e-4 (final checkpoint): 9 species x flight cells
+# Task 1 stays scored on the other flights of the site only (Max, 26 Nov).
 # One confusion matrix per flight (adapt_eval: eval_site, no AUC, RGB only).
 #
 #   tmux new -s rest
@@ -15,7 +15,7 @@
 #
 # AFTER: a queue status file to wait for ("queue finished" line) before the first job.
 # Each finished job is recorded in map.txt (job, run, test dir) and skipped on a rerun.
-# Logs, status and map: lightning_logs/queue_2026-11-26_restflight/. ~2 h in total.
+# Logs, status and map: lightning_logs/queue_2026-11-26_restflight/. ~1.5 h in total.
 
 source /zfs/ai4good/groups/neophytes/miniforge3/etc/profile.d/conda.sh
 conda activate /zfs/ai4good/groups/neophytes/miniforge3/envs/ai4good-neophytes
@@ -78,7 +78,6 @@ for fl in Basel_2_3 Rivera_1_1 Waltenschwil_1_1 Dornach_1_1; do
     if [ -z "$t1" ]; then log_status "NO TASK 1 RUN for $fl"; continue; fi
     excl=$t1/train_tiles.txt
     score_job "received_${fl}" "$RECEIVED" "${YEAR[$fl]}" "$fl" "$excl" best
-    score_job "cover_${fl}" "${t1##*/}" "${YEAR[$fl]}" "$fl" "$excl" final
     for sp in ${NOVEL[$fl]}; do
         nv=$(ls -td lightning_logs/*_np_nv${sp}_adapt_${fl}_k10list_tp05_hlr0.0005_dlr0.0005_steps500_*_s1 2>/dev/null | head -1)
         if [ -z "$nv" ]; then log_status "NO TASK 2 RUN for $sp $fl"; continue; fi
